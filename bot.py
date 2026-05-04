@@ -29,7 +29,7 @@ LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
 LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "3"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "10"))
-MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "50"))
+MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))   # 0 = todas las monedas
 # Solo cuenta posiciones abiertas POR EL BOT (ignora las manuales si se activa)
 ONLY_BOT_TRADES  = os.environ.get("ONLY_BOT_TRADES", "false").lower() == "true"
 
@@ -143,7 +143,9 @@ def get_all_positions() -> dict:
         log.error(f"get_positions error: {e}")
         return {}
 
-def get_top_symbols(limit: int) -> list:
+def get_top_symbols(limit: int = 0) -> list:
+    """Obtiene todos los pares USDT de BingX Futuros ordenados por volumen 24h.
+    limit=0 significa SIN límite (todas las monedas disponibles)."""
     try:
         data = bx_get("/openApi/swap/v2/quote/contracts", {})
         contracts = data.get("data", [])
@@ -154,12 +156,12 @@ def get_top_symbols(limit: int) -> list:
                 and c.get("asset", "") == "USDT"
                 and c.get("status") == 1]
         usdt.sort(key=lambda x: float(x.get("tradeAmount", 0)), reverse=True)
-        symbols = [c["symbol"] for c in usdt[:limit]]
-        log.info(f"Loaded {len(symbols)} symbols by 24h volume.")
+        symbols = [c["symbol"] for c in usdt] if limit == 0 else [c["symbol"] for c in usdt[:limit]]
+        log.info(f"Loaded {len(symbols)} symbols (limit={limit if limit>0 else 'ALL'}).")
         return symbols
     except Exception as e:
         log.warning(f"Contracts API failed ({e}), using fallback list.")
-        return FALLBACK_SYMBOLS[:limit]
+        return FALLBACK_SYMBOLS if limit == 0 else FALLBACK_SYMBOLS[:limit]
 
 def set_lev(symbol: str):
     for side in ("LONG", "SHORT"):
