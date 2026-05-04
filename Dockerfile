@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY bot.py .
 RUN mkdir -p logs
 
-CMD ["python", "-u", "src/bot.py"]
+CMD ["python", "-u", "bot.py"]
