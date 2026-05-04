@@ -1,6 +1,6 @@
 """
 ZigZag Institutional Elite V6 - MULTI-SYMBOL SCANNER
-Analiza TODOS los símbolos de BingX Futures | Railway | Telegram
+634 símbolos BingX Futures | Railway | Telegram
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -20,16 +20,17 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
 TIMEFRAME        = os.environ.get("TIMEFRAME",        "15m")
 RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",   "1.0"))
-PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "5"))
-VOL_MULT         = float(os.environ.get("VOL_MULT",        "1.5"))
+PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "3"))   # era 5 → más señales
+VOL_MULT         = float(os.environ.get("VOL_MULT",        "1.2")) # era 1.5 → más permisivo
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 TP_MULT          = float(os.environ.get("TP_MULT",         "2.0"))
 LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
 LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "120"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "3"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
-MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))   # 0 = TODAS
+MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
 ONLY_BOT_TRADES  = os.environ.get("ONLY_BOT_TRADES", "false").lower() == "true"
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "20.0")) # score mínimo para entrada
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
 CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip()] if _raw else []
@@ -49,16 +50,6 @@ FALLBACK_SYMBOLS = [
     "PEPE-USDT","FLOKI-USDT","WLD-USDT","GMX-USDT","DYDX-USDT",
     "IMX-USDT","GALA-USDT","CHZ-USDT","ZEC-USDT","DASH-USDT",
     "KAVA-USDT","CELO-USDT","FET-USDT","OCEAN-USDT","AGIX-USDT",
-    "STX-USDT","JTO-USDT","PYTH-USDT","JUP-USDT","DYM-USDT",
-    "STRK-USDT","ORDI-USDT","SATS-USDT","TRB-USDT","BLUR-USDT",
-    "CFX-USDT","CAKE-USDT","SAND-USDT","MANA-USDT","AXS-USDT",
-    "ENJ-USDT","THETA-USDT","VET-USDT","EGLD-USDT","FLOW-USDT",
-    "XTZ-USDT","NEO-USDT","ONE-USDT","ZIL-USDT","QNT-USDT",
-    "ENS-USDT","1INCH-USDT","COMP-USDT","SNX-USDT","SUSHI-USDT",
-    "GMT-USDT","GST-USDT","MAGIC-USDT","LOOKS-USDT","MOVR-USDT",
-    "GLMR-USDT","OSMO-USDT","SCRT-USDT","EVMOS-USDT","FTM-USDT",
-    "JASMY-USDT","ACH-USDT","C98-USDT","CLV-USDT","MINA-USDT",
-    "RAY-USDT","MASK-USDT","ALICE-USDT","ROSE-USDT","BAT-USDT",
 ]
 
 logging.basicConfig(level=logging.INFO,
@@ -137,85 +128,61 @@ def get_all_positions() -> dict:
         log.error(f"get_positions error: {e}")
         return {}
 
-# ── SYMBOL DISCOVERY — 3 endpoints en cascada ─────────────────────────────────
+# ── SYMBOL DISCOVERY ──────────────────────────────────────────────────────────
 def _symbols_from_contracts() -> list:
-    """Endpoint principal: /openApi/swap/v2/quote/contracts"""
     data = bx_get("/openApi/swap/v2/quote/contracts", {})
     contracts = data.get("data", [])
     if not isinstance(contracts, list) or len(contracts) == 0:
-        raise ValueError(f"Empty contracts data: {str(data)[:300]}")
-
-    # Filtro 1: asset==USDT y status==1
+        raise ValueError(f"Empty contracts: {str(data)[:200]}")
     usdt = [c for c in contracts
             if isinstance(c, dict) and c.get("asset","") == "USDT" and c.get("status") == 1]
-
-    # Filtro 2: solo asset==USDT (sin importar status)
     if not usdt:
-        usdt = [c for c in contracts
-                if isinstance(c, dict) and c.get("asset","") == "USDT"]
-
-    # Filtro 3: símbolo termina en -USDT (sin importar campos asset/status)
+        usdt = [c for c in contracts if isinstance(c, dict) and c.get("asset","") == "USDT"]
     if not usdt:
-        usdt = [c for c in contracts
-                if isinstance(c, dict) and str(c.get("symbol","")).endswith("-USDT")]
-
+        usdt = [c for c in contracts if isinstance(c, dict) and str(c.get("symbol","")).endswith("-USDT")]
     if not usdt:
-        raise ValueError("No USDT contracts after all filters")
-
+        raise ValueError("No USDT contracts found")
     usdt.sort(key=lambda x: float(x.get("tradeAmount", 0) or 0), reverse=True)
     syms = [c["symbol"] for c in usdt if c.get("symbol")]
     log.info(f"[contracts] {len(syms)} USDT symbols")
     return syms
 
 def _symbols_from_ticker() -> list:
-    """Fallback 1: /openApi/swap/v2/quote/ticker — tickers 24h"""
     data = bx_get("/openApi/swap/v2/quote/ticker", {})
     tickers = data.get("data", [])
     if not isinstance(tickers, list) or len(tickers) == 0:
-        raise ValueError(f"Empty ticker data: {str(data)[:300]}")
-
-    usdt = [t for t in tickers
-            if isinstance(t, dict) and str(t.get("symbol","")).endswith("-USDT")]
+        raise ValueError(f"Empty ticker: {str(data)[:200]}")
+    usdt = [t for t in tickers if isinstance(t, dict) and str(t.get("symbol","")).endswith("-USDT")]
     if not usdt:
-        raise ValueError("No USDT tickers found")
-
+        raise ValueError("No USDT tickers")
     usdt.sort(key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
     syms = [t["symbol"] for t in usdt if t.get("symbol")]
     log.info(f"[ticker] {len(syms)} USDT symbols")
     return syms
 
 def _symbols_from_premium_index() -> list:
-    """Fallback 2: /openApi/swap/v2/quote/premiumIndex — mark price index"""
     data = bx_get("/openApi/swap/v2/quote/premiumIndex", {})
     items = data.get("data", [])
     if not isinstance(items, list) or len(items) == 0:
-        raise ValueError(f"Empty premiumIndex: {str(data)[:300]}")
-
-    usdt = [i for i in items
-            if isinstance(i, dict) and str(i.get("symbol","")).endswith("-USDT")]
+        raise ValueError(f"Empty premiumIndex: {str(data)[:200]}")
+    usdt = [i for i in items if isinstance(i, dict) and str(i.get("symbol","")).endswith("-USDT")]
     if not usdt:
         raise ValueError("No USDT in premiumIndex")
-
     syms = [i["symbol"] for i in usdt if i.get("symbol")]
     log.info(f"[premiumIndex] {len(syms)} USDT symbols")
     return syms
 
 def get_all_symbols(limit: int = 0) -> list:
-    """
-    Carga TODOS los pares USDT de BingX Futures.
-    Intenta 3 endpoints en cascada; si todos fallan → fallback hardcoded.
-    """
     for fn in (_symbols_from_contracts, _symbols_from_ticker, _symbols_from_premium_index):
         try:
             syms = fn()
             if syms:
                 result = syms if limit == 0 else syms[:limit]
-                log.info(f"✅ {len(result)} symbols loaded via {fn.__name__} (limit={'ALL' if limit==0 else limit})")
+                log.info(f"✅ {len(result)} symbols loaded (limit={'ALL' if limit==0 else limit})")
                 return result
         except Exception as e:
             log.warning(f"Symbol loader {fn.__name__} failed: {e}")
-
-    log.warning(f"⚠️ All endpoints failed — using hardcoded fallback ({len(FALLBACK_SYMBOLS)} symbols)")
+    log.warning(f"⚠️ All endpoints failed — using fallback ({len(FALLBACK_SYMBOLS)} symbols)")
     return FALLBACK_SYMBOLS if limit == 0 else FALLBACK_SYMBOLS[:limit]
 
 def set_lev(symbol: str):
@@ -254,18 +221,20 @@ def get_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
 
 # ── STRATEGY ──────────────────────────────────────────────────────────────────
 def ph_series(high, left, right):
+    """Pivot High: máximo local con 'left' velas a la izq y 'right' a la der."""
     out = pd.Series(np.nan, index=high.index)
     for i in range(left, len(high) - right):
-        w = high.iloc[i - left: i + right + 1]
-        if high.iloc[i] == w.max():
+        window = high.iloc[i - left: i + right + 1]
+        if high.iloc[i] == window.max():
             out.iloc[i] = high.iloc[i]
     return out
 
 def pl_series(low, left, right):
+    """Pivot Low: mínimo local."""
     out = pd.Series(np.nan, index=low.index)
     for i in range(left, len(low) - right):
-        w = low.iloc[i - left: i + right + 1]
-        if low.iloc[i] == w.min():
+        window = low.iloc[i - left: i + right + 1]
+        if low.iloc[i] == window.min():
             out.iloc[i] = low.iloc[i]
     return out
 
@@ -276,48 +245,83 @@ def calc_atr(high, low, close, period):
     return tr.ewm(alpha=1/period, adjust=False).mean()
 
 def scan_symbol(symbol: str):
+    """
+    Señal LONG:  precio cruza por encima del último Pivot High con volumen elevado.
+    Señal SHORT: precio cruza por debajo del último Pivot Low con volumen elevado.
+    
+    Cambios vs V5:
+    - PIVOT_LEN reducido (3 por defecto) → más pivots confirmados
+    - VOL_MULT reducido (1.2) → barra de volumen más baja
+    - Se usan las últimas 2 velas cerradas para detectar cruce (más robusto)
+    - Se omite el filtro cc > co (dirección de la vela) para más señales
+    """
     try:
         df = get_klines(symbol)
-        if df.empty or len(df) < max(PIVOT_LEN*2+2, ATR_LEN+1, 21):
+        min_bars = max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, 30)
+        if df.empty or len(df) < min_bars:
             return None
 
         peak   = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
         valley = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
         vol_ma = df["volume"].rolling(20).mean()
-        inst   = df["volume"] > (vol_ma * VOL_MULT)
         atr_s  = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
 
-        i       = len(df) - 1
-        pc      = float(df["close"].iloc[i-1])
-        cc      = float(df["close"].iloc[i])
-        co      = float(df["open"].iloc[i])
-        cpeak   = float(peak.iloc[i])
-        cvalley = float(valley.iloc[i])
-        cinst   = bool(inst.iloc[i])
-        catr    = float(atr_s.iloc[i])
-        vma     = float(vol_ma.iloc[i]) if float(vol_ma.iloc[i]) > 0 else 1
-        vratio  = round(float(df["volume"].iloc[i]) / vma, 2)
+        # Usamos la última vela CERRADA (i-1) para señal, i es la vela en curso
+        i = len(df) - 2   # última vela cerrada
+        if i < PIVOT_LEN + 1:
+            return None
 
-        is_long  = (pc <= cpeak)   and (cc > cpeak)   and cinst and (cc > co)
-        is_short = (pc >= cvalley) and (cc < cvalley) and cinst and (cc < co)
+        prev_close  = float(df["close"].iloc[i - 1])
+        curr_close  = float(df["close"].iloc[i])
+        cpeak       = float(peak.iloc[i])
+        cvalley     = float(valley.iloc[i])
+        catr        = float(atr_s.iloc[i])
+        vol_now     = float(df["volume"].iloc[i])
+        vma         = float(vol_ma.iloc[i])
+
+        if np.isnan(cpeak) or np.isnan(cvalley) or np.isnan(catr) or vma <= 0:
+            return None
+
+        vratio = round(vol_now / vma, 2)
+        high_vol = vratio >= VOL_MULT
+
+        # Cruce hacia arriba del Pivot High
+        is_long  = (prev_close <= cpeak) and (curr_close > cpeak) and high_vol
+        # Cruce hacia abajo del Pivot Low
+        is_short = (prev_close >= cvalley) and (curr_close < cvalley) and high_vol
 
         if not is_long and not is_short:
             return None
 
         direction = "LONG" if is_long else "SHORT"
         if direction == "LONG":
-            sl = cvalley if not np.isnan(cvalley) else cc - catr * 2
-            tp = cc + (cc - sl) * TP_MULT
+            sl = max(cvalley, curr_close - catr * 2)
+            tp = curr_close + (curr_close - sl) * TP_MULT
         else:
-            sl = cpeak if not np.isnan(cpeak) else cc + catr * 2
-            tp = cc - (sl - cc) * TP_MULT
+            sl = min(cpeak, curr_close + catr * 2)
+            tp = curr_close - (sl - curr_close) * TP_MULT
 
-        rr    = abs(tp - cc) / abs(cc - sl) if abs(cc - sl) > 0 else 0
-        score = min(vratio*20, 40) + min((catr/cc)*5000, 30) + min(rr*10, 30)
+        dist = abs(curr_close - sl)
+        if dist == 0:
+            return None
 
-        return {"symbol": symbol, "signal": direction, "close": cc,
-                "sl": sl, "tp": tp, "atr": catr, "vol_ratio": vratio,
-                "score": round(score, 1), "rr": round(rr, 2)}
+        rr    = abs(tp - curr_close) / dist
+        score = min(vratio * 20, 40) + min((catr / curr_close) * 5000, 30) + min(rr * 10, 30)
+
+        if score < MIN_SCORE:
+            return None
+
+        return {
+            "symbol":    symbol,
+            "signal":    direction,
+            "close":     curr_close,
+            "sl":        sl,
+            "tp":        tp,
+            "atr":       catr,
+            "vol_ratio": vratio,
+            "score":     round(score, 1),
+            "rr":        round(rr, 2),
+        }
     except Exception as e:
         log.debug(f"Scan {symbol}: {e}")
         return None
@@ -349,8 +353,9 @@ def tg_startup(balance: float, symbols: list):
         f"<b>Monedas:</b> {len(symbols)} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>Lev:</b> {LEVERAGE}x | <b>Riesgo:</b> {RISK_PERCENT}%\n"
         f"<b>Max trades:</b> {MAX_OPEN_TRADES} | <b>TP:</b> 1:{TP_MULT}\n"
+        f"<b>Pivot:</b> {PIVOT_LEN} | <b>Vol:</b> {VOL_MULT}x | <b>MinScore:</b> {MIN_SCORE}\n"
         f"<b>Balance Futuros:</b> {balance:.2f} USDT\n"
-        f"<b>Top pares:</b> {', '.join(symbols[:10])}\n"
+        f"<b>Top pares:</b> {', '.join(symbols[:8])}\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -389,7 +394,8 @@ def tg_debug(balance: float, positions: dict, symbols: list):
         f"<b>Posiciones detectadas:</b> {len(positions)}\n"
         f"<b>Pares:</b> {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos a escanear:</b> {len(symbols)}\n"
-        f"<b>Chat ID usado:</b> <code>{TELEGRAM_CHAT_ID}</code>"
+        f"<b>PIVOT_LEN:</b> {PIVOT_LEN} | <b>VOL_MULT:</b> {VOL_MULT} | <b>MIN_SCORE:</b> {MIN_SCORE}\n"
+        f"<b>Chat ID:</b> <code>{TELEGRAM_CHAT_ID}</code>"
     )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -403,13 +409,14 @@ def main():
         symbols = get_all_symbols(MAX_SYMBOLS)
 
     if not symbols:
-        log.error("CRITICAL: No symbols loaded! Using fallback.")
+        log.error("CRITICAL: No symbols! Using fallback.")
         symbols = FALLBACK_SYMBOLS
 
     balance   = get_balance()
     positions = get_all_positions()
 
     log.info(f"Balance: {balance:.4f} USDT | Symbols: {len(symbols)} | Open: {len(positions)}")
+    log.info(f"Config — PIVOT_LEN:{PIVOT_LEN} VOL_MULT:{VOL_MULT} MIN_SCORE:{MIN_SCORE}")
 
     tg_debug(balance, positions, symbols)
     tg_startup(balance, symbols)
@@ -425,8 +432,8 @@ def main():
     while True:
         t0 = time.time()
         try:
-            balance   = get_balance()
-            positions = get_all_positions()
+            balance    = get_balance()
+            positions  = get_all_positions()
             open_count = len(positions)
 
             log.info(f"── Cycle | {balance:.4f} USDT | {open_count}/{MAX_OPEN_TRADES} trades | {len(symbols)} symbols ──")
@@ -444,6 +451,9 @@ def main():
 
             if signals:
                 tg_scan(signals, len(symbols), open_count)
+                # Log top 5 para diagnóstico
+                for s in signals[:5]:
+                    log.info(f"  → {s['symbol']} {s['signal']} score={s['score']} vol={s['vol_ratio']}x rr={s['rr']}")
 
             for sig in signals:
                 sym = sig["symbol"]
@@ -464,7 +474,7 @@ def main():
                 try:
                     set_lev(sym)
                     res = open_order(sym, side, qty, sig["sl"], sig["tp"])
-                    log.info(f"✅ ORDER {sym} {side} qty={qty} | response: {res}")
+                    log.info(f"✅ ORDER {sym} {side} qty={qty} | {res}")
                     tg_entry(sig, qty, balance)
                     entered_this_cycle.add(sym)
                     open_count += 1
