@@ -84,31 +84,52 @@ def bx_post(path: str, payload: dict) -> dict:
 def get_balance() -> float:
     try:
         data = bx_get("/openApi/swap/v2/user/balance")
+        log.info(f"RAW balance response: {json.dumps(data)[:400]}")
         d = data.get("data", {})
         if not isinstance(d, dict):
+            log.warning(f"data is not dict: {type(d)} — {str(d)[:200]}")
             return 0.0
+
         bal = d.get("balance", {})
+
+        # Buscar en bal si es dict
         if isinstance(bal, dict):
             for field in ("availableMargin", "available", "crossWalletBalance",
                           "walletBalance", "equity", "balance"):
                 v = bal.get(field)
-                if v not in (None, "", "0", 0):
+                if v is not None and v != "" and float(v) != 0.0:
                     result = float(v)
-                    log.info(f"Balance: {result:.4f} USDT (field: {field})")
+                    log.info(f"Balance: {result:.4f} USDT (bal.{field})")
                     return result
+            # Si todos son 0, usar equity (puede ser 0 con posiciones)
+            for field in ("equity", "walletBalance", "availableMargin"):
+                v = bal.get(field)
+                if v is not None and v != "":
+                    result = float(v)
+                    log.info(f"Balance (zero-ok): {result:.4f} USDT (bal.{field})")
+                    return result
+
+        # data directamente tiene los campos
         if d.get("asset") == "USDT":
             for field in ("availableMargin", "available", "walletBalance", "equity"):
                 v = d.get(field)
-                if v not in (None, "", "0", 0):
-                    return float(v)
+                if v is not None and v != "":
+                    result = float(v)
+                    log.info(f"Balance: {result:.4f} USDT (data.{field})")
+                    return result
+
+        # bal es lista
         if isinstance(bal, list):
             for asset in bal:
                 if isinstance(asset, dict) and asset.get("asset") == "USDT":
                     for field in ("availableMargin", "available", "walletBalance", "equity"):
                         v = asset.get(field)
-                        if v not in (None, "", "0", 0):
-                            return float(v)
-        log.warning(f"Balance not found in: {data}")
+                        if v is not None and v != "":
+                            result = float(v)
+                            log.info(f"Balance: {result:.4f} USDT (list.{field})")
+                            return result
+
+        log.warning(f"Balance not found. Full data: {data}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance error: {e}")
