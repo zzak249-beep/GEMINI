@@ -83,66 +83,46 @@ def bx_post(path: str, payload: dict) -> dict:
     return r.json()
 
 def get_balance() -> float:
-    """Retorna el balance disponible en USDT de Futuros — prueba todos los campos conocidos."""
+    """
+    BingX swap/v2/user/balance devuelve:
+    {"data": {"balance": {"userId":..., "asset":"USDT", "availableMargin":"172.9050", ...}}}
+    — notar que 'balance' es un DICT, no una lista.
+    """
     try:
         data = bx_get("/openApi/swap/v2/user/balance")
-        log.info(f"Balance raw: {data}")   # log completo para diagnóstico
         d = data.get("data", {})
+        if not isinstance(d, dict):
+            log.warning(f"Unexpected balance format: {data}")
+            return 0.0
 
-        # Formato 1: data.balance = [{asset, availableMargin, ...}]
-        if isinstance(d, dict):
-            for asset in d.get("balance", []):
-                if isinstance(asset, dict) and asset.get("asset") == "USDT":
-                    for field in ("availableMargin", "available", "walletBalance",
-                                  "crossWalletBalance", "equity", "balance"):
-                        v = asset.get(field)
-                        if v not in (None, "", "0", 0):
-                            log.info(f"Balance field used: {field} = {v}")
-                            return float(v)
+        # Caso real BingX: data.balance es un dict con los campos directamente
+        bal = d.get("balance", {})
+        if isinstance(bal, dict):
+            for field in ("availableMargin", "available", "crossWalletBalance",
+                          "walletBalance", "equity", "balance"):
+                v = bal.get(field)
+                if v not in (None, "", "0", 0):
+                    result = float(v)
+                    log.info(f"Balance: {result:.4f} USDT (field: {field})")
+                    return result
 
-        # Formato 2: data = {asset, availableMargin, ...}  (dict directo)
-        if isinstance(d, dict) and d.get("asset") == "USDT":
-            for field in ("availableMargin", "available", "walletBalance", "equity", "balance"):
+        # Fallback: data es directamente el dict de balance
+        if d.get("asset") == "USDT":
+            for field in ("availableMargin", "available", "walletBalance", "equity"):
                 v = d.get(field)
                 if v not in (None, "", "0", 0):
                     return float(v)
 
-        # Formato 3: data = lista de assets
-        if isinstance(d, list):
-            for asset in d:
+        # Fallback lista
+        if isinstance(bal, list):
+            for asset in bal:
                 if isinstance(asset, dict) and asset.get("asset") == "USDT":
-                    for field in ("availableMargin", "available", "walletBalance", "equity", "balance"):
+                    for field in ("availableMargin", "available", "walletBalance", "equity"):
                         v = asset.get(field)
                         if v not in (None, "", "0", 0):
                             return float(v)
 
-        # Formato 4: BingX a veces devuelve en data directamente
-        # Buscar cualquier clave que tenga "margin" o "balance" con valor > 0
-        def _search(obj, depth=0):
-            if depth > 4:
-                return None
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if isinstance(v, (int, float)) and float(v) > 0:
-                        if any(x in k.lower() for x in ("margin","available","equity","balance","wallet")):
-                            log.info(f"Balance fallback field: {k} = {v}")
-                            return float(v)
-                for v in obj.values():
-                    r = _search(v, depth+1)
-                    if r:
-                        return r
-            elif isinstance(obj, list):
-                for item in obj:
-                    r = _search(item, depth+1)
-                    if r:
-                        return r
-            return None
-
-        found = _search(d)
-        if found:
-            return found
-
-        log.warning(f"Could not parse balance from: {data}")
+        log.warning(f"Balance not found in: {data}")
         return 0.0
     except Exception as e:
         log.error(f"get_balance error: {e}")
