@@ -1,6 +1,6 @@
 """
 ZigZag Institutional Elite V6 - MULTI-SYMBOL SCANNER
-Analiza hasta 100 monedas en paralelo | BingX Futures | Railway | Telegram
+Analiza TODOS los símbolos de BingX Futures | Railway | Telegram
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -16,7 +16,6 @@ from telegram.constants import ParseMode
 BINGX_API_KEY    = os.environ["BINGX_API_KEY"]
 BINGX_SECRET_KEY = os.environ["BINGX_SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-# Chat ID: puede ser número positivo (usuario) o negativo (grupo). Se guarda como string.
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
 TIMEFRAME        = os.environ.get("TIMEFRAME",        "15m")
@@ -26,11 +25,10 @@ VOL_MULT         = float(os.environ.get("VOL_MULT",        "1.5"))
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 TP_MULT          = float(os.environ.get("TP_MULT",         "2.0"))
 LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
-LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
+LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "120"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "3"))
-SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "10"))
-MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))   # 0 = todas las monedas
-# Solo cuenta posiciones abiertas POR EL BOT (ignora las manuales si se activa)
+SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
+MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))   # 0 = TODAS
 ONLY_BOT_TRADES  = os.environ.get("ONLY_BOT_TRADES", "false").lower() == "true"
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
@@ -51,6 +49,16 @@ FALLBACK_SYMBOLS = [
     "PEPE-USDT","FLOKI-USDT","WLD-USDT","GMX-USDT","DYDX-USDT",
     "IMX-USDT","GALA-USDT","CHZ-USDT","ZEC-USDT","DASH-USDT",
     "KAVA-USDT","CELO-USDT","FET-USDT","OCEAN-USDT","AGIX-USDT",
+    "STX-USDT","JTO-USDT","PYTH-USDT","JUP-USDT","DYM-USDT",
+    "STRK-USDT","ORDI-USDT","SATS-USDT","TRB-USDT","BLUR-USDT",
+    "CFX-USDT","CAKE-USDT","SAND-USDT","MANA-USDT","AXS-USDT",
+    "ENJ-USDT","THETA-USDT","VET-USDT","EGLD-USDT","FLOW-USDT",
+    "XTZ-USDT","NEO-USDT","ONE-USDT","ZIL-USDT","QNT-USDT",
+    "ENS-USDT","1INCH-USDT","COMP-USDT","SNX-USDT","SUSHI-USDT",
+    "GMT-USDT","GST-USDT","MAGIC-USDT","LOOKS-USDT","MOVR-USDT",
+    "GLMR-USDT","OSMO-USDT","SCRT-USDT","EVMOS-USDT","FTM-USDT",
+    "JASMY-USDT","ACH-USDT","C98-USDT","CLV-USDT","MINA-USDT",
+    "RAY-USDT","MASK-USDT","ALICE-USDT","ROSE-USDT","BAT-USDT",
 ]
 
 logging.basicConfig(level=logging.INFO,
@@ -68,7 +76,7 @@ def bx_get(path: str, params: dict = None) -> dict:
     p["timestamp"] = int(time.time() * 1000)
     p["signature"] = _sign(p)
     r = requests.get(BINGX_BASE + path, params=p,
-                     headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10)
+                     headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=15)
     r.raise_for_status()
     return r.json()
 
@@ -78,24 +86,16 @@ def bx_post(path: str, payload: dict) -> dict:
     p["signature"] = _sign(p)
     r = requests.post(BINGX_BASE + path, json=p,
                       headers={"X-BX-APIKEY": BINGX_API_KEY,
-                               "Content-Type": "application/json"}, timeout=10)
+                               "Content-Type": "application/json"}, timeout=15)
     r.raise_for_status()
     return r.json()
 
 def get_balance() -> float:
-    """
-    BingX swap/v2/user/balance devuelve:
-    {"data": {"balance": {"userId":..., "asset":"USDT", "availableMargin":"172.9050", ...}}}
-    — notar que 'balance' es un DICT, no una lista.
-    """
     try:
         data = bx_get("/openApi/swap/v2/user/balance")
         d = data.get("data", {})
         if not isinstance(d, dict):
-            log.warning(f"Unexpected balance format: {data}")
             return 0.0
-
-        # Caso real BingX: data.balance es un dict con los campos directamente
         bal = d.get("balance", {})
         if isinstance(bal, dict):
             for field in ("availableMargin", "available", "crossWalletBalance",
@@ -105,15 +105,11 @@ def get_balance() -> float:
                     result = float(v)
                     log.info(f"Balance: {result:.4f} USDT (field: {field})")
                     return result
-
-        # Fallback: data es directamente el dict de balance
         if d.get("asset") == "USDT":
             for field in ("availableMargin", "available", "walletBalance", "equity"):
                 v = d.get(field)
                 if v not in (None, "", "0", 0):
                     return float(v)
-
-        # Fallback lista
         if isinstance(bal, list):
             for asset in bal:
                 if isinstance(asset, dict) and asset.get("asset") == "USDT":
@@ -121,7 +117,6 @@ def get_balance() -> float:
                         v = asset.get(field)
                         if v not in (None, "", "0", 0):
                             return float(v)
-
         log.warning(f"Balance not found in: {data}")
         return 0.0
     except Exception as e:
@@ -129,7 +124,6 @@ def get_balance() -> float:
         return 0.0
 
 def get_all_positions() -> dict:
-    """Devuelve {symbol: position} para todas las posiciones con size != 0."""
     try:
         data = bx_get("/openApi/swap/v2/user/positions", {})
         result = {}
@@ -143,25 +137,86 @@ def get_all_positions() -> dict:
         log.error(f"get_positions error: {e}")
         return {}
 
-def get_top_symbols(limit: int = 0) -> list:
-    """Obtiene todos los pares USDT de BingX Futuros ordenados por volumen 24h.
-    limit=0 significa SIN límite (todas las monedas disponibles)."""
-    try:
-        data = bx_get("/openApi/swap/v2/quote/contracts", {})
-        contracts = data.get("data", [])
-        if not isinstance(contracts, list) or len(contracts) == 0:
-            raise ValueError("Empty contracts list")
+# ── SYMBOL DISCOVERY — 3 endpoints en cascada ─────────────────────────────────
+def _symbols_from_contracts() -> list:
+    """Endpoint principal: /openApi/swap/v2/quote/contracts"""
+    data = bx_get("/openApi/swap/v2/quote/contracts", {})
+    contracts = data.get("data", [])
+    if not isinstance(contracts, list) or len(contracts) == 0:
+        raise ValueError(f"Empty contracts data: {str(data)[:300]}")
+
+    # Filtro 1: asset==USDT y status==1
+    usdt = [c for c in contracts
+            if isinstance(c, dict) and c.get("asset","") == "USDT" and c.get("status") == 1]
+
+    # Filtro 2: solo asset==USDT (sin importar status)
+    if not usdt:
         usdt = [c for c in contracts
-                if isinstance(c, dict)
-                and c.get("asset", "") == "USDT"
-                and c.get("status") == 1]
-        usdt.sort(key=lambda x: float(x.get("tradeAmount", 0)), reverse=True)
-        symbols = [c["symbol"] for c in usdt] if limit == 0 else [c["symbol"] for c in usdt[:limit]]
-        log.info(f"Loaded {len(symbols)} symbols (limit={limit if limit>0 else 'ALL'}).")
-        return symbols
-    except Exception as e:
-        log.warning(f"Contracts API failed ({e}), using fallback list.")
-        return FALLBACK_SYMBOLS if limit == 0 else FALLBACK_SYMBOLS[:limit]
+                if isinstance(c, dict) and c.get("asset","") == "USDT"]
+
+    # Filtro 3: símbolo termina en -USDT (sin importar campos asset/status)
+    if not usdt:
+        usdt = [c for c in contracts
+                if isinstance(c, dict) and str(c.get("symbol","")).endswith("-USDT")]
+
+    if not usdt:
+        raise ValueError("No USDT contracts after all filters")
+
+    usdt.sort(key=lambda x: float(x.get("tradeAmount", 0) or 0), reverse=True)
+    syms = [c["symbol"] for c in usdt if c.get("symbol")]
+    log.info(f"[contracts] {len(syms)} USDT symbols")
+    return syms
+
+def _symbols_from_ticker() -> list:
+    """Fallback 1: /openApi/swap/v2/quote/ticker — tickers 24h"""
+    data = bx_get("/openApi/swap/v2/quote/ticker", {})
+    tickers = data.get("data", [])
+    if not isinstance(tickers, list) or len(tickers) == 0:
+        raise ValueError(f"Empty ticker data: {str(data)[:300]}")
+
+    usdt = [t for t in tickers
+            if isinstance(t, dict) and str(t.get("symbol","")).endswith("-USDT")]
+    if not usdt:
+        raise ValueError("No USDT tickers found")
+
+    usdt.sort(key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
+    syms = [t["symbol"] for t in usdt if t.get("symbol")]
+    log.info(f"[ticker] {len(syms)} USDT symbols")
+    return syms
+
+def _symbols_from_premium_index() -> list:
+    """Fallback 2: /openApi/swap/v2/quote/premiumIndex — mark price index"""
+    data = bx_get("/openApi/swap/v2/quote/premiumIndex", {})
+    items = data.get("data", [])
+    if not isinstance(items, list) or len(items) == 0:
+        raise ValueError(f"Empty premiumIndex: {str(data)[:300]}")
+
+    usdt = [i for i in items
+            if isinstance(i, dict) and str(i.get("symbol","")).endswith("-USDT")]
+    if not usdt:
+        raise ValueError("No USDT in premiumIndex")
+
+    syms = [i["symbol"] for i in usdt if i.get("symbol")]
+    log.info(f"[premiumIndex] {len(syms)} USDT symbols")
+    return syms
+
+def get_all_symbols(limit: int = 0) -> list:
+    """
+    Carga TODOS los pares USDT de BingX Futures.
+    Intenta 3 endpoints en cascada; si todos fallan → fallback hardcoded.
+    """
+    for fn in (_symbols_from_contracts, _symbols_from_ticker, _symbols_from_premium_index):
+        try:
+            syms = fn()
+            if syms:
+                result = syms if limit == 0 else syms[:limit]
+                log.info(f"✅ {len(result)} symbols loaded via {fn.__name__} (limit={'ALL' if limit==0 else limit})")
+                return result
+        except Exception as e:
+            log.warning(f"Symbol loader {fn.__name__} failed: {e}")
+
+    log.warning(f"⚠️ All endpoints failed — using hardcoded fallback ({len(FALLBACK_SYMBOLS)} symbols)")
+    return FALLBACK_SYMBOLS if limit == 0 else FALLBACK_SYMBOLS[:limit]
 
 def set_lev(symbol: str):
     for side in ("LONG", "SHORT"):
@@ -173,13 +228,13 @@ def set_lev(symbol: str):
 
 def open_order(symbol: str, side: str, qty: float, sl: float, tp: float) -> dict:
     payload = {
-        "symbol":     symbol,
-        "side":       side,
+        "symbol":       symbol,
+        "side":         side,
         "positionSide": "LONG" if side == "BUY" else "SHORT",
-        "type":       "MARKET",
-        "quantity":   round(qty, 4),
-        "stopLoss":   json.dumps({"type":"MARK_PRICE","stopPrice":round(sl, 6),"workingType":"MARK_PRICE"}),
-        "takeProfit": json.dumps({"type":"MARK_PRICE","stopPrice":round(tp, 6),"workingType":"MARK_PRICE"}),
+        "type":         "MARKET",
+        "quantity":     round(qty, 4),
+        "stopLoss":     json.dumps({"type":"MARK_PRICE","stopPrice":round(sl,6),"workingType":"MARK_PRICE"}),
+        "takeProfit":   json.dumps({"type":"MARK_PRICE","stopPrice":round(tp,6),"workingType":"MARK_PRICE"}),
     }
     return bx_post("/openApi/swap/v2/trade/order", payload)
 
@@ -268,8 +323,8 @@ def scan_symbol(symbol: str):
         return None
 
 def calc_qty(balance: float, entry: float, sl: float) -> float:
-    risk  = balance * (RISK_PERCENT / 100)
-    dist  = abs(entry - sl)
+    risk = balance * (RISK_PERCENT / 100)
+    dist = abs(entry - sl)
     if dist == 0:
         return 0
     return max(round((risk * LEVERAGE) / entry, 4), 0.001)
@@ -277,7 +332,6 @@ def calc_qty(balance: float, entry: float, sl: float) -> float:
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
 async def _send(msg: str):
     bot = Bot(token=TELEGRAM_TOKEN)
-    # chat_id puede ser int o str; Bot acepta ambos
     chat_id = int(TELEGRAM_CHAT_ID) if TELEGRAM_CHAT_ID.lstrip("-").isdigit() else TELEGRAM_CHAT_ID
     await bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML)
 
@@ -307,7 +361,7 @@ def tg_scan(signals: list, total: int, open_count: int):
         f"🔍 <b>{len(signals)} señal(es) / {total} monedas</b> | Trades: {open_count}/{MAX_OPEN_TRADES}",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
-    for s in signals[:10]:  # máx 10 en el mensaje
+    for s in signals[:10]:
         e = "🟢" if s["signal"] == "LONG" else "🔴"
         lines.append(f"{e} <b>{s['symbol']}</b> Score:{s['score']} Vol:{s['vol_ratio']}x RR:1:{s['rr']}")
     lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
@@ -328,7 +382,6 @@ def tg_entry(sig: dict, qty: float, balance: float):
     )
 
 def tg_debug(balance: float, positions: dict, symbols: list):
-    """Mensaje de diagnóstico al arrancar para verificar conectividad."""
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
         f"🔧 <b>DEBUG — Conexión verificada</b>\n"
@@ -343,20 +396,28 @@ def tg_debug(balance: float, positions: dict, symbols: list):
 def main():
     log.info("=== ZigZag Institutional Elite V6 MULTI-SCANNER starting ===")
 
-    symbols  = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_top_symbols(MAX_SYMBOLS)
-    balance  = get_balance()
+    if CUSTOM_SYMBOLS:
+        symbols = CUSTOM_SYMBOLS
+        log.info(f"Using CUSTOM_SYMBOLS: {len(symbols)}")
+    else:
+        symbols = get_all_symbols(MAX_SYMBOLS)
+
+    if not symbols:
+        log.error("CRITICAL: No symbols loaded! Using fallback.")
+        symbols = FALLBACK_SYMBOLS
+
+    balance   = get_balance()
     positions = get_all_positions()
 
-    log.info(f"Balance: {balance:.4f} USDT | Symbols: {len(symbols)} | Open positions: {len(positions)}")
+    log.info(f"Balance: {balance:.4f} USDT | Symbols: {len(symbols)} | Open: {len(positions)}")
 
-    # Mensaje de debug para verificar que Telegram y BingX funcionan
     tg_debug(balance, positions, symbols)
     tg_startup(balance, symbols)
 
     log.info("Pre-setting leverage...")
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         list(ex.map(set_lev, symbols))
-    log.info("Leverage ready. Entering main loop.")
+    log.info(f"Leverage ready for {len(symbols)} symbols. Entering main loop.")
 
     errors = 0
     entered_this_cycle: set = set()
@@ -368,9 +429,8 @@ def main():
             positions = get_all_positions()
             open_count = len(positions)
 
-            log.info(f"── Cycle | {balance:.4f} USDT | {open_count}/{MAX_OPEN_TRADES} trades ──")
+            log.info(f"── Cycle | {balance:.4f} USDT | {open_count}/{MAX_OPEN_TRADES} trades | {len(symbols)} symbols ──")
 
-            # Escaneo paralelo
             signals = []
             with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
                 futures = {ex.submit(scan_symbol, s): s for s in symbols}
@@ -385,7 +445,6 @@ def main():
             if signals:
                 tg_scan(signals, len(symbols), open_count)
 
-            # Ejecutar entradas por orden de score
             for sig in signals:
                 sym = sig["symbol"]
                 if sym in positions or sym in entered_this_cycle:
