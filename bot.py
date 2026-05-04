@@ -1,17 +1,10 @@
 """
-ZigZag Institutional Elite V6 — Trading Bot
-BingX Futures | Railway Deployment | Telegram Reports
+ZigZag Institutional Elite V6 - MULTI-SYMBOL SCANNER
+Analiza hasta 100 monedas en paralelo | BingX Futures | Railway | Telegram
 """
-
-import os
-import time
-import hmac
-import hashlib
-import json
-import asyncio
-import logging
+import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -19,379 +12,349 @@ import numpy as np
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# ─────────────────────────────────────────────
-# CONFIG — from environment variables
-# ─────────────────────────────────────────────
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 BINGX_API_KEY    = os.environ["BINGX_API_KEY"]
 BINGX_SECRET_KEY = os.environ["BINGX_SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-SYMBOL           = os.environ.get("SYMBOL", "BTC-USDT")
-TIMEFRAME        = os.environ.get("TIMEFRAME", "15m")
-RISK_PERCENT     = float(os.environ.get("RISK_PERCENT", "1.0"))   # % of balance per trade
-PIVOT_LEN        = int(os.environ.get("PIVOT_LEN", "5"))
-VOL_MULT         = float(os.environ.get("VOL_MULT", "1.5"))
-ATR_LEN          = int(os.environ.get("ATR_LEN", "14"))
-TP_MULT          = float(os.environ.get("TP_MULT", "2.0"))
-LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS", "60"))
-LEVERAGE         = int(os.environ.get("LEVERAGE", "5"))
+
+TIMEFRAME       = os.environ.get("TIMEFRAME",       "15m")
+RISK_PERCENT    = float(os.environ.get("RISK_PERCENT",  "1.0"))
+PIVOT_LEN       = int(os.environ.get("PIVOT_LEN",      "5"))
+VOL_MULT        = float(os.environ.get("VOL_MULT",      "1.5"))
+ATR_LEN         = int(os.environ.get("ATR_LEN",        "14"))
+TP_MULT         = float(os.environ.get("TP_MULT",       "2.0"))
+LEVERAGE        = int(os.environ.get("LEVERAGE",       "5"))
+LOOP_SECONDS    = int(os.environ.get("LOOP_SECONDS",   "60"))
+MAX_OPEN_TRADES = int(os.environ.get("MAX_OPEN_TRADES","3"))
+SCAN_WORKERS    = int(os.environ.get("SCAN_WORKERS",   "10"))
+MAX_SYMBOLS     = int(os.environ.get("MAX_SYMBOLS",    "50"))
+
+_raw = os.environ.get("CUSTOM_SYMBOLS", "")
+CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip()] if _raw else []
 
 BINGX_BASE = "https://open-api.bingx.com"
+INTERVAL_MAP = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m",
+                "30m":"30m","1h":"1H","4h":"4H","1d":"1D"}
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("logs/bot.log"),
-    ],
-)
+FALLBACK_SYMBOLS = [
+    "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
+    "DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
+    "MATIC-USDT","UNI-USDT","LTC-USDT","BCH-USDT","ATOM-USDT",
+    "XLM-USDT","ETC-USDT","NEAR-USDT","APT-USDT","OP-USDT",
+    "ARB-USDT","FIL-USDT","ICP-USDT","HBAR-USDT","AAVE-USDT",
+    "GRT-USDT","MKR-USDT","CRV-USDT","LDO-USDT","RUNE-USDT",
+    "INJ-USDT","SUI-USDT","TIA-USDT","SEI-USDT","WIF-USDT",
+    "PEPE-USDT","FLOKI-USDT","WLD-USDT","GMX-USDT","DYDX-USDT",
+    "IMX-USDT","GALA-USDT","CHZ-USDT","ZEC-USDT","DASH-USDT",
+    "KAVA-USDT","CELO-USDT","FET-USDT","OCEAN-USDT","AGIX-USDT",
+]
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s",
+                    handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
-# ─────────────────────────────────────────────
-# BINGX API LAYER
-# ─────────────────────────────────────────────
+# ── BINGX API ─────────────────────────────────────────────────────────────────
+def _sign(params: dict) -> str:
+    qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    return hmac.new(BINGX_SECRET_KEY.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
-def _sign(params: dict, secret: str) -> str:
-    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-    return hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
-
-
-def bingx_get(path: str, params: dict = None) -> dict:
-    params = params or {}
-    params["timestamp"] = int(time.time() * 1000)
-    params["signature"] = _sign(params, BINGX_SECRET_KEY)
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
-    r = requests.get(BINGX_BASE + path, params=params, headers=headers, timeout=10)
+def bx_get(path: str, params: dict = None) -> dict:
+    p = dict(params or {})
+    p["timestamp"] = int(time.time() * 1000)
+    p["signature"] = _sign(p)
+    r = requests.get(BINGX_BASE + path, params=p,
+                     headers={"X-BX-APIKEY": BINGX_API_KEY}, timeout=10)
     r.raise_for_status()
     return r.json()
 
-
-def bingx_post(path: str, payload: dict) -> dict:
-    payload["timestamp"] = int(time.time() * 1000)
-    payload["signature"] = _sign(payload, BINGX_SECRET_KEY)
-    headers = {"X-BX-APIKEY": BINGX_API_KEY, "Content-Type": "application/json"}
-    r = requests.post(BINGX_BASE + path, json=payload, headers=headers, timeout=10)
+def bx_post(path: str, payload: dict) -> dict:
+    p = dict(payload)
+    p["timestamp"] = int(time.time() * 1000)
+    p["signature"] = _sign(p)
+    r = requests.post(BINGX_BASE + path, json=p,
+                      headers={"X-BX-APIKEY": BINGX_API_KEY,
+                               "Content-Type": "application/json"}, timeout=10)
     r.raise_for_status()
     return r.json()
-
 
 def get_balance() -> float:
-    data = bingx_get("/openApi/swap/v2/user/balance")
+    data = bx_get("/openApi/swap/v2/user/balance")
     for asset in data.get("data", {}).get("balance", []):
-        if asset.get("asset") == "USDT":
+        if isinstance(asset, dict) and asset.get("asset") == "USDT":
             return float(asset.get("availableMargin", 0))
     return 0.0
 
-
-def get_position() -> Optional[dict]:
-    data = bingx_get("/openApi/swap/v2/user/positions", {"symbol": SYMBOL})
+def get_all_positions() -> dict:
+    data = bx_get("/openApi/swap/v2/user/positions", {})
+    result = {}
     positions = data.get("data", [])
-    for p in positions:
-        if float(p.get("positionAmt", 0)) != 0:
-            return p
-    return None
+    if isinstance(positions, list):
+        for p in positions:
+            if isinstance(p, dict) and float(p.get("positionAmt", 0)) != 0:
+                result[p["symbol"]] = p
+    return result
 
-
-def set_leverage():
+def get_top_symbols(limit: int) -> list:
     try:
-        bingx_post("/openApi/swap/v2/trade/leverage", {
-            "symbol": SYMBOL,
-            "side": "LONG",
-            "leverage": LEVERAGE,
-        })
-        bingx_post("/openApi/swap/v2/trade/leverage", {
-            "symbol": SYMBOL,
-            "side": "SHORT",
-            "leverage": LEVERAGE,
-        })
+        data = bx_get("/openApi/swap/v2/quote/contracts", {})
+        contracts = data.get("data", [])
+        if not isinstance(contracts, list):
+            raise ValueError("Unexpected contracts format")
+        usdt = [c for c in contracts
+                if isinstance(c, dict)
+                and c.get("asset", "") == "USDT"
+                and c.get("status") == 1]
+        usdt.sort(key=lambda x: float(x.get("tradeAmount", 0)), reverse=True)
+        symbols = [c["symbol"] for c in usdt[:limit]]
+        log.info(f"Loaded {len(symbols)} symbols by 24h volume.")
+        return symbols
     except Exception as e:
-        log.warning(f"Leverage set error: {e}")
+        log.warning(f"Contracts API failed ({e}), using fallback list.")
+        return FALLBACK_SYMBOLS[:limit]
 
+def set_lev(symbol: str):
+    for side in ("LONG", "SHORT"):
+        try:
+            bx_post("/openApi/swap/v2/trade/leverage",
+                    {"symbol": symbol, "side": side, "leverage": LEVERAGE})
+        except Exception:
+            pass
 
-def open_order(side: str, qty: float, sl: float, tp: float) -> dict:
-    """side: 'BUY' or 'SELL'"""
+def open_order(symbol: str, side: str, qty: float, sl: float, tp: float) -> dict:
     payload = {
-        "symbol": SYMBOL,
+        "symbol": symbol,
         "side": side,
         "positionSide": "LONG" if side == "BUY" else "SHORT",
         "type": "MARKET",
         "quantity": round(qty, 4),
-        "stopLoss": json.dumps({"type": "MARK_PRICE", "stopPrice": round(sl, 2), "workingType": "MARK_PRICE"}),
-        "takeProfit": json.dumps({"type": "MARK_PRICE", "stopPrice": round(tp, 2), "workingType": "MARK_PRICE"}),
+        "stopLoss": json.dumps({"type":"MARK_PRICE","stopPrice":round(sl, 6),"workingType":"MARK_PRICE"}),
+        "takeProfit": json.dumps({"type":"MARK_PRICE","stopPrice":round(tp, 6),"workingType":"MARK_PRICE"}),
     }
-    return bingx_post("/openApi/swap/v2/trade/order", payload)
+    return bx_post("/openApi/swap/v2/trade/order", payload)
 
-
-def close_position(position: dict) -> dict:
-    side = "SELL" if float(position["positionAmt"]) > 0 else "BUY"
-    pos_side = "LONG" if float(position["positionAmt"]) > 0 else "SHORT"
-    qty = abs(float(position["positionAmt"]))
-    payload = {
-        "symbol": SYMBOL,
-        "side": side,
-        "positionSide": pos_side,
-        "type": "MARKET",
-        "quantity": round(qty, 4),
-    }
-    return bingx_post("/openApi/swap/v2/trade/order", payload)
-
-
-def get_klines(limit: int = 200) -> pd.DataFrame:
-    interval_map = {"1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
-                    "30m": "30m", "1h": "1H", "4h": "4H", "1d": "1D"}
-    params = {
-        "symbol": SYMBOL,
-        "interval": interval_map.get(TIMEFRAME, "15m"),
-        "limit": limit,
-    }
-    data = bingx_get("/openApi/swap/v3/quote/klines", params)
+def get_klines(symbol: str, limit: int = 200) -> pd.DataFrame:
+    params = {"symbol": symbol,
+              "interval": INTERVAL_MAP.get(TIMEFRAME, "15m"),
+              "limit": limit}
+    data = bx_get("/openApi/swap/v3/quote/klines", params)
     rows = data.get("data", [])
-    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "close_time"])
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = df[col].astype(float)
+    if not rows or not isinstance(rows, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
+    for col in ("open","high","low","close","volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
     return df.sort_values("open_time").reset_index(drop=True)
 
-# ─────────────────────────────────────────────
-# ZIGZAG STRATEGY ENGINE
-# ─────────────────────────────────────────────
-
-def pivot_high(high: pd.Series, left: int, right: int) -> pd.Series:
-    result = pd.Series(np.nan, index=high.index)
+# ── STRATEGY ──────────────────────────────────────────────────────────────────
+def ph_series(high: pd.Series, left: int, right: int) -> pd.Series:
+    out = pd.Series(np.nan, index=high.index)
     for i in range(left, len(high) - right):
-        window = high.iloc[i - left: i + right + 1]
-        if high.iloc[i] == window.max():
-            result.iloc[i] = high.iloc[i]
-    return result
+        w = high.iloc[i - left: i + right + 1]
+        if high.iloc[i] == w.max():
+            out.iloc[i] = high.iloc[i]
+    return out
 
-
-def pivot_low(low: pd.Series, left: int, right: int) -> pd.Series:
-    result = pd.Series(np.nan, index=low.index)
+def pl_series(low: pd.Series, left: int, right: int) -> pd.Series:
+    out = pd.Series(np.nan, index=low.index)
     for i in range(left, len(low) - right):
-        window = low.iloc[i - left: i + right + 1]
-        if low.iloc[i] == window.min():
-            result.iloc[i] = low.iloc[i]
-    return result
+        w = low.iloc[i - left: i + right + 1]
+        if low.iloc[i] == w.min():
+            out.iloc[i] = low.iloc[i]
+    return out
 
+def calc_atr(high, low, close, period):
+    tr = pd.concat([high - low,
+                    (high - close.shift()).abs(),
+                    (low  - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
 
-def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs(),
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+def scan_symbol(symbol: str):
+    try:
+        df = get_klines(symbol)
+        if df.empty or len(df) < max(PIVOT_LEN*2+2, ATR_LEN+1, 21):
+            return None
 
+        peak   = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
+        valley = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
+        vol_ma  = df["volume"].rolling(20).mean()
+        inst    = df["volume"] > (vol_ma * VOL_MULT)
+        atr_s   = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
 
-def compute_signals(df: pd.DataFrame) -> dict:
-    n = len(df)
-    if n < max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, 21):
-        return {"signal": None}
+        i = len(df) - 1
+        pc = float(df["close"].iloc[i-1])
+        cc = float(df["close"].iloc[i])
+        co = float(df["open"].iloc[i])
+        cpeak   = float(peak.iloc[i])
+        cvalley = float(valley.iloc[i])
+        cinst   = bool(inst.iloc[i])
+        catr    = float(atr_s.iloc[i])
+        vma     = float(vol_ma.iloc[i]) if vol_ma.iloc[i] > 0 else 1
+        vratio  = round(float(df["volume"].iloc[i]) / vma, 2)
 
-    ph = pivot_high(df["high"], PIVOT_LEN, PIVOT_LEN)
-    pl = pivot_low(df["low"], PIVOT_LEN, PIVOT_LEN)
+        is_long  = (pc <= cpeak)   and (cc > cpeak)   and cinst and (cc > co)
+        is_short = (pc >= cvalley) and (cc < cvalley) and cinst and (cc < co)
 
-    # Carry-forward last known peak/valley
-    peak   = ph.ffill()
-    valley = pl.ffill()
+        if not is_long and not is_short:
+            return None
 
-    vol_ma = df["volume"].rolling(20).mean()
-    inst_vol = df["volume"] > (vol_ma * VOL_MULT)
+        direction = "LONG" if is_long else "SHORT"
+        if direction == "LONG":
+            sl = cvalley if not np.isnan(cvalley) else cc - catr * 2
+            tp = cc + (cc - sl) * TP_MULT
+        else:
+            sl = cpeak if not np.isnan(cpeak) else cc + catr * 2
+            tp = cc - (sl - cc) * TP_MULT
 
-    atr_val = atr(df["high"], df["low"], df["close"], ATR_LEN)
+        rr    = abs(tp - cc) / abs(cc - sl) if abs(cc - sl) > 0 else 0
+        score = min(vratio * 20, 40) + min((catr/cc)*5000, 30) + min(rr*10, 30)
 
-    close   = df["close"]
-    open_   = df["open"]
+        return {"symbol": symbol, "signal": direction, "close": cc,
+                "sl": sl, "tp": tp, "atr": catr, "vol_ratio": vratio,
+                "score": round(score, 1), "rr": round(rr, 2)}
+    except Exception as e:
+        log.debug(f"Scan {symbol}: {e}")
+        return None
 
-    # Current bar (last completed)
-    i = n - 1
-    prev_close = close.iloc[i - 1]
-    curr_close = close.iloc[i]
-    curr_peak   = peak.iloc[i]
-    curr_valley = valley.iloc[i]
-    curr_inst   = inst_vol.iloc[i]
-    curr_atr    = atr_val.iloc[i]
-    bullish_body = curr_close > open_.iloc[i]
-    bearish_body = curr_close < open_.iloc[i]
-
-    long_breakout  = (prev_close <= curr_peak) and (curr_close > curr_peak) and curr_inst and bullish_body
-    short_breakout = (prev_close >= curr_valley) and (curr_close < curr_valley) and curr_inst and bearish_body
-
-    signal = None
-    sl = tp = None
-
-    if long_breakout:
-        signal = "LONG"
-        sl = curr_valley if not np.isnan(curr_valley) else curr_close - curr_atr * 2
-        tp = curr_close + (curr_close - sl) * TP_MULT
-
-    elif short_breakout:
-        signal = "SHORT"
-        sl = curr_peak if not np.isnan(curr_peak) else curr_close + curr_atr * 2
-        tp = curr_close - (sl - curr_close) * TP_MULT
-
-    return {
-        "signal": signal,
-        "close": curr_close,
-        "peak": curr_peak,
-        "valley": curr_valley,
-        "sl": sl,
-        "tp": tp,
-        "atr": curr_atr,
-        "inst_vol": curr_inst,
-        "vol_ratio": round(df["volume"].iloc[i] / vol_ma.iloc[i], 2) if vol_ma.iloc[i] > 0 else 0,
-    }
-
-
-def calc_quantity(balance: float, entry: float, sl: float) -> float:
-    risk_amount = balance * (RISK_PERCENT / 100)
-    sl_distance = abs(entry - sl)
-    if sl_distance == 0:
+def calc_qty(balance: float, entry: float, sl: float) -> float:
+    risk = balance * (RISK_PERCENT / 100)
+    dist = abs(entry - sl)
+    if dist == 0:
         return 0
-    qty = (risk_amount * LEVERAGE) / entry
-    return max(round(qty, 4), 0.001)
+    return max(round((risk * LEVERAGE) / entry, 4), 0.001)
 
-# ─────────────────────────────────────────────
-# TELEGRAM REPORTS
-# ─────────────────────────────────────────────
-
+# ── TELEGRAM ──────────────────────────────────────────────────────────────────
 async def _send(msg: str):
     bot = Bot(token=TELEGRAM_TOKEN)
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
 
-
-def send_telegram(msg: str):
+def tg(msg: str):
     try:
         asyncio.run(_send(msg))
     except Exception as e:
-        log.warning(f"Telegram error: {e}")
+        log.warning(f"Telegram: {e}")
 
-
-def report_signal(sig: dict, qty: float, balance: float):
-    direction = "🟢 LONG" if sig["signal"] == "LONG" else "🔴 SHORT"
-    msg = (
-        f"<b>⚡ ZigZag Elite — ENTRADA</b>\n"
+def tg_startup(balance: float, symbols: list):
+    tg(
+        f"🚀 <b>ZigZag Elite V6 — MULTI-SCANNER</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Par:</b> {SYMBOL} | {TIMEFRAME}\n"
-        f"<b>Dirección:</b> {direction}\n"
-        f"<b>Precio entrada:</b> <code>{sig['close']:.4f}</code>\n"
-        f"<b>Stop Loss:</b>   <code>{sig['sl']:.4f}</code>\n"
-        f"<b>Take Profit:</b> <code>{sig['tp']:.4f}</code>\n"
-        f"<b>RR Ratio:</b> 1:{TP_MULT}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Cantidad:</b>    {qty} contratos\n"
-        f"<b>Balance:</b>     {balance:.2f} USDT\n"
-        f"<b>Riesgo:</b>      {RISK_PERCENT}% = {balance * RISK_PERCENT / 100:.2f} USDT\n"
-        f"<b>Volumen:</b>     {sig['vol_ratio']}x MA (⚡ institucional)\n"
-        f"<b>ATR:</b>         {sig['atr']:.4f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ Bot activo | {len(symbols)} monedas\n"
+        f"<b>TF:</b> {TIMEFRAME} | <b>Lev:</b> {LEVERAGE}x | "
+        f"<b>Riesgo:</b> {RISK_PERCENT}% | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
+        f"<b>Balance:</b> {balance:.2f} USDT\n"
+        f"<b>Top pares:</b> {', '.join(symbols[:10])}\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
-    send_telegram(msg)
 
+def tg_scan(signals: list, total: int, open_count: int):
+    if not signals:
+        return
+    lines = [f"🔍 <b>{len(signals)} señal(es) / {total} monedas</b> | Trades: {open_count}/{MAX_OPEN_TRADES}", "━━━━━━━━━━━━━━━━━━━━"]
+    for s in signals:
+        e = "🟢" if s["signal"] == "LONG" else "🔴"
+        lines.append(f"{e} <b>{s['symbol']}</b> | Score:{s['score']} | Vol:{s['vol_ratio']}x | RR:1:{s['rr']}")
+    lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
+    tg("\n".join(lines))
 
-def report_close(position: dict, reason: str):
-    amt = float(position.get("positionAmt", 0))
-    entry = float(position.get("avgPrice", 0))
-    direction = "🟢 LONG" if amt > 0 else "🔴 SHORT"
-    pnl = float(position.get("unrealizedProfit", 0))
-    pnl_emoji = "✅" if pnl >= 0 else "❌"
-    msg = (
-        f"<b>{pnl_emoji} ZigZag Elite — CIERRE</b>\n"
+def tg_entry(sig: dict, qty: float, balance: float):
+    d = "🟢 LONG" if sig["signal"] == "LONG" else "🔴 SHORT"
+    tg(
+        f"<b>⚡ ENTRADA — {sig['symbol']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Par:</b> {SYMBOL}\n"
-        f"<b>Dirección:</b> {direction}\n"
-        f"<b>Entrada:</b>   <code>{entry:.4f}</code>\n"
-        f"<b>PnL:</b>       <code>{pnl:+.4f} USDT</code>\n"
-        f"<b>Razón:</b>     {reason}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Dir:</b> {d} | <b>Score:</b> {sig['score']}/100\n"
+        f"<b>Entrada:</b>     <code>{sig['close']:.6g}</code>\n"
+        f"<b>Stop Loss:</b>   <code>{sig['sl']:.6g}</code>\n"
+        f"<b>Take Profit:</b> <code>{sig['tp']:.6g}</code>\n"
+        f"<b>RR:</b> 1:{sig['rr']} | <b>Vol:</b> {sig['vol_ratio']}x ⚡\n"
+        f"<b>Qty:</b> {qty} | <b>Riesgo:</b> {balance*RISK_PERCENT/100:.2f} USDT\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
-    send_telegram(msg)
 
-
-def report_error(context: str, error: Exception):
-    msg = (
-        f"⚠️ <b>Error en Bot</b>\n"
-        f"<b>Contexto:</b> {context}\n"
-        f"<b>Error:</b> <code>{str(error)[:300]}</code>\n"
-        f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
-    )
-    send_telegram(msg)
-
-
-def report_startup(balance: float):
-    msg = (
-        f"🚀 <b>ZigZag Institutional Elite V6</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"<b>Estado:</b> ✅ Bot activo\n"
-        f"<b>Par:</b>       {SYMBOL}\n"
-        f"<b>Temporalidad:</b> {TIMEFRAME}\n"
-        f"<b>Apalancamiento:</b> {LEVERAGE}x\n"
-        f"<b>Riesgo/trade:</b>  {RISK_PERCENT}%\n"
-        f"<b>TP Ratio:</b>    1:{TP_MULT}\n"
-        f"<b>Vol Mult:</b>    {VOL_MULT}x\n"
-        f"<b>Balance:</b>    {balance:.2f} USDT\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
-    )
-    send_telegram(msg)
-
-# ─────────────────────────────────────────────
-# MAIN LOOP
-# ─────────────────────────────────────────────
-
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info("=== ZigZag Institutional Elite V6 starting ===")
-    set_leverage()
-    balance = get_balance()
-    log.info(f"Balance: {balance:.2f} USDT")
-    report_startup(balance)
+    log.info("=== ZigZag Institutional Elite V6 MULTI-SCANNER starting ===")
 
-    consecutive_errors = 0
+    symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_top_symbols(MAX_SYMBOLS)
+    balance = get_balance()
+    log.info(f"Balance: {balance:.2f} USDT | Symbols: {len(symbols)}")
+    tg_startup(balance, symbols)
+
+    log.info("Pre-setting leverage for all symbols...")
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+        list(ex.map(set_lev, symbols))
+
+    errors = 0
+    entered_this_cycle: set = set()
 
     while True:
+        t0 = time.time()
         try:
-            df = get_klines(limit=200)
-            sig = compute_signals(df)
-            position = get_position()
             balance = get_balance()
+            positions = get_all_positions()
+            open_count = len(positions)
 
-            log.info(
-                f"Signal={sig['signal']} | Close={sig.get('close','?')} "
-                f"| Peak={sig.get('peak','?'):.4f} | Valley={sig.get('valley','?'):.4f} "
-                f"| InstVol={sig.get('inst_vol','?')}"
-            )
+            log.info(f"── Cycle | {balance:.2f} USDT | {open_count}/{MAX_OPEN_TRADES} trades ──")
 
-            # ── ENTRY ──────────────────────────────────
-            if sig["signal"] and position is None:
-                qty = calc_quantity(balance, sig["close"], sig["sl"])
+            # Escaneo paralelo
+            signals = []
+            with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
+                futures = {ex.submit(scan_symbol, s): s for s in symbols}
+                for f in as_completed(futures):
+                    r = f.result()
+                    if r:
+                        signals.append(r)
+
+            signals.sort(key=lambda x: x["score"], reverse=True)
+            log.info(f"Signals: {len(signals)}/{len(symbols)}")
+
+            if signals:
+                tg_scan(signals, len(symbols), open_count)
+
+            # Ejecutar entradas por orden de score
+            for sig in signals:
+                sym = sig["symbol"]
+                if sym in positions or sym in entered_this_cycle:
+                    continue
+                if open_count >= MAX_OPEN_TRADES:
+                    log.info("Max trades reached.")
+                    break
+
+                qty = calc_qty(balance, sig["close"], sig["sl"])
                 if qty <= 0:
-                    log.warning("Quantity calculated as 0, skipping.")
-                else:
-                    side = "BUY" if sig["signal"] == "LONG" else "SELL"
-                    result = open_order(side, qty, sig["sl"], sig["tp"])
-                    log.info(f"Order placed: {result}")
-                    report_signal(sig, qty, balance)
+                    continue
 
-            consecutive_errors = 0
+                side = "BUY" if sig["signal"] == "LONG" else "SELL"
+                try:
+                    set_lev(sym)
+                    res = open_order(sym, side, qty, sig["sl"], sig["tp"])
+                    log.info(f"ORDER {sym} {side} qty={qty}: {res}")
+                    tg_entry(sig, qty, balance)
+                    entered_this_cycle.add(sym)
+                    open_count += 1
+                    time.sleep(0.5)
+                except Exception as e:
+                    log.error(f"Order error {sym}: {e}")
+
+            entered_this_cycle.clear()
+            errors = 0
 
         except KeyboardInterrupt:
-            log.info("Bot stopped by user.")
-            send_telegram("🛑 <b>Bot detenido manualmente</b>")
+            tg("🛑 <b>Bot detenido manualmente</b>")
             break
         except Exception as e:
-            consecutive_errors += 1
-            log.exception(f"Loop error #{consecutive_errors}: {e}")
-            if consecutive_errors <= 3:
-                report_error("Loop principal", e)
-            if consecutive_errors >= 10:
-                report_error("CRÍTICO: 10 errores consecutivos, deteniendo bot", e)
+            errors += 1
+            log.exception(f"Cycle error #{errors}: {e}")
+            if errors <= 3:
+                tg(f"⚠️ <b>Error #{errors}</b>\n<code>{str(e)[:200]}</code>")
+            if errors >= 10:
+                tg("🔴 <b>CRÍTICO: 10 errores. Bot detenido.</b>")
                 break
 
-        time.sleep(LOOP_SECONDS)
-
+        sleep = max(0, LOOP_SECONDS - (time.time() - t0))
+        log.info(f"Sleeping {sleep:.1f}s")
+        time.sleep(sleep)
 
 if __name__ == "__main__":
     main()
