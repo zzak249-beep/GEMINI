@@ -16,10 +16,9 @@ FIX CRÍTICO v9.1:
     Se fetcha el precio de mercado en vivo JUSTO ANTES de enviar la orden
     y se recalcula SL/TP sobre ese precio actualizado.
 
-AJUSTE v9.3 — FILTROS AÚN MÁS RELAJADOS:
-  - angle_prev eliminado: solo el ángulo actual debe superar SLOPE_LIMIT
-  - USE_DI=false por defecto: filtro DI+/DI- desactivado (demasiado restrictivo)
-  - USE_DI se puede activar con variable de entorno si se desea más calidad
+AJUSTE v9.4 — FIX SPAM TELEGRAM:
+  - get_live_price falla silenciosamente (log warning, sin mensaje Telegram)
+    para símbolos sin Mark Price disponible en BingX (ej: AIXBT-USDT)
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -606,7 +605,7 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9.3 — OPEN SIGNALS</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9.4 — OPEN SIGNALS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
@@ -661,7 +660,7 @@ def tg_entry(sig, qty, balance):
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9.3 OPEN SIGNALS — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9.4 OPEN SIGNALS — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
@@ -674,7 +673,7 @@ def tg_debug(balance, positions, symbols):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9.3 OPEN SIGNALS [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9.4 OPEN SIGNALS [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -743,10 +742,15 @@ def main():
 
                     # ── FIX ERROR 101400 ──────────────────────────────────────
                     # Obtener precio en vivo y recalcular SL/TP justo antes de
-                    # enviar la orden, para que BingX no rechace por SL obsoleto
-                    live_price = get_live_price(sym)
-                    sl_live, tp_live = recalc_sl_tp(sig, live_price)
+                    # enviar la orden. Si el símbolo no tiene Mark Price en BingX
+                    # se descarta silenciosamente (sin spam en Telegram).
+                    try:
+                        live_price = get_live_price(sym)
+                    except Exception as ep:
+                        log.warning(f"Sin precio en vivo para {sym}: {ep} → señal descartada")
+                        continue  # saltar silenciosamente, sin Telegram
 
+                    sl_live, tp_live = recalc_sl_tp(sig, live_price)
                     if sl_live is None:
                         log.warning(f"SL/TP inválido con precio en vivo para {sym} "
                                     f"(live={live_price:.6g}), señal descartada.")
