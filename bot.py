@@ -214,6 +214,7 @@ def set_lev(symbol):
         except Exception:
             pass
 
+# ── FIX PRINCIPAL: stopLoss type=STOP_MARKET, takeProfit type=TAKE_PROFIT_MARKET ──
 def open_order(symbol, side, qty, sl, tp):
     payload = {
         "symbol":       symbol,
@@ -221,8 +222,16 @@ def open_order(symbol, side, qty, sl, tp):
         "positionSide": "LONG" if side=="BUY" else "SHORT",
         "type":         "MARKET",
         "quantity":     round(qty, 4),
-        "stopLoss":     json.dumps({"type":"MARK_PRICE","stopPrice":round(sl,6),"workingType":"MARK_PRICE"}),
-        "takeProfit":   json.dumps({"type":"MARK_PRICE","stopPrice":round(tp,6),"workingType":"MARK_PRICE"}),
+        "stopLoss":     json.dumps({
+            "type":        "STOP_MARKET",        # ← CORREGIDO (antes: "MARK_PRICE")
+            "stopPrice":   round(sl, 6),
+            "workingType": "MARK_PRICE"
+        }),
+        "takeProfit":   json.dumps({
+            "type":        "TAKE_PROFIT_MARKET", # ← CORREGIDO (antes: "MARK_PRICE")
+            "stopPrice":   round(tp, 6),
+            "workingType": "MARK_PRICE"
+        }),
     }
     resp = bx_post("/openApi/swap/v2/trade/order", payload)
     code = resp.get("code", -1)
