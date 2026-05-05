@@ -1,5 +1,5 @@
 """
-ZigZag + EMA Slope + ADX Elite V9 — HIGH WINRATE EDITION
+ZigZag + EMA Slope + ADX Elite V9.2 — BALANCED EDITION
 MEJORAS WINRATE:
   1. Filtro de tendencia mayor: EMA50 en mismo TF (solo LONG si close>EMA50, SHORT si close<EMA50)
   2. RSI como confirmador: evita entrar en sobrecompra/sobreventa extrema
@@ -7,18 +7,20 @@ MEJORAS WINRATE:
   4. Confirmación de cierre de vela: verifica que la vela anterior también confirme dirección
   5. Filtro de spread ATR: descarta señales cuando ATR/precio es demasiado alto (crypto volátil)
   6. SL separación mínima garantizada de 0.5% del precio para evitar error 101400
-  7. Score mínimo elevado a 40 con ponderación revisada
+  7. Score mínimo en 30 (bajado de 40 para más señales)
   8. SLOPE_LOOK=5 para ángulo más estable
-  9. Filtro de horario: evita las primeras velas del día (alta volatilidad caótica)
- 10. Doble confirmación EMA: ema_fast y ema_slow ambas en dirección correcta
+  9. Doble confirmación EMA: ema_fast y ema_slow ambas en dirección correcta
 
 FIX CRÍTICO v9.1:
   - Error 101400 "SL Price must be greater than Last Price":
     Se fetcha el precio de mercado en vivo JUSTO ANTES de enviar la orden
     y se recalcula SL/TP sobre ese precio actualizado.
-    El close_now del scan puede tener 60+ segundos de retraso; el precio
-    puede haberse movido por encima del SL calculado para SHORTs (o por
-    debajo para LONGs), causando el rechazo de BingX.
+
+AJUSTE v9.2 — FILTROS RELAJADOS (más señales):
+  - MIN_SCORE  : 40.0 → 30.0  (menos exigente)
+  - ADX_MIN    : 20.0 → 15.0  (mercados menos tendenciales también válidos)
+  - VOL_MULT   : 1.2  → 1.0   (volumen normal ya es suficiente)
+  - SLOPE_LIMIT: 20.0 → 15.0  (ángulo más suave permitido)
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -43,19 +45,19 @@ LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "10"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "40.0"))
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "30.0"))   # ↓ bajado de 40 → más señales
 MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))
 
 # ── EMA SLOPE ─────────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))
 EMA_TREND        = int(os.environ.get("EMA_TREND",        "50"))
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "20.0"))
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "15.0"))   # ↓ bajado de 20 → ángulo más suave
 SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "15.0"))   # ↓ bajado de 20 → más tendencias válidas
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
@@ -66,7 +68,7 @@ USE_RSI          = os.environ.get("USE_RSI", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.2"))
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))    # ↓ bajado de 1.2 → volumen normal OK
 
 # ── ZIGZAG / ATR ──────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
@@ -602,7 +604,7 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9.1 — HIGH WINRATE</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9.2 — BALANCED</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
@@ -656,7 +658,7 @@ def tg_entry(sig, qty, balance):
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9.1 HIGH WINRATE — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9.2 BALANCED — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
@@ -669,7 +671,7 @@ def tg_debug(balance, positions, symbols):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9.1 HIGH WINRATE [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9.2 BALANCED [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
