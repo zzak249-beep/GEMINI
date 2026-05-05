@@ -1,6 +1,9 @@
 """
 ZigZag + EMA Slope + ADX Elite V9
 Estrategia Pine Script: EMA7/17 + Ángulo≥30° + ADX>20 + Volumen + ZigZag timing
+FIXES APLICADOS:
+  1. open_order: stopLoss type=STOP_MARKET, takeProfit type=TAKE_PROFIT_MARKET
+  2. SL/TP: garantía de que SL siempre esté del lado correcto del precio
 """
 import os, time, hmac, hashlib, json, asyncio, logging, math
 from datetime import datetime, timezone
@@ -28,28 +31,28 @@ MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
 MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "35.0"))
 MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.3"))
 
-# ── EMA SLOPE (Pine Script exact) ─────────────────────────────────────────────
+# ── EMA SLOPE ─────────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "30.0"))  # grados
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "30.0"))
 SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "3"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))  # fuerza mínima
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))   # vol > media*1.0
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))
 
 # ── ZIGZAG ────────────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "3"))
 TP_MULT          = float(os.environ.get("TP_MULT",        "2.0"))
 
-# Modo: "dual" = Slope+ADX+Vol + ZigZag timing | "slope" = solo Slope+ADX+Vol
-STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "dual")
+# Modo: "dual" | "slope" | "zigzag"
+STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "slope")
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
 CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip()] if _raw else []
@@ -154,7 +157,7 @@ def get_all_positions():
 def _is_valid(sym):
     if not sym or not sym.endswith("-USDT"):
         return False
-    base = sym.replace("-USDT","")
+    base = sym.replace("-USDT", "")
     return len(base) >= 2 and not any(base.startswith(p) for p in EXCLUDED_PREFIXES)
 
 def _symbols_from_contracts():
@@ -162,25 +165,25 @@ def _symbols_from_contracts():
     contracts = data.get("data", [])
     if not isinstance(contracts, list) or not contracts:
         raise ValueError("Empty contracts")
-    usdt = [c for c in contracts if isinstance(c,dict) and c.get("asset","")=="USDT" and c.get("status")==1]
+    usdt = [c for c in contracts if isinstance(c, dict) and c.get("asset", "") == "USDT" and c.get("status") == 1]
     if not usdt:
-        usdt = [c for c in contracts if isinstance(c,dict) and c.get("asset","")=="USDT"]
+        usdt = [c for c in contracts if isinstance(c, dict) and c.get("asset", "") == "USDT"]
     if not usdt:
-        usdt = [c for c in contracts if isinstance(c,dict) and str(c.get("symbol","")).endswith("-USDT")]
+        usdt = [c for c in contracts if isinstance(c, dict) and str(c.get("symbol", "")).endswith("-USDT")]
     if not usdt:
         raise ValueError("No USDT contracts")
-    usdt.sort(key=lambda x: float(x.get("tradeAmount",0) or 0), reverse=True)
-    return [c["symbol"] for c in usdt if _is_valid(c.get("symbol",""))]
+    usdt.sort(key=lambda x: float(x.get("tradeAmount", 0) or 0), reverse=True)
+    return [c["symbol"] for c in usdt if _is_valid(c.get("symbol", ""))]
 
 def _symbols_from_ticker():
     data = bx_get("/openApi/swap/v2/quote/ticker", {})
     tickers = data.get("data", [])
     if not isinstance(tickers, list) or not tickers:
         raise ValueError("Empty ticker")
-    usdt = [t for t in tickers if isinstance(t,dict) and _is_valid(t.get("symbol",""))]
+    usdt = [t for t in tickers if isinstance(t, dict) and _is_valid(t.get("symbol", ""))]
     if not usdt:
         raise ValueError("No valid tickers")
-    usdt.sort(key=lambda x: float(x.get("quoteVolume",0) or 0), reverse=True)
+    usdt.sort(key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
     return [t["symbol"] for t in usdt]
 
 def _symbols_from_index():
@@ -188,7 +191,7 @@ def _symbols_from_index():
     items = data.get("data", [])
     if not isinstance(items, list) or not items:
         raise ValueError("Empty premiumIndex")
-    syms = [i["symbol"] for i in items if isinstance(i,dict) and _is_valid(i.get("symbol",""))]
+    syms = [i["symbol"] for i in items if isinstance(i, dict) and _is_valid(i.get("symbol", ""))]
     if not syms:
         raise ValueError("No valid symbols in premiumIndex")
     return syms
@@ -198,37 +201,37 @@ def get_all_symbols(limit=0):
         try:
             syms = fn()
             if syms:
-                result = syms if limit==0 else syms[:limit]
+                result = syms if limit == 0 else syms[:limit]
                 log.info(f"✅ {len(result)} symbols via {fn.__name__}")
                 return result
         except Exception as e:
             log.warning(f"{fn.__name__} failed: {e}")
     log.warning(f"⚠️ Using fallback ({len(FALLBACK_SYMBOLS)} syms)")
-    return FALLBACK_SYMBOLS if limit==0 else FALLBACK_SYMBOLS[:limit]
+    return FALLBACK_SYMBOLS if limit == 0 else FALLBACK_SYMBOLS[:limit]
 
 def set_lev(symbol):
-    for side in ("LONG","SHORT"):
+    for side in ("LONG", "SHORT"):
         try:
             bx_post("/openApi/swap/v2/trade/leverage",
-                    {"symbol":symbol,"side":side,"leverage":LEVERAGE})
+                    {"symbol": symbol, "side": side, "leverage": LEVERAGE})
         except Exception:
             pass
 
-# ── FIX PRINCIPAL: stopLoss type=STOP_MARKET, takeProfit type=TAKE_PROFIT_MARKET ──
+# ── FIX 1: type correcto para SL/TP en BingX ─────────────────────────────────
 def open_order(symbol, side, qty, sl, tp):
     payload = {
         "symbol":       symbol,
         "side":         side,
-        "positionSide": "LONG" if side=="BUY" else "SHORT",
+        "positionSide": "LONG" if side == "BUY" else "SHORT",
         "type":         "MARKET",
         "quantity":     round(qty, 4),
-        "stopLoss":     json.dumps({
-            "type":        "STOP_MARKET",        # ← CORREGIDO (antes: "MARK_PRICE")
+        "stopLoss": json.dumps({
+            "type":        "STOP_MARKET",         # ← CORREGIDO
             "stopPrice":   round(sl, 6),
             "workingType": "MARK_PRICE"
         }),
-        "takeProfit":   json.dumps({
-            "type":        "TAKE_PROFIT_MARKET", # ← CORREGIDO (antes: "MARK_PRICE")
+        "takeProfit": json.dumps({
+            "type":        "TAKE_PROFIT_MARKET",  # ← CORREGIDO
             "stopPrice":   round(tp, 6),
             "workingType": "MARK_PRICE"
         }),
@@ -236,115 +239,100 @@ def open_order(symbol, side, qty, sl, tp):
     resp = bx_post("/openApi/swap/v2/trade/order", payload)
     code = resp.get("code", -1)
     if code != 0:
-        raise ValueError(f"BingX code={code}: {resp.get('msg','unknown')}")
+        raise ValueError(f"BingX code={code}: {resp.get('msg', 'unknown')}")
     return resp
 
 def get_klines(symbol, limit=250):
-    params = {"symbol":symbol, "interval":INTERVAL_MAP.get(TIMEFRAME,"15m"), "limit":limit}
+    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "15m"), "limit": limit}
     data = bx_get("/openApi/swap/v3/quote/klines", params)
     rows = data.get("data", [])
     if not rows or not isinstance(rows, list):
         return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
-    for col in ("open","high","low","close","volume"):
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "close_time"])
+    for col in ("open", "high", "low", "close", "volume"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.dropna(subset=["open", "high", "low", "close", "volume"], inplace=True)
     return df.sort_values("open_time").reset_index(drop=True)
 
 # ── INDICADORES ───────────────────────────────────────────────────────────────
 def calc_atr(high, low, close, period):
-    tr = pd.concat([high-low,
-                    (high-close.shift()).abs(),
-                    (low-close.shift()).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 def calc_ema_angle(ema_s, atr_s, look):
-    """Réplica exacta Pine: atan(price_change / (atr * lookback)) * (180/pi)"""
+    """Réplica Pine: atan(price_change / (atr * lookback)) * (180/pi)"""
     price_change = ema_s - ema_s.shift(look)
     denom = atr_s * look
     angle = np.degrees(np.arctan2(price_change.values, denom.values))
     return pd.Series(angle, index=ema_s.index)
 
 def calc_adx(high, low, close, period):
-    """
-    ADX = Wilder smoothed DX
-    DI+ = 100 * smooth(+DM) / smooth(TR)
-    DI- = 100 * smooth(-DM) / smooth(TR)
-    DX  = 100 * |DI+ - DI-| / (DI+ + DI-)
-    ADX = EMA(DX, period)
-    """
     up   = high.diff()
     down = -low.diff()
     plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    tr = pd.concat([high-low,
-                    (high-close.shift()).abs(),
-                    (low-close.shift()).abs()], axis=1).max(axis=1)
-
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
     alpha = 1.0 / period
     def wilder(arr):
         s = pd.Series(arr, index=high.index)
         return s.ewm(alpha=alpha, adjust=False).mean()
-
     tr_s   = wilder(tr)
     pdm_s  = wilder(plus_dm)
     mdm_s  = wilder(minus_dm)
-
     di_plus  = 100 * pdm_s / tr_s.replace(0, np.nan)
     di_minus = 100 * mdm_s / tr_s.replace(0, np.nan)
-    dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
+    dx  = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
     adx = dx.ewm(alpha=alpha, adjust=False).mean()
     return di_plus, di_minus, adx
 
 def ph_series(high, left, right):
     out = pd.Series(np.nan, index=high.index)
-    for i in range(left, len(high)-right):
-        w = high.iloc[i-left:i+right+1]
+    for i in range(left, len(high) - right):
+        w = high.iloc[i - left:i + right + 1]
         if high.iloc[i] == w.max():
             out.iloc[i] = high.iloc[i]
     return out
 
 def pl_series(low, left, right):
     out = pd.Series(np.nan, index=low.index)
-    for i in range(left, len(low)-right):
-        w = low.iloc[i-left:i+right+1]
+    for i in range(left, len(low) - right):
+        w = low.iloc[i - left:i + right + 1]
         if low.iloc[i] == w.min():
             out.iloc[i] = low.iloc[i]
     return out
 
 # ── ESTRATEGIA PRINCIPAL ──────────────────────────────────────────────────────
 def scan_symbol(symbol):
-    """
-    Pine Script V9 logic:
-      LONG:  EMA7>EMA17  AND angle7 >= +SLOPE_LIMIT  AND adx>ADX_MIN  AND vol>volAvg
-      SHORT: EMA7<EMA17  AND angle7 <= -SLOPE_LIMIT  AND adx>ADX_MIN  AND vol>volAvg
-
-    + ZigZag breakout de pivot para timing de entrada (modo dual)
-
-    SL/TP: basado en ATR y pivot más cercano (como en bot anterior)
-    """
     try:
         df = get_klines(symbol)
-        min_bars = max(PIVOT_LEN*2+2, ATR_LEN+1, EMA_SLOW+10, ADX_LEN*2+5, 60)
+        min_bars = max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, EMA_SLOW + 10, ADX_LEN * 2 + 5, 60)
         if df.empty or len(df) < min_bars:
             return None
 
-        atr_s  = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
-        ema_f  = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-        ema_s  = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-        angle  = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
+        atr_s       = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
+        ema_f       = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
+        ema_s       = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
+        angle       = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
         _, _, adx_s = calc_adx(df["high"], df["low"], df["close"], ADX_LEN)
-        vol_ma = df["volume"].rolling(20).mean()
-        peak   = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
-        valley = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
+        vol_ma      = df["volume"].rolling(20).mean()
+        peak        = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
+        valley      = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
 
-        i = len(df) - 2   # última vela cerrada
-        if i < max(PIVOT_LEN+1, EMA_SLOW+2, ADX_LEN*2):
+        i = len(df) - 2  # última vela cerrada
+        if i < max(PIVOT_LEN + 1, EMA_SLOW + 2, ADX_LEN * 2):
             return None
 
         close_now  = float(df["close"].iloc[i])
-        close_prev = float(df["close"].iloc[i-1])
+        close_prev = float(df["close"].iloc[i - 1])
         ema_f_now  = float(ema_f.iloc[i])
         ema_s_now  = float(ema_s.iloc[i])
         angle_now  = float(angle.iloc[i])
@@ -357,23 +345,21 @@ def scan_symbol(symbol):
 
         if any(np.isnan(x) for x in [angle_now, adx_now, cpeak, cvalley, catr, ema_f_now, ema_s_now]):
             return None
-        if vma <= 0:
+        if vma <= 0 or catr <= 0:
             return None
 
         vratio = round(vol_now / vma, 2)
 
-        # ── Pine Script logic ─────────────────────────────────────────────────
-        vol_confirm  = (not USE_VOL) or (vratio >= VOL_MULT)
-        adx_confirm  = (not USE_ADX) or (adx_now > ADX_MIN)
+        # ── Filtros ───────────────────────────────────────────────────────────
+        vol_confirm = (not USE_VOL) or (vratio >= VOL_MULT)
+        adx_confirm = (not USE_ADX) or (adx_now > ADX_MIN)
 
-        slope_long  = (ema_f_now > ema_s_now) and (angle_now >= SLOPE_LIMIT)  and adx_confirm and vol_confirm
+        slope_long  = (ema_f_now > ema_s_now) and (angle_now >=  SLOPE_LIMIT) and adx_confirm and vol_confirm
         slope_short = (ema_f_now < ema_s_now) and (angle_now <= -SLOPE_LIMIT) and adx_confirm and vol_confirm
 
-        # ── ZigZag breakout ───────────────────────────────────────────────────
         zz_long  = (close_prev <= cpeak)   and (close_now > cpeak)
         zz_short = (close_prev >= cvalley) and (close_now < cvalley)
 
-        # ── Combinar según modo ───────────────────────────────────────────────
         if STRATEGY_MODE == "slope":
             is_long, is_short = slope_long, slope_short
             method = "SLOPE+ADX"
@@ -381,7 +367,7 @@ def scan_symbol(symbol):
             is_long  = zz_long  and vol_confirm
             is_short = zz_short and vol_confirm
             method = "ZIGZAG"
-        else:  # dual — slope da dirección, zigzag da timing
+        else:  # dual
             is_long  = slope_long  and zz_long
             is_short = slope_short and zz_short
             method = "DUAL"
@@ -391,13 +377,29 @@ def scan_symbol(symbol):
 
         direction = "LONG" if is_long else "SHORT"
 
-        # ── SL / TP via ATR + pivot ───────────────────────────────────────────
+        # ── FIX 2: SL/TP con garantía de posición correcta ───────────────────
         if direction == "LONG":
-            sl_price = max(cvalley, close_now - catr * 2)
+            sl_price = min(cvalley, close_now - catr * 2)
+            # Garantía: SL SIEMPRE por debajo del precio de entrada
+            if sl_price >= close_now:
+                sl_price = close_now - catr * 2
             tp_price = close_now + (close_now - sl_price) * TP_MULT
         else:
-            sl_price = min(cpeak, close_now + catr * 2)
+            sl_price = max(cpeak, close_now + catr * 2)
+            # Garantía: SL SIEMPRE por encima del precio de entrada
+            if sl_price <= close_now:
+                sl_price = close_now + catr * 2
             tp_price = close_now - (sl_price - close_now) * TP_MULT
+
+        # Validaciones finales de SL/TP
+        if direction == "LONG":
+            if sl_price >= close_now or tp_price <= close_now:
+                log.debug(f"{symbol} LONG SL/TP inválido: sl={sl_price} tp={tp_price} close={close_now}")
+                return None
+        else:
+            if sl_price <= close_now or tp_price >= close_now:
+                log.debug(f"{symbol} SHORT SL/TP inválido: sl={sl_price} tp={tp_price} close={close_now}")
+                return None
 
         dist = abs(close_now - sl_price)
         if dist == 0:
@@ -410,10 +412,10 @@ def scan_symbol(symbol):
         rr = abs(tp_price - close_now) / dist
 
         # Score compuesto
-        score  = min(abs(angle_now) / SLOPE_LIMIT * 25, 30)   # ángulo (30)
-        score += min((adx_now - ADX_MIN) / ADX_MIN * 20, 25)   # ADX (25)
-        score += min(vratio * 15, 25)                            # volumen (25)
-        score += min(rr * 10, 20)                                # RR (20)
+        score  = min(abs(angle_now) / SLOPE_LIMIT * 25, 30)
+        score += min((adx_now - ADX_MIN) / ADX_MIN * 20, 25)
+        score += min(vratio * 15, 25)
+        score += min(rr * 10, 20)
 
         if score < MIN_SCORE:
             return None
@@ -479,7 +481,7 @@ def tg_scan(signals, total, open_count):
         "━━━━━━━━━━━━━━━━━━━━",
     ]
     for s in signals[:8]:
-        e = "🟢" if s["signal"]=="LONG" else "🔴"
+        e = "🟢" if s["signal"] == "LONG" else "🔴"
         lines.append(
             f"{e} <b>{s['symbol']}</b> [{s['method']}] "
             f"Score:{s['score']} Ang:{s['angle']}° ADX:{s['adx']} Vol:{s['vol_ratio']}x"
@@ -488,7 +490,7 @@ def tg_scan(signals, total, open_count):
     tg("\n".join(lines))
 
 def tg_entry(sig, qty, balance):
-    d = "🟢 LONG" if sig["signal"]=="LONG" else "🔴 SHORT"
+    d = "🟢 LONG" if sig["signal"] == "LONG" else "🔴 SHORT"
     tg(
         f"<b>✅ ORDEN EN BINGX — {sig['symbol']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -499,7 +501,7 @@ def tg_entry(sig, qty, balance):
         f"<b>Stop Loss:</b>   <code>{sig['sl']:.6g}</code> ({sig['dist_pct']}%)\n"
         f"<b>Take Profit:</b> <code>{sig['tp']:.6g}</code>\n"
         f"<b>RR:</b> 1:{sig['rr']} | <b>Qty:</b> {qty} | "
-        f"<b>Riesgo:</b> {balance*RISK_PERCENT/100:.2f} USDT\n"
+        f"<b>Riesgo:</b> {balance * RISK_PERCENT / 100:.2f} USDT\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -535,7 +537,7 @@ def main():
         list(ex.map(set_lev, symbols))
     log.info("Ready. Main loop starting.")
 
-    errors = 0
+    errors  = 0
     entered: set = set()
 
     while True:
@@ -562,8 +564,11 @@ def main():
             if signals:
                 tg_scan(signals, len(symbols), open_count)
                 for s in signals[:5]:
-                    log.info(f"  → {s['symbol']} {s['signal']} [{s['method']}] "
-                             f"score={s['score']} ang={s['angle']}° adx={s['adx']} vol={s['vol_ratio']}x")
+                    log.info(
+                        f"  → {s['symbol']} {s['signal']} [{s['method']}] "
+                        f"score={s['score']} ang={s['angle']}° adx={s['adx']} "
+                        f"vol={s['vol_ratio']}x sl={s['sl']:.6g} tp={s['tp']:.6g}"
+                    )
 
             for sig in signals:
                 sym = sig["symbol"]
@@ -580,11 +585,11 @@ def main():
                 if qty <= 0:
                     continue
 
-                side = "BUY" if sig["signal"]=="LONG" else "SELL"
+                side = "BUY" if sig["signal"] == "LONG" else "SELL"
                 try:
                     set_lev(sym)
                     res = open_order(sym, side, qty, sig["sl"], sig["tp"])
-                    log.info(f"✅ {sym} {side} qty={qty} | {res}")
+                    log.info(f"✅ {sym} {side} qty={qty} sl={sig['sl']:.6g} tp={sig['tp']:.6g} | {res}")
                     tg_entry(sig, qty, balance)
                     entered.add(sym)
                     open_count += 1
