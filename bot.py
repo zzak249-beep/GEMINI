@@ -11,9 +11,14 @@ MEJORAS WINRATE:
   8. SLOPE_LOOK=5 para ángulo más estable
   9. Filtro de horario: evita las primeras velas del día (alta volatilidad caótica)
  10. Doble confirmación EMA: ema_fast y ema_slow ambas en dirección correcta
-FIXES APLICADOS:
-  - open_order: STOP_MARKET / TAKE_PROFIT_MARKET
-  - SL/TP: garantía de posición + separación mínima
+
+FIX CRÍTICO v9.1:
+  - Error 101400 "SL Price must be greater than Last Price":
+    Se fetcha el precio de mercado en vivo JUSTO ANTES de enviar la orden
+    y se recalcula SL/TP sobre ese precio actualizado.
+    El close_now del scan puede tener 60+ segundos de retraso; el precio
+    puede haberse movido por encima del SL calculado para SHORTs (o por
+    debajo para LONGs), causando el rechazo de BingX.
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -38,39 +43,38 @@ LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "10"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "40.0"))   # ↑ subido de 25
-MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))    # ↑ subido de 0.3
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "40.0"))
+MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))
 
 # ── EMA SLOPE ─────────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))
-EMA_TREND        = int(os.environ.get("EMA_TREND",        "50"))     # NUEVO: filtro tendencia
+EMA_TREND        = int(os.environ.get("EMA_TREND",        "50"))
 SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "20.0"))
-SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))      # ↑ subido de 3
+SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))   # ↑ subido de 15
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
 
-# ── RSI (nuevo filtro winrate) ────────────────────────────────────────────────
+# ── RSI ───────────────────────────────────────────────────────────────────────
 RSI_LEN          = int(os.environ.get("RSI_LEN",          "14"))
-RSI_OB           = float(os.environ.get("RSI_OB",         "70.0"))   # overbought — no LONG
-RSI_OS           = float(os.environ.get("RSI_OS",         "30.0"))   # oversold   — no SHORT
+RSI_OB           = float(os.environ.get("RSI_OB",         "70.0"))
+RSI_OS           = float(os.environ.get("RSI_OS",         "30.0"))
 USE_RSI          = os.environ.get("USE_RSI", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.2"))    # ↑ subido de 1.0
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.2"))
 
 # ── ZIGZAG / ATR ──────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "3"))
-TP_MULT          = float(os.environ.get("TP_MULT",        "1.5"))    # ↓ bajado de 2.0 → más alcanzable
-SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",    "1.5"))    # NUEVO: multiplicador SL
-ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "3.0"))    # NUEVO: descartar si ATR>3% precio
+TP_MULT          = float(os.environ.get("TP_MULT",        "1.5"))
+SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",    "1.5"))
+ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "3.0"))
 
-# Modo operativo
 STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "slope")
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
@@ -236,7 +240,80 @@ def set_lev(symbol):
         except Exception:
             pass
 
-# ── ORDEN — TIPOS CORREGIDOS ──────────────────────────────────────────────────
+# ── PRECIO EN VIVO ────────────────────────────────────────────────────────────
+# FIX error 101400: obtener precio de mercado actual justo antes de enviar orden
+def get_live_price(symbol):
+    """
+    Obtiene el Mark Price actual de BingX para el símbolo dado.
+    Se usa para recalcular SL/TP en el momento exacto de la orden,
+    evitando el error 101400 causado por el desfase entre el precio
+    del scan y el precio real en el momento de la ejecución.
+    """
+    try:
+        data = bx_get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
+        items = data.get("data", [])
+        if isinstance(items, list):
+            for item in items:
+                if item.get("symbol") == symbol:
+                    return float(item["markPrice"])
+        # Fallback: último precio del ticker
+        data2 = bx_get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+        tickers = data2.get("data", [])
+        if isinstance(tickers, list):
+            for t in tickers:
+                if t.get("symbol") == symbol:
+                    return float(t["lastPrice"])
+        raise ValueError(f"No se encontró precio en vivo para {symbol}")
+    except Exception as e:
+        raise ValueError(f"get_live_price({symbol}) falló: {e}")
+
+
+def recalc_sl_tp(sig, live_price):
+    """
+    Recalcula SL y TP usando el precio en vivo en lugar del close_now del scan.
+
+    El close_now puede tener 60+ segundos de antigüedad. Si el precio se movió
+    en ese tiempo (especialmente en SHORTs, donde SL debe estar POR ENCIMA del
+    precio), BingX rechaza la orden con código 101400.
+
+    Retorna (sl_price, tp_price) redondeados, o (None, None) si no son válidos.
+    """
+    catr      = sig["atr"]
+    direction = sig["signal"]
+    sl_distance = catr * SL_ATR_MULT
+
+    if direction == "LONG":
+        # SL debe estar POR DEBAJO del precio actual
+        sl_price = live_price - sl_distance
+        # Garantía de separación mínima
+        if (live_price - sl_price) / live_price * 100 < MIN_DIST_PCT:
+            sl_price = live_price * (1 - MIN_DIST_PCT / 100)
+        tp_price = live_price + (live_price - sl_price) * TP_MULT
+        # Validación final
+        if sl_price >= live_price or tp_price <= live_price:
+            log.warning(f"recalc_sl_tp LONG inválido: price={live_price} sl={sl_price} tp={tp_price}")
+            return None, None
+    else:
+        # SHORT: SL debe estar POR ENCIMA del precio actual ← aquí estaba el error 101400
+        sl_price = live_price + sl_distance
+        # Garantía de separación mínima
+        if (sl_price - live_price) / live_price * 100 < MIN_DIST_PCT:
+            sl_price = live_price * (1 + MIN_DIST_PCT / 100)
+        tp_price = live_price - (sl_price - live_price) * TP_MULT
+        # Validación final
+        if sl_price <= live_price or tp_price >= live_price:
+            log.warning(f"recalc_sl_tp SHORT inválido: price={live_price} sl={sl_price} tp={tp_price}")
+            return None, None
+
+    dist_pct = abs(live_price - sl_price) / live_price * 100
+    if dist_pct < MIN_DIST_PCT:
+        log.warning(f"recalc_sl_tp dist_pct {dist_pct:.3f}% < mínimo {MIN_DIST_PCT}%")
+        return None, None
+
+    return round(sl_price, 6), round(tp_price, 6)
+
+
+# ── ORDEN ─────────────────────────────────────────────────────────────────────
 def open_order(symbol, side, qty, sl, tp):
     payload = {
         "symbol":       symbol,
@@ -312,7 +389,6 @@ def calc_adx(high, low, close, period):
     return di_plus, di_minus, adx
 
 def calc_rsi(close, period):
-    """RSI estándar Wilder"""
     delta = close.diff()
     gain  = delta.clip(lower=0)
     loss  = (-delta).clip(lower=0)
@@ -347,19 +423,18 @@ def scan_symbol(symbol):
         if df.empty or len(df) < min_bars:
             return None
 
-        # ── Indicadores ───────────────────────────────────────────────────────
         atr_s        = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
         ema_f        = df["close"].ewm(span=EMA_FAST,  adjust=False).mean()
         ema_s        = df["close"].ewm(span=EMA_SLOW,  adjust=False).mean()
-        ema_trend    = df["close"].ewm(span=EMA_TREND, adjust=False).mean()  # NUEVO
+        ema_trend    = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
         angle        = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
         di_p, di_m, adx_s = calc_adx(df["high"], df["low"], df["close"], ADX_LEN)
-        rsi_s        = calc_rsi(df["close"], RSI_LEN)                        # NUEVO
+        rsi_s        = calc_rsi(df["close"], RSI_LEN)
         vol_ma       = df["volume"].rolling(20).mean()
         peak         = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
         valley       = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
 
-        i = len(df) - 2  # última vela cerrada
+        i = len(df) - 2
         if i < max(PIVOT_LEN + 1, EMA_TREND + 2, ADX_LEN * 2):
             return None
 
@@ -369,7 +444,7 @@ def scan_symbol(symbol):
         ema_s_now    = float(ema_s.iloc[i])
         ema_trend_now= float(ema_trend.iloc[i])
         angle_now    = float(angle.iloc[i])
-        angle_prev   = float(angle.iloc[i - 1])   # NUEVO: confirmación previa
+        angle_prev   = float(angle.iloc[i - 1])
         adx_now      = float(adx_s.iloc[i])
         di_p_now     = float(di_p.iloc[i])
         di_m_now     = float(di_m.iloc[i])
@@ -387,54 +462,46 @@ def scan_symbol(symbol):
         if vma <= 0 or catr <= 0:
             return None
 
-        # ── Filtro ATR volatilidad extrema ────────────────────────────────────
         atr_pct = (catr / close_now) * 100
         if atr_pct > ATR_MAX_PCT:
-            return None  # demasiado volátil → SL muy amplio, riesgo de liquidación
+            return None
 
         vratio = round(vol_now / vma, 2)
 
-        # ── Filtros base ──────────────────────────────────────────────────────
         vol_confirm  = (not USE_VOL) or (vratio >= VOL_MULT)
         adx_confirm  = (not USE_ADX) or (adx_now > ADX_MIN)
 
-        # ── NUEVO: Filtro tendencia EMA50 ─────────────────────────────────────
-        trend_long  = close_now > ema_trend_now   # precio sobre EMA50 → sesgo alcista
-        trend_short = close_now < ema_trend_now   # precio bajo EMA50  → sesgo bajista
+        trend_long  = close_now > ema_trend_now
+        trend_short = close_now < ema_trend_now
 
-        # ── NUEVO: Filtro RSI ─────────────────────────────────────────────────
-        rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)   # no entrar LONG en sobrecompra
-        rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)   # no entrar SHORT en sobreventa
+        rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)
+        rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)
 
-        # ── NUEVO: DI confirmación — DI+ > DI- para LONG, DI- > DI+ para SHORT
         di_long_ok  = di_p_now > di_m_now
         di_short_ok = di_m_now > di_p_now
 
-        # ── NUEVO: Ángulo consistente (actual y previo en misma dirección) ─────
         angle_long_ok  = (angle_now >= SLOPE_LIMIT)  and (angle_prev >= SLOPE_LIMIT * 0.5)
         angle_short_ok = (angle_now <= -SLOPE_LIMIT) and (angle_prev <= -SLOPE_LIMIT * 0.5)
 
-        # ── Señales SLOPE ─────────────────────────────────────────────────────
         slope_long = (
             ema_f_now > ema_s_now and
             angle_long_ok         and
             adx_confirm           and
             vol_confirm           and
-            trend_long            and   # NUEVO
-            rsi_long_ok           and   # NUEVO
-            di_long_ok                  # NUEVO
+            trend_long            and
+            rsi_long_ok           and
+            di_long_ok
         )
         slope_short = (
             ema_f_now < ema_s_now and
             angle_short_ok        and
             adx_confirm           and
             vol_confirm           and
-            trend_short           and   # NUEVO
-            rsi_short_ok          and   # NUEVO
-            di_short_ok                 # NUEVO
+            trend_short           and
+            rsi_short_ok          and
+            di_short_ok
         )
 
-        # ── ZigZag breakout ───────────────────────────────────────────────────
         zz_long  = (close_prev <= cpeak)   and (close_now > cpeak)
         zz_short = (close_prev >= cvalley) and (close_now < cvalley)
 
@@ -445,7 +512,7 @@ def scan_symbol(symbol):
             is_long  = zz_long  and vol_confirm and trend_long
             is_short = zz_short and vol_confirm and trend_short
             method = "ZIGZAG"
-        else:  # dual
+        else:
             is_long  = slope_long  and zz_long
             is_short = slope_short and zz_short
             method = "DUAL"
@@ -455,27 +522,24 @@ def scan_symbol(symbol):
 
         direction = "LONG" if is_long else "SHORT"
 
-        # ── SL/TP con separación mínima garantizada ───────────────────────────
-        sl_distance = catr * SL_ATR_MULT  # mínimo 1.5x ATR de distancia
+        # SL/TP basado en close_now para calcular score y referencias del scan
+        # (el SL/TP REAL se recalculará con precio en vivo antes de la orden)
+        sl_distance = catr * SL_ATR_MULT
 
         if direction == "LONG":
             sl_pivot  = min(cvalley, close_now - sl_distance)
             sl_price  = min(sl_pivot, close_now - sl_distance)
-            # Garantía absoluta: SL < precio y separación mínima
             if sl_price >= close_now or (close_now - sl_price) / close_now * 100 < MIN_DIST_PCT:
                 sl_price = close_now * (1 - MIN_DIST_PCT / 100)
             tp_price  = close_now + (close_now - sl_price) * TP_MULT
-            # Validación final
             if sl_price >= close_now or tp_price <= close_now:
                 return None
         else:
             sl_pivot  = max(cpeak, close_now + sl_distance)
             sl_price  = max(sl_pivot, close_now + sl_distance)
-            # Garantía absoluta: SL > precio y separación mínima
             if sl_price <= close_now or (sl_price - close_now) / close_now * 100 < MIN_DIST_PCT:
                 sl_price = close_now * (1 + MIN_DIST_PCT / 100)
             tp_price  = close_now - (sl_price - close_now) * TP_MULT
-            # Validación final
             if sl_price <= close_now or tp_price >= close_now:
                 return None
 
@@ -486,13 +550,12 @@ def scan_symbol(symbol):
 
         rr = abs(tp_price - close_now) / dist
 
-        # ── Score mejorado ────────────────────────────────────────────────────
-        score  = min(abs(angle_now) / SLOPE_LIMIT * 20, 25)            # ángulo    (25)
-        score += min((adx_now - ADX_MIN) / ADX_MIN * 15, 20)           # ADX       (20)
-        score += min(vratio * 10, 20)                                    # volumen   (20)
-        score += min(rr * 8, 15)                                         # RR        (15)
-        score += 10 if trend_long or trend_short else 0                  # EMA50     (10) NUEVO
-        score += min(abs(di_p_now - di_m_now) / 10, 10)                 # DI spread (10) NUEVO
+        score  = min(abs(angle_now) / SLOPE_LIMIT * 20, 25)
+        score += min((adx_now - ADX_MIN) / ADX_MIN * 15, 20)
+        score += min(vratio * 10, 20)
+        score += min(rr * 8, 15)
+        score += 10 if trend_long or trend_short else 0
+        score += min(abs(di_p_now - di_m_now) / 10, 10)
 
         if score < MIN_SCORE:
             return None
@@ -539,7 +602,7 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9 — HIGH WINRATE</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9.1 — HIGH WINRATE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
@@ -552,6 +615,7 @@ def tg_startup(balance, symbols):
         f"<b>TP:</b> 1:{TP_MULT} | <b>Lev:</b> {LEVERAGE}x | "
         f"<b>Monedas:</b> {len(symbols)} | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
         f"<b>Balance:</b> {balance:.2f} USDT\n"
+        f"🔧 <b>Fix 101400:</b> SL/TP recalculado con precio en vivo ✅\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -592,19 +656,20 @@ def tg_entry(sig, qty, balance):
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9 HIGH WINRATE — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9.1 HIGH WINRATE — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
         f"<b>EMA {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND}</b> Slope≥{SLOPE_LIMIT}° "
         f"ADX≥{ADX_MIN} Vol≥{VOL_MULT}x RSI {RSI_OS}-{RSI_OB} Score≥{MIN_SCORE}\n"
         f"<b>SL ATR mult:</b> {SL_ATR_MULT}x | <b>TP mult:</b> {TP_MULT}x\n"
-        f"<b>MAX_OPEN_TRADES:</b> {MAX_OPEN_TRADES} | <b>TF:</b> {TIMEFRAME}"
+        f"<b>MAX_OPEN_TRADES:</b> {MAX_OPEN_TRADES} | <b>TF:</b> {TIMEFRAME}\n"
+        f"<b>Fix 101400:</b> precio en vivo antes de orden ✅"
     )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9 HIGH WINRATE [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9.1 HIGH WINRATE [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -661,25 +726,51 @@ def main():
                 if sym in positions or sym in entered:
                     continue
                 if open_count >= MAX_OPEN_TRADES:
-                    log.info(f"Max trades ({MAX_OPEN_TRADES}) reached.")
+                    log.info(f"Max trades ({MAX_OPEN_TRADES}) alcanzado.")
                     break
                 if balance < 5:
-                    log.warning(f"Balance too low ({balance:.2f})")
+                    log.warning(f"Balance demasiado bajo ({balance:.2f})")
                     break
-
-                qty = calc_qty(balance, sig["close"], sig["sl"])
-                if qty <= 0:
-                    continue
 
                 side = "BUY" if sig["signal"] == "LONG" else "SELL"
                 try:
                     set_lev(sym)
-                    res = open_order(sym, side, qty, sig["sl"], sig["tp"])
-                    log.info(f"✅ {sym} {side} qty={qty} | {res}")
+
+                    # ── FIX ERROR 101400 ──────────────────────────────────────
+                    # Obtener precio en vivo y recalcular SL/TP justo antes de
+                    # enviar la orden, para que BingX no rechace por SL obsoleto
+                    live_price = get_live_price(sym)
+                    sl_live, tp_live = recalc_sl_tp(sig, live_price)
+
+                    if sl_live is None:
+                        log.warning(f"SL/TP inválido con precio en vivo para {sym} "
+                                    f"(live={live_price:.6g}), señal descartada.")
+                        continue
+
+                    log.info(f"Precio en vivo {sym}: scan={sig['close']:.6g} "
+                             f"live={live_price:.6g} | "
+                             f"SL scan={sig['sl']:.6g} → SL live={sl_live:.6g}")
+
+                    qty = calc_qty(balance, live_price, sl_live)
+                    if qty <= 0:
+                        continue
+
+                    res = open_order(sym, side, qty, sl_live, tp_live)
+                    log.info(f"✅ {sym} {side} qty={qty} live={live_price:.6g} "
+                             f"sl={sl_live:.6g} tp={tp_live:.6g} | {res}")
+
+                    # Actualizar sig con valores reales para el mensaje Telegram
+                    sig["close"]    = live_price
+                    sig["sl"]       = sl_live
+                    sig["tp"]       = tp_live
+                    sig["dist_pct"] = round(abs(live_price - sl_live) / live_price * 100, 3)
+                    sig["rr"]       = round(abs(tp_live - live_price) / abs(live_price - sl_live), 2)
+
                     tg_entry(sig, qty, balance)
                     entered.add(sym)
                     open_count += 1
                     time.sleep(0.5)
+
                 except Exception as e:
                     log.error(f"Order FAILED {sym}: {e}")
                     tg(f"⚠️ <b>Error {sym}</b>: <code>{str(e)[:150]}</code>")
