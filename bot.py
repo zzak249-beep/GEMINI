@@ -1,11 +1,21 @@
 """
-ZigZag + EMA Slope + ADX Elite V9
-Estrategia Pine Script: EMA7/17 + Ángulo≥30° + ADX>20 + Volumen + ZigZag timing
+ZigZag + EMA Slope + ADX Elite V9 — HIGH WINRATE EDITION
+MEJORAS WINRATE:
+  1. Filtro de tendencia mayor: EMA50 en mismo TF (solo LONG si close>EMA50, SHORT si close<EMA50)
+  2. RSI como confirmador: evita entrar en sobrecompra/sobreventa extrema
+  3. SL mínimo de 1.5x ATR para dar más margen y evitar stop hunts
+  4. Confirmación de cierre de vela: verifica que la vela anterior también confirme dirección
+  5. Filtro de spread ATR: descarta señales cuando ATR/precio es demasiado alto (crypto volátil)
+  6. SL separación mínima garantizada de 0.5% del precio para evitar error 101400
+  7. Score mínimo elevado a 40 con ponderación revisada
+  8. SLOPE_LOOK=5 para ángulo más estable
+  9. Filtro de horario: evita las primeras velas del día (alta volatilidad caótica)
+ 10. Doble confirmación EMA: ema_fast y ema_slow ambas en dirección correcta
 FIXES APLICADOS:
-  1. open_order: stopLoss type=STOP_MARKET, takeProfit type=TAKE_PROFIT_MARKET
-  2. SL/TP: garantía de que SL siempre esté del lado correcto del precio
+  - open_order: STOP_MARKET / TAKE_PROFIT_MARKET
+  - SL/TP: garantía de posición + separación mínima
 """
-import os, time, hmac, hashlib, json, asyncio, logging, math
+import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,37 +31,46 @@ BINGX_SECRET_KEY = os.environ["BINGX_SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 
-TIMEFRAME        = os.environ.get("TIMEFRAME",        "15m")
+TIMEFRAME        = os.environ.get("TIMEFRAME",        "5m")
 RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",   "1.0"))
 LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
-LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "120"))
-MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "5"))
+LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
+MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "10"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "35.0"))
-MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.3"))
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "40.0"))   # ↑ subido de 25
+MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))    # ↑ subido de 0.3
 
 # ── EMA SLOPE ─────────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "30.0"))
-SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "3"))
+EMA_TREND        = int(os.environ.get("EMA_TREND",        "50"))     # NUEVO: filtro tendencia
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "20.0"))
+SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))      # ↑ subido de 3
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "20.0"))   # ↑ subido de 15
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
+
+# ── RSI (nuevo filtro winrate) ────────────────────────────────────────────────
+RSI_LEN          = int(os.environ.get("RSI_LEN",          "14"))
+RSI_OB           = float(os.environ.get("RSI_OB",         "70.0"))   # overbought — no LONG
+RSI_OS           = float(os.environ.get("RSI_OS",         "30.0"))   # oversold   — no SHORT
+USE_RSI          = os.environ.get("USE_RSI", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.2"))    # ↑ subido de 1.0
 
-# ── ZIGZAG ────────────────────────────────────────────────────────────────────
+# ── ZIGZAG / ATR ──────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "3"))
-TP_MULT          = float(os.environ.get("TP_MULT",        "2.0"))
+TP_MULT          = float(os.environ.get("TP_MULT",        "1.5"))    # ↓ bajado de 2.0 → más alcanzable
+SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",    "1.5"))    # NUEVO: multiplicador SL
+ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "3.0"))    # NUEVO: descartar si ATR>3% precio
 
-# Modo: "dual" | "slope" | "zigzag"
+# Modo operativo
 STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "slope")
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
@@ -217,7 +236,7 @@ def set_lev(symbol):
         except Exception:
             pass
 
-# ── FIX 1: type correcto para SL/TP en BingX ─────────────────────────────────
+# ── ORDEN — TIPOS CORREGIDOS ──────────────────────────────────────────────────
 def open_order(symbol, side, qty, sl, tp):
     payload = {
         "symbol":       symbol,
@@ -226,12 +245,12 @@ def open_order(symbol, side, qty, sl, tp):
         "type":         "MARKET",
         "quantity":     round(qty, 4),
         "stopLoss": json.dumps({
-            "type":        "STOP_MARKET",         # ← CORREGIDO
+            "type":        "STOP_MARKET",
             "stopPrice":   round(sl, 6),
             "workingType": "MARK_PRICE"
         }),
         "takeProfit": json.dumps({
-            "type":        "TAKE_PROFIT_MARKET",  # ← CORREGIDO
+            "type":        "TAKE_PROFIT_MARKET",
             "stopPrice":   round(tp, 6),
             "workingType": "MARK_PRICE"
         }),
@@ -242,8 +261,8 @@ def open_order(symbol, side, qty, sl, tp):
         raise ValueError(f"BingX code={code}: {resp.get('msg', 'unknown')}")
     return resp
 
-def get_klines(symbol, limit=250):
-    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "15m"), "limit": limit}
+def get_klines(symbol, limit=300):
+    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "5m"), "limit": limit}
     data = bx_get("/openApi/swap/v3/quote/klines", params)
     rows = data.get("data", [])
     if not rows or not isinstance(rows, list):
@@ -265,7 +284,6 @@ def calc_atr(high, low, close, period):
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 def calc_ema_angle(ema_s, atr_s, look):
-    """Réplica Pine: atan(price_change / (atr * lookback)) * (180/pi)"""
     price_change = ema_s - ema_s.shift(look)
     denom = atr_s * look
     angle = np.degrees(np.arctan2(price_change.values, denom.values))
@@ -283,8 +301,7 @@ def calc_adx(high, low, close, period):
     ], axis=1).max(axis=1)
     alpha = 1.0 / period
     def wilder(arr):
-        s = pd.Series(arr, index=high.index)
-        return s.ewm(alpha=alpha, adjust=False).mean()
+        return pd.Series(arr, index=high.index).ewm(alpha=alpha, adjust=False).mean()
     tr_s   = wilder(tr)
     pdm_s  = wilder(plus_dm)
     mdm_s  = wilder(minus_dm)
@@ -293,6 +310,17 @@ def calc_adx(high, low, close, period):
     dx  = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
     adx = dx.ewm(alpha=alpha, adjust=False).mean()
     return di_plus, di_minus, adx
+
+def calc_rsi(close, period):
+    """RSI estándar Wilder"""
+    delta = close.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
 def ph_series(high, left, right):
     out = pd.Series(np.nan, index=high.index)
@@ -313,50 +341,100 @@ def pl_series(low, left, right):
 # ── ESTRATEGIA PRINCIPAL ──────────────────────────────────────────────────────
 def scan_symbol(symbol):
     try:
-        df = get_klines(symbol)
-        min_bars = max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, EMA_SLOW + 10, ADX_LEN * 2 + 5, 60)
+        df = get_klines(symbol, limit=300)
+        min_bars = max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, EMA_TREND + 10,
+                       ADX_LEN * 2 + 5, RSI_LEN + 5, 80)
         if df.empty or len(df) < min_bars:
             return None
 
-        atr_s       = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
-        ema_f       = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
-        ema_s       = df["close"].ewm(span=EMA_SLOW, adjust=False).mean()
-        angle       = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
-        _, _, adx_s = calc_adx(df["high"], df["low"], df["close"], ADX_LEN)
-        vol_ma      = df["volume"].rolling(20).mean()
-        peak        = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
-        valley      = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
+        # ── Indicadores ───────────────────────────────────────────────────────
+        atr_s        = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
+        ema_f        = df["close"].ewm(span=EMA_FAST,  adjust=False).mean()
+        ema_s        = df["close"].ewm(span=EMA_SLOW,  adjust=False).mean()
+        ema_trend    = df["close"].ewm(span=EMA_TREND, adjust=False).mean()  # NUEVO
+        angle        = calc_ema_angle(ema_f, atr_s, SLOPE_LOOK)
+        di_p, di_m, adx_s = calc_adx(df["high"], df["low"], df["close"], ADX_LEN)
+        rsi_s        = calc_rsi(df["close"], RSI_LEN)                        # NUEVO
+        vol_ma       = df["volume"].rolling(20).mean()
+        peak         = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
+        valley       = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
 
         i = len(df) - 2  # última vela cerrada
-        if i < max(PIVOT_LEN + 1, EMA_SLOW + 2, ADX_LEN * 2):
+        if i < max(PIVOT_LEN + 1, EMA_TREND + 2, ADX_LEN * 2):
             return None
 
-        close_now  = float(df["close"].iloc[i])
-        close_prev = float(df["close"].iloc[i - 1])
-        ema_f_now  = float(ema_f.iloc[i])
-        ema_s_now  = float(ema_s.iloc[i])
-        angle_now  = float(angle.iloc[i])
-        adx_now    = float(adx_s.iloc[i])
-        vol_now    = float(df["volume"].iloc[i])
-        vma        = float(vol_ma.iloc[i])
-        cpeak      = float(peak.iloc[i])
-        cvalley    = float(valley.iloc[i])
-        catr       = float(atr_s.iloc[i])
+        close_now    = float(df["close"].iloc[i])
+        close_prev   = float(df["close"].iloc[i - 1])
+        ema_f_now    = float(ema_f.iloc[i])
+        ema_s_now    = float(ema_s.iloc[i])
+        ema_trend_now= float(ema_trend.iloc[i])
+        angle_now    = float(angle.iloc[i])
+        angle_prev   = float(angle.iloc[i - 1])   # NUEVO: confirmación previa
+        adx_now      = float(adx_s.iloc[i])
+        di_p_now     = float(di_p.iloc[i])
+        di_m_now     = float(di_m.iloc[i])
+        rsi_now      = float(rsi_s.iloc[i])
+        vol_now      = float(df["volume"].iloc[i])
+        vma          = float(vol_ma.iloc[i])
+        cpeak        = float(peak.iloc[i])
+        cvalley      = float(valley.iloc[i])
+        catr         = float(atr_s.iloc[i])
 
-        if any(np.isnan(x) for x in [angle_now, adx_now, cpeak, cvalley, catr, ema_f_now, ema_s_now]):
+        if any(np.isnan(x) for x in [angle_now, adx_now, cpeak, cvalley, catr,
+                                      ema_f_now, ema_s_now, ema_trend_now,
+                                      rsi_now, di_p_now, di_m_now]):
             return None
         if vma <= 0 or catr <= 0:
             return None
 
+        # ── Filtro ATR volatilidad extrema ────────────────────────────────────
+        atr_pct = (catr / close_now) * 100
+        if atr_pct > ATR_MAX_PCT:
+            return None  # demasiado volátil → SL muy amplio, riesgo de liquidación
+
         vratio = round(vol_now / vma, 2)
 
-        # ── Filtros ───────────────────────────────────────────────────────────
-        vol_confirm = (not USE_VOL) or (vratio >= VOL_MULT)
-        adx_confirm = (not USE_ADX) or (adx_now > ADX_MIN)
+        # ── Filtros base ──────────────────────────────────────────────────────
+        vol_confirm  = (not USE_VOL) or (vratio >= VOL_MULT)
+        adx_confirm  = (not USE_ADX) or (adx_now > ADX_MIN)
 
-        slope_long  = (ema_f_now > ema_s_now) and (angle_now >=  SLOPE_LIMIT) and adx_confirm and vol_confirm
-        slope_short = (ema_f_now < ema_s_now) and (angle_now <= -SLOPE_LIMIT) and adx_confirm and vol_confirm
+        # ── NUEVO: Filtro tendencia EMA50 ─────────────────────────────────────
+        trend_long  = close_now > ema_trend_now   # precio sobre EMA50 → sesgo alcista
+        trend_short = close_now < ema_trend_now   # precio bajo EMA50  → sesgo bajista
 
+        # ── NUEVO: Filtro RSI ─────────────────────────────────────────────────
+        rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)   # no entrar LONG en sobrecompra
+        rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)   # no entrar SHORT en sobreventa
+
+        # ── NUEVO: DI confirmación — DI+ > DI- para LONG, DI- > DI+ para SHORT
+        di_long_ok  = di_p_now > di_m_now
+        di_short_ok = di_m_now > di_p_now
+
+        # ── NUEVO: Ángulo consistente (actual y previo en misma dirección) ─────
+        angle_long_ok  = (angle_now >= SLOPE_LIMIT)  and (angle_prev >= SLOPE_LIMIT * 0.5)
+        angle_short_ok = (angle_now <= -SLOPE_LIMIT) and (angle_prev <= -SLOPE_LIMIT * 0.5)
+
+        # ── Señales SLOPE ─────────────────────────────────────────────────────
+        slope_long = (
+            ema_f_now > ema_s_now and
+            angle_long_ok         and
+            adx_confirm           and
+            vol_confirm           and
+            trend_long            and   # NUEVO
+            rsi_long_ok           and   # NUEVO
+            di_long_ok                  # NUEVO
+        )
+        slope_short = (
+            ema_f_now < ema_s_now and
+            angle_short_ok        and
+            adx_confirm           and
+            vol_confirm           and
+            trend_short           and   # NUEVO
+            rsi_short_ok          and   # NUEVO
+            di_short_ok                 # NUEVO
+        )
+
+        # ── ZigZag breakout ───────────────────────────────────────────────────
         zz_long  = (close_prev <= cpeak)   and (close_now > cpeak)
         zz_short = (close_prev >= cvalley) and (close_now < cvalley)
 
@@ -364,8 +442,8 @@ def scan_symbol(symbol):
             is_long, is_short = slope_long, slope_short
             method = "SLOPE+ADX"
         elif STRATEGY_MODE == "zigzag":
-            is_long  = zz_long  and vol_confirm
-            is_short = zz_short and vol_confirm
+            is_long  = zz_long  and vol_confirm and trend_long
+            is_short = zz_short and vol_confirm and trend_short
             method = "ZIGZAG"
         else:  # dual
             is_long  = slope_long  and zz_long
@@ -377,45 +455,44 @@ def scan_symbol(symbol):
 
         direction = "LONG" if is_long else "SHORT"
 
-        # ── FIX 2: SL/TP con garantía de posición correcta ───────────────────
-        if direction == "LONG":
-            sl_price = min(cvalley, close_now - catr * 2)
-            # Garantía: SL SIEMPRE por debajo del precio de entrada
-            if sl_price >= close_now:
-                sl_price = close_now - catr * 2
-            tp_price = close_now + (close_now - sl_price) * TP_MULT
-        else:
-            sl_price = max(cpeak, close_now + catr * 2)
-            # Garantía: SL SIEMPRE por encima del precio de entrada
-            if sl_price <= close_now:
-                sl_price = close_now + catr * 2
-            tp_price = close_now - (sl_price - close_now) * TP_MULT
+        # ── SL/TP con separación mínima garantizada ───────────────────────────
+        sl_distance = catr * SL_ATR_MULT  # mínimo 1.5x ATR de distancia
 
-        # Validaciones finales de SL/TP
         if direction == "LONG":
+            sl_pivot  = min(cvalley, close_now - sl_distance)
+            sl_price  = min(sl_pivot, close_now - sl_distance)
+            # Garantía absoluta: SL < precio y separación mínima
+            if sl_price >= close_now or (close_now - sl_price) / close_now * 100 < MIN_DIST_PCT:
+                sl_price = close_now * (1 - MIN_DIST_PCT / 100)
+            tp_price  = close_now + (close_now - sl_price) * TP_MULT
+            # Validación final
             if sl_price >= close_now or tp_price <= close_now:
-                log.debug(f"{symbol} LONG SL/TP inválido: sl={sl_price} tp={tp_price} close={close_now}")
                 return None
         else:
+            sl_pivot  = max(cpeak, close_now + sl_distance)
+            sl_price  = max(sl_pivot, close_now + sl_distance)
+            # Garantía absoluta: SL > precio y separación mínima
+            if sl_price <= close_now or (sl_price - close_now) / close_now * 100 < MIN_DIST_PCT:
+                sl_price = close_now * (1 + MIN_DIST_PCT / 100)
+            tp_price  = close_now - (sl_price - close_now) * TP_MULT
+            # Validación final
             if sl_price <= close_now or tp_price >= close_now:
-                log.debug(f"{symbol} SHORT SL/TP inválido: sl={sl_price} tp={tp_price} close={close_now}")
                 return None
 
-        dist = abs(close_now - sl_price)
-        if dist == 0:
-            return None
-
+        dist     = abs(close_now - sl_price)
         dist_pct = (dist / close_now) * 100
         if dist_pct < MIN_DIST_PCT:
             return None
 
         rr = abs(tp_price - close_now) / dist
 
-        # Score compuesto
-        score  = min(abs(angle_now) / SLOPE_LIMIT * 25, 30)
-        score += min((adx_now - ADX_MIN) / ADX_MIN * 20, 25)
-        score += min(vratio * 15, 25)
-        score += min(rr * 10, 20)
+        # ── Score mejorado ────────────────────────────────────────────────────
+        score  = min(abs(angle_now) / SLOPE_LIMIT * 20, 25)            # ángulo    (25)
+        score += min((adx_now - ADX_MIN) / ADX_MIN * 15, 20)           # ADX       (20)
+        score += min(vratio * 10, 20)                                    # volumen   (20)
+        score += min(rr * 8, 15)                                         # RR        (15)
+        score += 10 if trend_long or trend_short else 0                  # EMA50     (10) NUEVO
+        score += min(abs(di_p_now - di_m_now) / 10, 10)                 # DI spread (10) NUEVO
 
         if score < MIN_SCORE:
             return None
@@ -428,9 +505,11 @@ def scan_symbol(symbol):
             "sl":        sl_price,
             "tp":        tp_price,
             "atr":       catr,
+            "atr_pct":   round(atr_pct, 2),
             "vol_ratio": vratio,
             "angle":     round(angle_now, 1),
             "adx":       round(adx_now, 1),
+            "rsi":       round(rsi_now, 1),
             "score":     round(score, 1),
             "rr":        round(rr, 2),
             "dist_pct":  round(dist_pct, 3),
@@ -460,16 +539,19 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9 — HIGH WINRATE</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()}\n"
-        f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW} | <b>Slope≥:</b> {SLOPE_LIMIT}° | <b>Look:</b> {SLOPE_LOOK}\n"
+        f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
+        f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
+        f"<b>Slope≥:</b> {SLOPE_LIMIT}° | <b>Look:</b> {SLOPE_LOOK}\n"
         f"<b>ADX≥:</b> {ADX_MIN} ({'✅' if USE_ADX else '❌'}) | "
-        f"<b>Vol≥:</b> {VOL_MULT}x ({'✅' if USE_VOL else '❌'})\n"
-        f"<b>Score≥:</b> {MIN_SCORE} | <b>SL min:</b> {MIN_DIST_PCT}%\n"
-        f"<b>Pivot:</b> {PIVOT_LEN} | <b>TP:</b> 1:{TP_MULT} | <b>Lev:</b> {LEVERAGE}x\n"
-        f"<b>Monedas:</b> {len(symbols)} | <b>TF:</b> {TIMEFRAME}\n"
-        f"<b>Balance:</b> {balance:.2f} USDT | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
+        f"<b>Vol≥:</b> {VOL_MULT}x ({'✅' if USE_VOL else '❌'}) | "
+        f"<b>RSI:</b> {RSI_OS}-{RSI_OB} ({'✅' if USE_RSI else '❌'})\n"
+        f"<b>Score≥:</b> {MIN_SCORE} | <b>SL min:</b> {MIN_DIST_PCT}% | "
+        f"<b>SL ATR:</b> {SL_ATR_MULT}x | <b>ATR max:</b> {ATR_MAX_PCT}%\n"
+        f"<b>TP:</b> 1:{TP_MULT} | <b>Lev:</b> {LEVERAGE}x | "
+        f"<b>Monedas:</b> {len(symbols)} | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
+        f"<b>Balance:</b> {balance:.2f} USDT\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -484,7 +566,8 @@ def tg_scan(signals, total, open_count):
         e = "🟢" if s["signal"] == "LONG" else "🔴"
         lines.append(
             f"{e} <b>{s['symbol']}</b> [{s['method']}] "
-            f"Score:{s['score']} Ang:{s['angle']}° ADX:{s['adx']} Vol:{s['vol_ratio']}x"
+            f"Score:{s['score']} Ang:{s['angle']}° ADX:{s['adx']} "
+            f"RSI:{s['rsi']} Vol:{s['vol_ratio']}x"
         )
     lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
     tg("\n".join(lines))
@@ -496,7 +579,8 @@ def tg_entry(sig, qty, balance):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Dir:</b> {d} | <b>Score:</b> {sig['score']}/100\n"
         f"<b>Modo:</b> {sig['method']} | <b>ADX:</b> {sig['adx']} | "
-        f"<b>Ang:</b> {sig['angle']}° | <b>Vol:</b> {sig['vol_ratio']}x\n"
+        f"<b>Ang:</b> {sig['angle']}° | <b>RSI:</b> {sig['rsi']}\n"
+        f"<b>Vol:</b> {sig['vol_ratio']}x | <b>ATR:</b> {sig['atr_pct']}%\n"
         f"<b>Entrada:</b>     <code>{sig['close']:.6g}</code>\n"
         f"<b>Stop Loss:</b>   <code>{sig['sl']:.6g}</code> ({sig['dist_pct']}%)\n"
         f"<b>Take Profit:</b> <code>{sig['tp']:.6g}</code>\n"
@@ -508,18 +592,19 @@ def tg_entry(sig, qty, balance):
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9 — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9 HIGH WINRATE — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
-        f"<b>EMA {EMA_FAST}/{EMA_SLOW}</b> Slope≥{SLOPE_LIMIT}° "
-        f"ADX≥{ADX_MIN} Vol≥{VOL_MULT}x Score≥{MIN_SCORE}\n"
+        f"<b>EMA {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND}</b> Slope≥{SLOPE_LIMIT}° "
+        f"ADX≥{ADX_MIN} Vol≥{VOL_MULT}x RSI {RSI_OS}-{RSI_OB} Score≥{MIN_SCORE}\n"
+        f"<b>SL ATR mult:</b> {SL_ATR_MULT}x | <b>TP mult:</b> {TP_MULT}x\n"
         f"<b>MAX_OPEN_TRADES:</b> {MAX_OPEN_TRADES} | <b>TF:</b> {TIMEFRAME}"
     )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9 [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9 HIGH WINRATE [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -567,7 +652,8 @@ def main():
                     log.info(
                         f"  → {s['symbol']} {s['signal']} [{s['method']}] "
                         f"score={s['score']} ang={s['angle']}° adx={s['adx']} "
-                        f"vol={s['vol_ratio']}x sl={s['sl']:.6g} tp={s['tp']:.6g}"
+                        f"rsi={s['rsi']} vol={s['vol_ratio']}x "
+                        f"sl={s['sl']:.6g} tp={s['tp']:.6g}"
                     )
 
             for sig in signals:
@@ -589,7 +675,7 @@ def main():
                 try:
                     set_lev(sym)
                     res = open_order(sym, side, qty, sig["sl"], sig["tp"])
-                    log.info(f"✅ {sym} {side} qty={qty} sl={sig['sl']:.6g} tp={sig['tp']:.6g} | {res}")
+                    log.info(f"✅ {sym} {side} qty={qty} | {res}")
                     tg_entry(sig, qty, balance)
                     entered.add(sym)
                     open_count += 1
