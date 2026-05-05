@@ -16,11 +16,10 @@ FIX CRÍTICO v9.1:
     Se fetcha el precio de mercado en vivo JUSTO ANTES de enviar la orden
     y se recalcula SL/TP sobre ese precio actualizado.
 
-AJUSTE v9.2 — FILTROS RELAJADOS (más señales):
-  - MIN_SCORE  : 40.0 → 30.0  (menos exigente)
-  - ADX_MIN    : 20.0 → 15.0  (mercados menos tendenciales también válidos)
-  - VOL_MULT   : 1.2  → 1.0   (volumen normal ya es suficiente)
-  - SLOPE_LIMIT: 20.0 → 15.0  (ángulo más suave permitido)
+AJUSTE v9.3 — FILTROS AÚN MÁS RELAJADOS:
+  - angle_prev eliminado: solo el ángulo actual debe superar SLOPE_LIMIT
+  - USE_DI=false por defecto: filtro DI+/DI- desactivado (demasiado restrictivo)
+  - USE_DI se puede activar con variable de entorno si se desea más calidad
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -59,6 +58,7 @@ SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
 ADX_MIN          = float(os.environ.get("ADX_MIN",        "15.0"))   # ↓ bajado de 20 → más tendencias válidas
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
+USE_DI           = os.environ.get("USE_DI",  "false").lower() == "true"  # ↓ desactivado por defecto
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
 RSI_LEN          = int(os.environ.get("RSI_LEN",          "14"))
@@ -479,11 +479,13 @@ def scan_symbol(symbol):
         rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)
         rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)
 
-        di_long_ok  = di_p_now > di_m_now
-        di_short_ok = di_m_now > di_p_now
+        # DI ahora es opcional (USE_DI controla si se aplica)
+        di_long_ok  = (not USE_DI) or (di_p_now > di_m_now)
+        di_short_ok = (not USE_DI) or (di_m_now > di_p_now)
 
-        angle_long_ok  = (angle_now >= SLOPE_LIMIT)  and (angle_prev >= SLOPE_LIMIT * 0.5)
-        angle_short_ok = (angle_now <= -SLOPE_LIMIT) and (angle_prev <= -SLOPE_LIMIT * 0.5)
+        # Ángulo: solo vela actual (angle_prev eliminado — demasiado restrictivo)
+        angle_long_ok  = angle_now >= SLOPE_LIMIT
+        angle_short_ok = angle_now <= -SLOPE_LIMIT
 
         slope_long = (
             ema_f_now > ema_s_now and
@@ -604,14 +606,15 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9.2 — BALANCED</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9.3 — OPEN SIGNALS</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
         f"<b>Slope≥:</b> {SLOPE_LIMIT}° | <b>Look:</b> {SLOPE_LOOK}\n"
         f"<b>ADX≥:</b> {ADX_MIN} ({'✅' if USE_ADX else '❌'}) | "
         f"<b>Vol≥:</b> {VOL_MULT}x ({'✅' if USE_VOL else '❌'}) | "
-        f"<b>RSI:</b> {RSI_OS}-{RSI_OB} ({'✅' if USE_RSI else '❌'})\n"
+        f"<b>RSI:</b> {RSI_OS}-{RSI_OB} ({'✅' if USE_RSI else '❌'}) | "
+        f"<b>DI:</b> ({'✅' if USE_DI else '❌'})\n"
         f"<b>Score≥:</b> {MIN_SCORE} | <b>SL min:</b> {MIN_DIST_PCT}% | "
         f"<b>SL ATR:</b> {SL_ATR_MULT}x | <b>ATR max:</b> {ATR_MAX_PCT}%\n"
         f"<b>TP:</b> 1:{TP_MULT} | <b>Lev:</b> {LEVERAGE}x | "
@@ -658,7 +661,7 @@ def tg_entry(sig, qty, balance):
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9.2 BALANCED — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9.3 OPEN SIGNALS — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
@@ -671,7 +674,7 @@ def tg_debug(balance, positions, symbols):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9.2 BALANCED [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9.3 OPEN SIGNALS [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
