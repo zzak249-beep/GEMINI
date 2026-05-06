@@ -1,24 +1,18 @@
 """
-ZigZag + EMA Slope + ADX Elite V9.2 — BALANCED EDITION
-MEJORAS WINRATE:
-  1. Filtro de tendencia mayor: EMA50 en mismo TF (solo LONG si close>EMA50, SHORT si close<EMA50)
-  2. RSI como confirmador: evita entrar en sobrecompra/sobreventa extrema
-  3. SL mínimo de 1.5x ATR para dar más margen y evitar stop hunts
-  4. Confirmación de cierre de vela: verifica que la vela anterior también confirme dirección
-  5. Filtro de spread ATR: descarta señales cuando ATR/precio es demasiado alto (crypto volátil)
-  6. SL separación mínima garantizada de 0.5% del precio para evitar error 101400
-  7. Score mínimo en 30 (bajado de 40 para más señales)
-  8. SLOPE_LOOK=5 para ángulo más estable
-  9. Doble confirmación EMA: ema_fast y ema_slow ambas en dirección correcta
+ZigZag + EMA Slope + ADX Elite V9.5 — FIX NO-TRADES EDITION
 
-FIX CRÍTICO v9.1:
-  - Error 101400 "SL Price must be greater than Last Price":
-    Se fetcha el precio de mercado en vivo JUSTO ANTES de enviar la orden
-    y se recalcula SL/TP sobre ese precio actualizado.
-
-AJUSTE v9.4 — FIX SPAM TELEGRAM:
-  - get_live_price falla silenciosamente (log warning, sin mensaje Telegram)
-    para símbolos sin Mark Price disponible en BingX (ej: AIXBT-USDT)
+FIXES v9.5:
+  1. LOG DIAGNÓSTICO COMPLETO: cada señal descartada deja un log claro
+     (live_price fail / recalc_sl_tp None / ya en posición / qty=0)
+  2. get_live_price con fallback DOBLE: premiumIndex → ticker → last kline close
+     Evita descartar señales por símbolo sin Mark Price
+  3. recalc_sl_tp con tolerancia ampliada: MIN_DIST_PCT aplicado correctamente
+  4. tg_no_trades: mensaje Telegram de diagnóstico si hay señales pero 0 órdenes
+  5. EMA_TREND configurable vía env (ya estaba) — añadido al startup message
+  6. Retry en open_order (1 reintento) con delay de 1s
+  7. Balance mínimo bajado de 5 a 1 USDT
+  8. entered.clear() movido a ANTES del loop de señales (no al final)
+     para evitar bloquear el mismo símbolo en el mismo ciclo
 """
 import os, time, hmac, hashlib, json, asyncio, logging
 from datetime import datetime, timezone
@@ -43,21 +37,21 @@ LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "60"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "10"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "30.0"))   # ↓ bajado de 40 → más señales
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "30.0"))
 MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))
 
 # ── EMA SLOPE ─────────────────────────────────────────────────────────────────
 EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))
 EMA_TREND        = int(os.environ.get("EMA_TREND",        "50"))
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "15.0"))   # ↓ bajado de 20 → ángulo más suave
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "15.0"))
 SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "15.0"))   # ↓ bajado de 20 → más tendencias válidas
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "15.0"))
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
-USE_DI           = os.environ.get("USE_DI",  "false").lower() == "true"  # ↓ desactivado por defecto
+USE_DI           = os.environ.get("USE_DI",  "false").lower() == "true"
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
 RSI_LEN          = int(os.environ.get("RSI_LEN",          "14"))
@@ -67,7 +61,7 @@ USE_RSI          = os.environ.get("USE_RSI", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))    # ↓ bajado de 1.2 → volumen normal OK
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.0"))
 
 # ── ZIGZAG / ATR ──────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
@@ -241,74 +235,116 @@ def set_lev(symbol):
         except Exception:
             pass
 
-# ── PRECIO EN VIVO ────────────────────────────────────────────────────────────
-# FIX error 101400: obtener precio de mercado actual justo antes de enviar orden
+# ── PRECIO EN VIVO ─────────────────────────────────────────────────────────────
+# FIX v9.5: triple fallback para evitar descartar señales por falta de Mark Price
 def get_live_price(symbol):
     """
-    Obtiene el Mark Price actual de BingX para el símbolo dado.
-    Se usa para recalcular SL/TP en el momento exacto de la orden,
-    evitando el error 101400 causado por el desfase entre el precio
-    del scan y el precio real en el momento de la ejecución.
+    Obtiene precio actual con 3 fallbacks:
+    1. Mark Price (premiumIndex) — el más exacto para futuros
+    2. Last Price (ticker) — alternativa si el símbolo no tiene funding rate
+    3. Close de la última kline — último recurso para símbolos poco líquidos
+
+    En v9.4 solo se intentaba premiumIndex y se descartaba la señal si fallaba.
+    Eso causaba que símbolos como NAORIS-USDT (sin Mark Price indexado
+    individualmente) no abrieran órdenes pese a tener señal válida.
     """
+    errors = []
+
+    # Fallback 1: premiumIndex individual
     try:
         data = bx_get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         items = data.get("data", [])
         if isinstance(items, list):
             for item in items:
                 if item.get("symbol") == symbol:
-                    return float(item["markPrice"])
-        # Fallback: último precio del ticker
+                    mp = item.get("markPrice")
+                    if mp:
+                        return float(mp)
+        # A veces el endpoint devuelve dict en vez de list
+        if isinstance(items, dict) and items.get("symbol") == symbol:
+            mp = items.get("markPrice")
+            if mp:
+                return float(mp)
+    except Exception as e:
+        errors.append(f"premiumIndex: {e}")
+
+    # Fallback 2: ticker individual
+    try:
         data2 = bx_get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
         tickers = data2.get("data", [])
         if isinstance(tickers, list):
             for t in tickers:
                 if t.get("symbol") == symbol:
-                    return float(t["lastPrice"])
-        raise ValueError(f"No se encontró precio en vivo para {symbol}")
+                    lp = t.get("lastPrice") or t.get("price")
+                    if lp:
+                        log.info(f"get_live_price {symbol}: usando lastPrice (ticker fallback)")
+                        return float(lp)
+        if isinstance(tickers, dict):
+            lp = tickers.get("lastPrice") or tickers.get("price")
+            if lp:
+                return float(lp)
     except Exception as e:
-        raise ValueError(f"get_live_price({symbol}) falló: {e}")
+        errors.append(f"ticker: {e}")
+
+    # Fallback 3: última kline
+    try:
+        params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "5m"), "limit": 2}
+        data3 = bx_get("/openApi/swap/v3/quote/klines", params)
+        rows = data3.get("data", [])
+        if rows and isinstance(rows, list):
+            # La última fila es la más reciente
+            last_close = float(rows[-1][4])  # index 4 = close
+            log.info(f"get_live_price {symbol}: usando kline close (último fallback) = {last_close}")
+            return last_close
+    except Exception as e:
+        errors.append(f"kline: {e}")
+
+    raise ValueError(f"get_live_price({symbol}) todos los fallbacks fallaron: {errors}")
 
 
 def recalc_sl_tp(sig, live_price):
     """
-    Recalcula SL y TP usando el precio en vivo en lugar del close_now del scan.
-
-    El close_now puede tener 60+ segundos de antigüedad. Si el precio se movió
-    en ese tiempo (especialmente en SHORTs, donde SL debe estar POR ENCIMA del
-    precio), BingX rechaza la orden con código 101400.
-
-    Retorna (sl_price, tp_price) redondeados, o (None, None) si no son válidos.
+    Recalcula SL y TP usando el precio en vivo.
+    
+    FIX v9.5: logging detallado para diagnosticar por qué retorna None.
+    También se amplió la tolerancia: si dist_pct cae apenas bajo el mínimo
+    por floating-point, se ajusta en lugar de descartar.
     """
     catr      = sig["atr"]
     direction = sig["signal"]
     sl_distance = catr * SL_ATR_MULT
 
     if direction == "LONG":
-        # SL debe estar POR DEBAJO del precio actual
         sl_price = live_price - sl_distance
-        # Garantía de separación mínima
-        if (live_price - sl_price) / live_price * 100 < MIN_DIST_PCT:
+        dist_pct = (live_price - sl_price) / live_price * 100
+        if dist_pct < MIN_DIST_PCT:
             sl_price = live_price * (1 - MIN_DIST_PCT / 100)
         tp_price = live_price + (live_price - sl_price) * TP_MULT
-        # Validación final
-        if sl_price >= live_price or tp_price <= live_price:
-            log.warning(f"recalc_sl_tp LONG inválido: price={live_price} sl={sl_price} tp={tp_price}")
+
+        if sl_price >= live_price:
+            log.warning(f"recalc LONG {sig['symbol']}: sl({sl_price:.6g}) >= price({live_price:.6g})")
             return None, None
-    else:
-        # SHORT: SL debe estar POR ENCIMA del precio actual ← aquí estaba el error 101400
-        sl_price = live_price + sl_distance
-        # Garantía de separación mínima
-        if (sl_price - live_price) / live_price * 100 < MIN_DIST_PCT:
-            sl_price = live_price * (1 + MIN_DIST_PCT / 100)
-        tp_price = live_price - (sl_price - live_price) * TP_MULT
-        # Validación final
-        if sl_price <= live_price or tp_price >= live_price:
-            log.warning(f"recalc_sl_tp SHORT inválido: price={live_price} sl={sl_price} tp={tp_price}")
+        if tp_price <= live_price:
+            log.warning(f"recalc LONG {sig['symbol']}: tp({tp_price:.6g}) <= price({live_price:.6g})")
             return None, None
 
-    dist_pct = abs(live_price - sl_price) / live_price * 100
-    if dist_pct < MIN_DIST_PCT:
-        log.warning(f"recalc_sl_tp dist_pct {dist_pct:.3f}% < mínimo {MIN_DIST_PCT}%")
+    else:  # SHORT
+        sl_price = live_price + sl_distance
+        dist_pct = (sl_price - live_price) / live_price * 100
+        if dist_pct < MIN_DIST_PCT:
+            sl_price = live_price * (1 + MIN_DIST_PCT / 100)
+        tp_price = live_price - (sl_price - live_price) * TP_MULT
+
+        if sl_price <= live_price:
+            log.warning(f"recalc SHORT {sig['symbol']}: sl({sl_price:.6g}) <= price({live_price:.6g})")
+            return None, None
+        if tp_price >= live_price:
+            log.warning(f"recalc SHORT {sig['symbol']}: tp({tp_price:.6g}) >= price({live_price:.6g})")
+            return None, None
+
+    final_dist_pct = abs(live_price - sl_price) / live_price * 100
+    if final_dist_pct < MIN_DIST_PCT * 0.9:  # 10% de tolerancia extra
+        log.warning(f"recalc {sig['symbol']}: dist_pct final {final_dist_pct:.3f}% muy bajo")
         return None, None
 
     return round(sl_price, 6), round(tp_price, 6)
@@ -338,6 +374,35 @@ def open_order(symbol, side, qty, sl, tp):
     if code != 0:
         raise ValueError(f"BingX code={code}: {resp.get('msg', 'unknown')}")
     return resp
+
+def open_order_with_retry(symbol, side, qty, sl, tp, retries=1):
+    """
+    FIX v9.5: 1 reintento con recálculo de SL/TP si falla con error 101400.
+    En el reintento se obtiene un precio fresco y se recalcula todo.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return open_order(symbol, side, qty, sl, tp)
+        except ValueError as e:
+            if "101400" in str(e) and attempt < retries:
+                log.warning(f"Error 101400 en {symbol}, reintentando con precio fresco...")
+                time.sleep(1)
+                try:
+                    fresh_price = get_live_price(symbol)
+                    dist = abs(fresh_price - sl)
+                    if side == "BUY":
+                        sl = round(fresh_price * (1 - MIN_DIST_PCT / 100), 6)
+                        tp = round(fresh_price + (fresh_price - sl) * TP_MULT, 6)
+                    else:
+                        sl = round(fresh_price * (1 + MIN_DIST_PCT / 100), 6)
+                        tp = round(fresh_price - (sl - fresh_price) * TP_MULT, 6)
+                    log.info(f"Retry {symbol}: fresh={fresh_price:.6g} sl={sl:.6g} tp={tp:.6g}")
+                except Exception as ep:
+                    log.warning(f"Retry get_live_price falló: {ep}")
+                    raise
+            else:
+                raise
+
 
 def get_klines(symbol, limit=300):
     params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "5m"), "limit": limit}
@@ -445,7 +510,6 @@ def scan_symbol(symbol):
         ema_s_now    = float(ema_s.iloc[i])
         ema_trend_now= float(ema_trend.iloc[i])
         angle_now    = float(angle.iloc[i])
-        angle_prev   = float(angle.iloc[i - 1])
         adx_now      = float(adx_s.iloc[i])
         di_p_now     = float(di_p.iloc[i])
         di_m_now     = float(di_m.iloc[i])
@@ -478,11 +542,9 @@ def scan_symbol(symbol):
         rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)
         rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)
 
-        # DI ahora es opcional (USE_DI controla si se aplica)
         di_long_ok  = (not USE_DI) or (di_p_now > di_m_now)
         di_short_ok = (not USE_DI) or (di_m_now > di_p_now)
 
-        # Ángulo: solo vela actual (angle_prev eliminado — demasiado restrictivo)
         angle_long_ok  = angle_now >= SLOPE_LIMIT
         angle_short_ok = angle_now <= -SLOPE_LIMIT
 
@@ -525,8 +587,6 @@ def scan_symbol(symbol):
 
         direction = "LONG" if is_long else "SHORT"
 
-        # SL/TP basado en close_now para calcular score y referencias del scan
-        # (el SL/TP REAL se recalculará con precio en vivo antes de la orden)
         sl_distance = catr * SL_ATR_MULT
 
         if direction == "LONG":
@@ -605,7 +665,7 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V9.4 — OPEN SIGNALS</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V9.5 — NO-TRADES FIX</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
@@ -619,7 +679,7 @@ def tg_startup(balance, symbols):
         f"<b>TP:</b> 1:{TP_MULT} | <b>Lev:</b> {LEVERAGE}x | "
         f"<b>Monedas:</b> {len(symbols)} | <b>Max trades:</b> {MAX_OPEN_TRADES}\n"
         f"<b>Balance:</b> {balance:.2f} USDT\n"
-        f"🔧 <b>Fix 101400:</b> SL/TP recalculado con precio en vivo ✅\n"
+        f"🔧 <b>Fixes v9.5:</b> triple price fallback + retry 101400 ✅\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -657,10 +717,24 @@ def tg_entry(sig, qty, balance):
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
+def tg_no_trades_diag(signals, skip_reasons):
+    """
+    FIX v9.5: Mensaje de diagnóstico cuando hay señales pero no se abren órdenes.
+    Muy útil para saber exactamente qué está bloqueando las órdenes.
+    """
+    lines = [
+        f"⚠️ <b>DIAGNÓSTICO: {len(signals)} señales, 0 órdenes</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for sym, reason in list(skip_reasons.items())[:8]:
+        lines.append(f"  • <b>{sym}</b>: {reason}")
+    lines.append(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
+    tg("\n".join(lines))
+
 def tg_debug(balance, positions, symbols):
     pos_list = list(positions.keys()) if positions else ["ninguna"]
     tg(
-        f"🔧 <b>DEBUG V9.4 OPEN SIGNALS — {STRATEGY_MODE.upper()}</b>\n"
+        f"🔧 <b>DEBUG V9.5 — {STRATEGY_MODE.upper()}</b>\n"
         f"<b>Balance:</b> {balance:.4f} USDT\n"
         f"<b>Posiciones:</b> {len(positions)} → {', '.join(pos_list[:5])}\n"
         f"<b>Símbolos:</b> {len(symbols)}\n"
@@ -668,12 +742,12 @@ def tg_debug(balance, positions, symbols):
         f"ADX≥{ADX_MIN} Vol≥{VOL_MULT}x RSI {RSI_OS}-{RSI_OB} Score≥{MIN_SCORE}\n"
         f"<b>SL ATR mult:</b> {SL_ATR_MULT}x | <b>TP mult:</b> {TP_MULT}x\n"
         f"<b>MAX_OPEN_TRADES:</b> {MAX_OPEN_TRADES} | <b>TF:</b> {TIMEFRAME}\n"
-        f"<b>Fix 101400:</b> precio en vivo antes de orden ✅"
+        f"<b>Fix v9.5:</b> triple price fallback + retry 101400 ✅"
     )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V9.4 OPEN SIGNALS [{STRATEGY_MODE.upper()}] ===")
+    log.info(f"=== EMA+ADX+ZigZag Elite V9.5 NO-TRADES FIX [{STRATEGY_MODE.upper()}] ===")
 
     symbols = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -692,7 +766,6 @@ def main():
     log.info("Ready. Main loop starting.")
 
     errors  = 0
-    entered: set = set()
 
     while True:
         t0 = time.time()
@@ -725,50 +798,68 @@ def main():
                         f"sl={s['sl']:.6g} tp={s['tp']:.6g}"
                     )
 
+            # FIX v9.5: entradas ya procesadas en este ciclo (reset al inicio)
+            entered: set = set()
+            # FIX v9.5: razones de descarte para diagnóstico
+            skip_reasons: dict = {}
+            orders_opened = 0
+
             for sig in signals:
                 sym = sig["symbol"]
-                if sym in positions or sym in entered:
+
+                # ── Checks previos al intento de orden ──────────────────────
+                if sym in positions:
+                    skip_reasons[sym] = "ya en posición abierta"
+                    continue
+                if sym in entered:
+                    skip_reasons[sym] = "ya intentado este ciclo"
                     continue
                 if open_count >= MAX_OPEN_TRADES:
                     log.info(f"Max trades ({MAX_OPEN_TRADES}) alcanzado.")
                     break
-                if balance < 5:
+                # FIX v9.5: balance mínimo bajado de 5 → 1 USDT
+                if balance < 1:
                     log.warning(f"Balance demasiado bajo ({balance:.2f})")
+                    skip_reasons[sym] = f"balance bajo ({balance:.2f} USDT)"
                     break
 
                 side = "BUY" if sig["signal"] == "LONG" else "SELL"
                 try:
                     set_lev(sym)
 
-                    # ── FIX ERROR 101400 ──────────────────────────────────────
-                    # Obtener precio en vivo y recalcular SL/TP justo antes de
-                    # enviar la orden. Si el símbolo no tiene Mark Price en BingX
-                    # se descarta silenciosamente (sin spam en Telegram).
+                    # ── Precio en vivo (triple fallback) ────────────────────
                     try:
                         live_price = get_live_price(sym)
+                        log.info(f"Live price {sym}: scan={sig['close']:.6g} live={live_price:.6g}")
                     except Exception as ep:
-                        log.warning(f"Sin precio en vivo para {sym}: {ep} → señal descartada")
-                        continue  # saltar silenciosamente, sin Telegram
-
-                    sl_live, tp_live = recalc_sl_tp(sig, live_price)
-                    if sl_live is None:
-                        log.warning(f"SL/TP inválido con precio en vivo para {sym} "
-                                    f"(live={live_price:.6g}), señal descartada.")
+                        reason = f"sin precio en vivo: {str(ep)[:60]}"
+                        log.warning(f"{sym}: {reason}")
+                        skip_reasons[sym] = reason
                         continue
 
-                    log.info(f"Precio en vivo {sym}: scan={sig['close']:.6g} "
-                             f"live={live_price:.6g} | "
-                             f"SL scan={sig['sl']:.6g} → SL live={sl_live:.6g}")
+                    # ── Recalcular SL/TP ────────────────────────────────────
+                    sl_live, tp_live = recalc_sl_tp(sig, live_price)
+                    if sl_live is None:
+                        reason = f"SL/TP inválido con live={live_price:.6g}"
+                        log.warning(f"{sym}: {reason}")
+                        skip_reasons[sym] = reason
+                        continue
 
                     qty = calc_qty(balance, live_price, sl_live)
                     if qty <= 0:
+                        reason = "qty=0 (balance insuficiente)"
+                        log.warning(f"{sym}: {reason}")
+                        skip_reasons[sym] = reason
                         continue
 
-                    res = open_order(sym, side, qty, sl_live, tp_live)
-                    log.info(f"✅ {sym} {side} qty={qty} live={live_price:.6g} "
-                             f"sl={sl_live:.6g} tp={tp_live:.6g} | {res}")
+                    log.info(f"Enviando orden {sym} {side} qty={qty} "
+                             f"live={live_price:.6g} sl={sl_live:.6g} tp={tp_live:.6g}")
 
-                    # Actualizar sig con valores reales para el mensaje Telegram
+                    # ── Orden con retry ─────────────────────────────────────
+                    res = open_order_with_retry(sym, side, qty, sl_live, tp_live, retries=1)
+                    log.info(f"✅ {sym} {side} qty={qty} | {res}")
+
+                    # Actualizar sig para el mensaje Telegram
                     sig["close"]    = live_price
                     sig["sl"]       = sl_live
                     sig["tp"]       = tp_live
@@ -778,13 +869,20 @@ def main():
                     tg_entry(sig, qty, balance)
                     entered.add(sym)
                     open_count += 1
+                    orders_opened += 1
                     time.sleep(0.5)
 
                 except Exception as e:
+                    reason = str(e)[:100]
                     log.error(f"Order FAILED {sym}: {e}")
+                    skip_reasons[sym] = f"error orden: {reason}"
                     tg(f"⚠️ <b>Error {sym}</b>: <code>{str(e)[:150]}</code>")
 
-            entered.clear()
+            # FIX v9.5: diagnóstico si había señales pero no se abrió ninguna
+            if signals and orders_opened == 0 and skip_reasons:
+                log.warning(f"Señales={len(signals)} pero 0 órdenes. Razones: {skip_reasons}")
+                tg_no_trades_diag(signals, skip_reasons)
+
             errors = 0
 
         except KeyboardInterrupt:
