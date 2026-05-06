@@ -1,17 +1,17 @@
 """
-ZigZag + EMA Slope + ADX Elite V10.0 — TURBO EDITION
+EMA Slope + ADX + Multi-Timeframe Elite V11.0 — BULLET TRAIN EDITION
 
-MEJORAS V10 sobre V9.5:
-  1. WEBSOCKET CACHE: klines y precios via WS en background → 10-50x más rápido
-  2. BLACKLIST DE COMMODITIES: Gasoline, Oil Brent, índices sin liquidez
-  3. FILTRO DE SPREAD: descarta símbolo si spread > MAX_SPREAD_PCT
-  4. TRAILING STOP: mueve SL a breakeven cuando el trade va +BE_ATR_MULT × ATR
-  5. POSITION SIZING: mínimo 1.5 USDT / máximo 7 USDT por orden
-  6. COOLDOWN POR SÍMBOLO: 30 min tras SL para no re-entrar en perdedor
-  7. VARIABLES OPTIMIZADAS: TF 15m, ADX≥22, TP_MULT 2.0, SL_ATR 2.5, Score≥45
-  8. FILTRO VOLUMEN: VOL_MULT 1.2x (elimina señales en volumen plano)
-  9. USE_DI activado por defecto: mejora dirección de tendencia
- 10. CONFLUENCIA: comprueba que RSI no esté en zona opuesta al trade
+MEJORAS V11 sobre V10:
+  1. DUAL TIMEFRAME: 5m entradas + 1H tendencia/S&R ("golden setup")
+  2. EMA 7/17 en 5m con pendiente ≥30° (estrategia "tren bala")
+  3. PATRONES DE VELA: Pin Bar, Engulfing, Vela Momentum (entradas de precisión)
+  4. R:R OBJETIVO 3:1: TP = 3× distancia SL, stop ajustado en vela señal
+  5. ANTI-CHOP: ADX≥25 + rango normalizado anti-mercado-lateral
+  6. H1 S/R ZONES: no comprar en resistencia H1, no vender en soporte H1
+  7. GOLDEN SETUP: M5 + H1 alineados = señal de máxima calidad (+20 score)
+  8. POSITION SIZING CORRECTO: riesgo_usdt / dist_sl% (sin error de leverage)
+  9. STOP EN VELA SEÑAL: SL debajo del mínimo / encima del máximo exacto
+ 10. H1 CACHE TTL: klines H1 con cache de 5min para no sobrecargar API
 """
 import os, time, hmac, hashlib, json, asyncio, logging, threading
 from datetime import datetime, timezone
@@ -36,67 +36,89 @@ BINGX_SECRET_KEY = os.environ["BINGX_SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-TIMEFRAME        = os.environ.get("TIMEFRAME",        "15m")
-RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",   "1.0"))
+# V11: 5m entradas, 1H tendencia
+TIMEFRAME        = os.environ.get("TIMEFRAME",        "5m")
+H1_TIMEFRAME     = os.environ.get("H1_TIMEFRAME",     "1h")
+RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",   "1.5"))   # V11: 1→1.5%
 LEVERAGE         = int(os.environ.get("LEVERAGE",         "5"))
-LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "45"))
+LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",     "30"))    # V11: 45→30
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES",  "6"))
 SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",     "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",      "0"))
 
 # ── FILTROS DE CALIDAD ────────────────────────────────────────────────────────
-MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "45.0"))   # V10: 30→45
-MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.5"))    # V10: 0.3→0.5
-MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT", "0.15"))   # V10: nuevo
-ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "2.5"))    # V10: 3.0→2.5
+MIN_SCORE        = float(os.environ.get("MIN_SCORE",      "55.0"))   # V11: 45→55
+MIN_DIST_PCT     = float(os.environ.get("MIN_DIST_PCT",   "0.25"))   # V11: más ajustado
+MAX_SPREAD_PCT   = float(os.environ.get("MAX_SPREAD_PCT", "0.15"))
+ATR_MAX_PCT      = float(os.environ.get("ATR_MAX_PCT",    "3.5"))    # V11: más permisivo en 5m
 
-# ── EMA SLOPE ─────────────────────────────────────────────────────────────────
-EMA_FAST         = int(os.environ.get("EMA_FAST",         "8"))      # V10: 7→8
-EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "21"))     # V10: 17→21
-EMA_TREND        = int(os.environ.get("EMA_TREND",        "100"))    # V10: 50→100
-SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "20.0"))   # V10: 15→20
-SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "5"))
+# ── EMA SLOPE — ESTRATEGIA "TREN BALA" ───────────────────────────────────────
+EMA_FAST         = int(os.environ.get("EMA_FAST",         "7"))      # V11: 8→7
+EMA_SLOW         = int(os.environ.get("EMA_SLOW",         "17"))     # V11: 21→17
+EMA_TREND        = int(os.environ.get("EMA_TREND",        "100"))    # filtro tendencia 5m
+H1_EMA_TREND     = int(os.environ.get("H1_EMA_TREND",     "21"))     # EMA 21 en H1
+SLOPE_LIMIT      = float(os.environ.get("SLOPE_LIMIT",    "30.0"))   # V11: 20→30° "tren bala"
+SLOPE_LOOK       = int(os.environ.get("SLOPE_LOOK",       "3"))      # V11: 5→3 más reactivo
 
 # ── ADX ───────────────────────────────────────────────────────────────────────
 ADX_LEN          = int(os.environ.get("ADX_LEN",          "14"))
-ADX_MIN          = float(os.environ.get("ADX_MIN",        "22.0"))   # V10: 15→22
+ADX_MIN          = float(os.environ.get("ADX_MIN",        "25.0"))   # V11: 22→25 anti-chop
 USE_ADX          = os.environ.get("USE_ADX", "true").lower() == "true"
-USE_DI           = os.environ.get("USE_DI",  "true").lower() == "true"  # V10: false→true
+USE_DI           = os.environ.get("USE_DI",  "true").lower() == "true"
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
 RSI_LEN          = int(os.environ.get("RSI_LEN",          "14"))
-RSI_OB           = float(os.environ.get("RSI_OB",         "68.0"))   # V10: 70→68
-RSI_OS           = float(os.environ.get("RSI_OS",         "32.0"))   # V10: 30→32
+RSI_OB           = float(os.environ.get("RSI_OB",         "70.0"))
+RSI_OS           = float(os.environ.get("RSI_OS",         "30.0"))
 USE_RSI          = os.environ.get("USE_RSI", "true").lower() == "true"
 
 # ── VOLUME ────────────────────────────────────────────────────────────────────
 USE_VOL          = os.environ.get("USE_VOL", "true").lower() == "true"
-VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.2"))    # V10: 1.0→1.2
+VOL_MULT         = float(os.environ.get("VOL_MULT",       "1.3"))    # V11: 1.2→1.3
 
-# ── ZIGZAG / ATR ──────────────────────────────────────────────────────────────
+# ── ATR / SL / TP ─────────────────────────────────────────────────────────────
 ATR_LEN          = int(os.environ.get("ATR_LEN",          "14"))
 PIVOT_LEN        = int(os.environ.get("PIVOT_LEN",        "3"))
-TP_MULT          = float(os.environ.get("TP_MULT",        "2.0"))    # V10: 1.5→2.0
-SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",    "2.5"))    # V10: 2.0→2.5
+TP_MULT          = float(os.environ.get("TP_MULT",        "3.0"))    # V11: 2.0→3.0 (R:R 1:3)
+SL_ATR_MULT      = float(os.environ.get("SL_ATR_MULT",    "1.5"))    # V11: 2.5→1.5 stop ajustado
+MIN_RR           = float(os.environ.get("MIN_RR",         "2.5"))    # V11: nuevo R:R mínimo
 
-# ── NUEVAS FEATURES V10 ───────────────────────────────────────────────────────
+# ── PATRONES DE VELA (V11 NUEVO) ─────────────────────────────────────────────
+USE_CANDLE_PATTERNS = os.environ.get("USE_CANDLE_PATTERNS", "true").lower() == "true"
+PIN_BAR_RATIO       = float(os.environ.get("PIN_BAR_RATIO",   "0.30"))  # cuerpo/rango max
+PIN_TAIL_RATIO      = float(os.environ.get("PIN_TAIL_RATIO",  "0.55"))  # cola/rango min
+ENGULF_MIN_RATIO    = float(os.environ.get("ENGULF_MIN_RATIO","1.05"))  # cuerpo actual/prev
+MOMENTUM_BODY_MIN   = float(os.environ.get("MOMENTUM_BODY_MIN","0.65")) # cuerpo/rango min
+
+# ── H1 CONFIRMACIÓN (V11 NUEVO) ───────────────────────────────────────────────
+USE_H1_CONFIRM   = os.environ.get("USE_H1_CONFIRM", "true").lower() == "true"
+USE_H1_SR        = os.environ.get("USE_H1_SR",      "true").lower() == "true"
+H1_SR_DIST_MIN   = float(os.environ.get("H1_SR_DIST_MIN", "1.2"))   # % dist mínima a S/R H1
+H1_CACHE_TTL     = int(os.environ.get("H1_CACHE_TTL",    "300"))     # segundos TTL cache H1
+ANTI_CHOP        = os.environ.get("ANTI_CHOP", "true").lower() == "true"
+
+# ── POSITION SIZING V11 ───────────────────────────────────────────────────────
+MIN_ORDER_USDT   = float(os.environ.get("MIN_ORDER_USDT", "3.0"))    # V11: 1.5→3.0
+MAX_ORDER_USDT   = float(os.environ.get("MAX_ORDER_USDT", "40.0"))   # V11: 7→40 (fix principal)
+MAX_MARGIN_PCT   = float(os.environ.get("MAX_MARGIN_PCT", "25.0"))   # % máx del balance como margen
+
+# ── TRAILING / COOLDOWN ───────────────────────────────────────────────────────
 TRAILING_STOP    = os.environ.get("TRAILING_STOP", "true").lower() == "true"
-BE_ATR_MULT      = float(os.environ.get("BE_ATR_MULT",    "0.8"))    # activar BE
-MIN_ORDER_USDT   = float(os.environ.get("MIN_ORDER_USDT", "1.5"))    # tamaño mínimo
-MAX_ORDER_USDT   = float(os.environ.get("MAX_ORDER_USDT", "7.0"))    # tamaño máximo
-COOLDOWN_MINS    = int(os.environ.get("COOLDOWN_MINS",    "30"))     # cooldown tras SL
+BE_ATR_MULT      = float(os.environ.get("BE_ATR_MULT",    "1.0"))    # V11: 0.8→1.0
+COOLDOWN_MINS    = int(os.environ.get("COOLDOWN_MINS",    "20"))     # V11: 30→20
 USE_WS_CACHE     = os.environ.get("USE_WS_CACHE", "true").lower() == "true"
-STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "slope")
+STRATEGY_MODE    = os.environ.get("STRATEGY_MODE", "dual_tf")        # V11: nuevo modo
 
 _raw = os.environ.get("CUSTOM_SYMBOLS", "")
 CUSTOM_SYMBOLS = [s.strip() for s in _raw.split(",") if s.strip()] if _raw else []
 
 BINGX_BASE   = "https://open-api.bingx.com"
 BINGX_WS     = "wss://open-api-swap.bingx.com/swap-market"
-INTERVAL_MAP = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m",
-                "30m":"30m","1h":"1H","4h":"4H","1d":"1D"}
+INTERVAL_MAP = {
+    "1m":"1m","3m":"3m","5m":"5m","15m":"15m",
+    "30m":"30m","1h":"1H","4h":"4H","1d":"1D"
+}
 
-# V10: blacklist ampliada
 EXCLUDED_PREFIXES = ("NCS","NCF","NCMEX","NCOIL","NCGAS","NCXAU","NCXAG")
 EXCLUDED_KEYWORDS = ("Gasoline","GasOil","Brent","WTI","OilBrent",
                      "Copper","Wheat","Cotton","Soybean","Silver",
@@ -121,7 +143,8 @@ log = logging.getLogger(__name__)
 ws_kline_cache  = {}   # {symbol: pd.DataFrame}
 ws_price_cache  = {}   # {symbol: float}
 ws_cache_lock   = threading.Lock()
-sl_cooldown     = {}   # {symbol: datetime} — cooldown tras SL
+sl_cooldown     = {}   # {symbol: datetime}
+h1_cache        = {}   # {symbol: (df, timestamp)} — cache H1 con TTL
 
 # ── BINGX API ─────────────────────────────────────────────────────────────────
 def _sign(params):
@@ -204,7 +227,6 @@ def _is_valid(sym):
         return False
     if any(base.startswith(p) for p in EXCLUDED_PREFIXES):
         return False
-    # V10: excluir commodities y forex por nombre
     if any(kw.lower() in sym.lower() for kw in EXCLUDED_KEYWORDS):
         return False
     return True
@@ -250,9 +272,8 @@ def set_lev(symbol):
         except Exception:
             pass
 
-# ── WEBSOCKET KLINE CACHE (V10 NUEVO) ─────────────────────────────────────────
+# ── WEBSOCKET KLINE CACHE ─────────────────────────────────────────────────────
 def _ws_on_message(ws_app, message):
-    """Actualiza el cache de klines desde WebSocket en background."""
     try:
         import gzip
         try:
@@ -279,17 +300,16 @@ def _ws_on_message(ws_app, message):
             with ws_cache_lock:
                 df = ws_kline_cache.get(sym)
                 if df is None:
-                    return  # esperamos a que REST llene el cache primero
-                # actualizar o añadir la última vela
+                    return
                 if len(df) > 0 and df.iloc[-1]["open_time"] == row["open_time"]:
                     for col in ("open","high","low","close","volume"):
                         df.at[df.index[-1], col] = row[col]
                 else:
                     new_row = pd.DataFrame([row])
-                    ws_kline_cache[sym] = pd.concat([df, new_row], ignore_index=True).tail(300)
+                    ws_kline_cache[sym] = pd.concat([df, new_row], ignore_index=True).tail(400)
                 ws_price_cache[sym] = row["close"]
-    except Exception as e:
-        pass  # no bloquear el hilo WS
+    except Exception:
+        pass
 
 def _ws_on_error(ws_app, error):
     log.warning(f"WS error: {error}")
@@ -298,8 +318,8 @@ def _ws_on_close(ws_app, *args):
     log.info("WS closed — reconnecting in 5s")
 
 def _ws_on_open(ws_app, symbols):
-    ivl = INTERVAL_MAP.get(TIMEFRAME, "15m").lower()
-    for sym in symbols[:200]:  # BingX limita suscripciones simultáneas
+    ivl = INTERVAL_MAP.get(TIMEFRAME, "5m").lower()
+    for sym in symbols[:200]:
         bx_sym = sym.replace("-", "_")
         sub_msg = json.dumps({
             "id": f"sub_{sym}",
@@ -312,7 +332,6 @@ def _ws_on_open(ws_app, symbols):
             pass
 
 def start_ws_cache(symbols):
-    """Inicia WebSocket en hilo daemon para cache de precios en tiempo real."""
     if not USE_WS_CACHE:
         return
     def _run():
@@ -335,7 +354,6 @@ def start_ws_cache(symbols):
 
 # ── PRECIO EN VIVO ─────────────────────────────────────────────────────────────
 def get_live_price(symbol):
-    # Intentar cache WS primero (sin latencia de red)
     if USE_WS_CACHE:
         with ws_cache_lock:
             p = ws_price_cache.get(symbol)
@@ -343,7 +361,6 @@ def get_live_price(symbol):
             return p
 
     errors = []
-    # Fallback 1: premiumIndex
     try:
         data = bx_get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
         items = data.get("data", [])
@@ -360,7 +377,6 @@ def get_live_price(symbol):
     except Exception as e:
         errors.append(f"premiumIndex: {e}")
 
-    # Fallback 2: ticker
     try:
         data2 = bx_get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
         tickers = data2.get("data", [])
@@ -377,9 +393,8 @@ def get_live_price(symbol):
     except Exception as e:
         errors.append(f"ticker: {e}")
 
-    # Fallback 3: última kline
     try:
-        params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "15m"), "limit": 2}
+        params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "5m"), "limit": 2}
         data3 = bx_get("/openApi/swap/v3/quote/klines", params)
         rows = data3.get("data", [])
         if rows and isinstance(rows, list):
@@ -387,11 +402,10 @@ def get_live_price(symbol):
     except Exception as e:
         errors.append(f"kline: {e}")
 
-    raise ValueError(f"get_live_price({symbol}) falló: {errors}")
+    raise ValueError(f"get_live_price({symbol}) failed: {errors}")
 
-# ── SPREAD FILTER (V10 NUEVO) ──────────────────────────────────────────────────
+# ── SPREAD FILTER ──────────────────────────────────────────────────────────────
 def get_spread_pct(symbol):
-    """Retorna spread bid/ask en porcentaje. Retorna 999 si falla."""
     try:
         data = bx_get("/openApi/swap/v2/quote/bookTicker", {"symbol": symbol})
         d = data.get("data", {})
@@ -407,6 +421,334 @@ def get_spread_pct(symbol):
         return 999.0
     except Exception:
         return 999.0
+
+# ── KLINES ────────────────────────────────────────────────────────────────────
+def get_klines(symbol, limit=300):
+    if USE_WS_CACHE:
+        with ws_cache_lock:
+            df = ws_kline_cache.get(symbol)
+        if df is not None and len(df) >= limit // 2:
+            return df.copy()
+
+    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "5m"), "limit": limit}
+    data = bx_get("/openApi/swap/v3/quote/klines", params)
+    rows = data.get("data", [])
+    if not rows or not isinstance(rows, list):
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
+    for col in ("open","high","low","close","volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    df.dropna(subset=["open","high","low","close","volume"], inplace=True)
+    df = df.sort_values("open_time").reset_index(drop=True)
+
+    if USE_WS_CACHE:
+        with ws_cache_lock:
+            ws_kline_cache[symbol] = df.copy()
+
+    return df
+
+def get_h1_klines(symbol, limit=60):
+    """Fetch H1 klines con cache TTL de H1_CACHE_TTL segundos."""
+    now = time.time()
+    cached = h1_cache.get(symbol)
+    if cached:
+        df_c, ts = cached
+        if now - ts < H1_CACHE_TTL and len(df_c) >= 30:
+            return df_c.copy()
+
+    try:
+        params = {"symbol": symbol, "interval": "1H", "limit": limit}
+        data = bx_get("/openApi/swap/v3/quote/klines", params)
+        rows = data.get("data", [])
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
+        for col in ("open","high","low","close","volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df.dropna(subset=["open","high","low","close"], inplace=True)
+        df = df.sort_values("open_time").reset_index(drop=True)
+        h1_cache[symbol] = (df.copy(), now)
+        return df
+    except Exception as e:
+        log.debug(f"H1 klines {symbol}: {e}")
+        return pd.DataFrame()
+
+# ── INDICADORES ───────────────────────────────────────────────────────────────
+def calc_atr(high, low, close, period):
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def calc_ema_angle(ema_s, atr_s, look):
+    price_change = ema_s - ema_s.shift(look)
+    denom = atr_s * look
+    angle = np.degrees(np.arctan2(price_change.values, denom.values))
+    return pd.Series(angle, index=ema_s.index)
+
+def calc_adx(high, low, close, period):
+    up   = high.diff()
+    down = -low.diff()
+    plus_dm  = np.where((up > down) & (up > 0),   up,   0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low  - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    alpha = 1.0 / period
+    def wilder(arr):
+        return pd.Series(arr, index=high.index).ewm(alpha=alpha, adjust=False).mean()
+    tr_s   = wilder(tr)
+    pdm_s  = wilder(plus_dm)
+    mdm_s  = wilder(minus_dm)
+    di_p   = 100 * pdm_s / tr_s.replace(0, np.nan)
+    di_m   = 100 * mdm_s / tr_s.replace(0, np.nan)
+    dx     = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan)
+    adx    = dx.ewm(alpha=alpha, adjust=False).mean()
+    return di_p, di_m, adx
+
+def calc_rsi(close, period):
+    delta    = close.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# ── ANÁLISIS H1 (V11 NUEVO) ───────────────────────────────────────────────────
+def analyze_h1(symbol):
+    """
+    Análisis H1: tendencia EMA21, niveles S/R por pivotes, distancia a S/R.
+    Retorna dict o None si no hay datos suficientes.
+    """
+    df = get_h1_klines(symbol, limit=60)
+    if df.empty or len(df) < 30:
+        return None
+
+    close = df["close"]
+    high  = df["high"]
+    low   = df["low"]
+
+    ema21     = close.ewm(span=H1_EMA_TREND, adjust=False).mean()
+    ema21_now = float(ema21.iloc[-1])
+    ema21_prev= float(ema21.iloc[-4]) if len(ema21) > 4 else ema21_now
+    close_now = float(close.iloc[-1])
+
+    # Tendencia H1 según precio vs EMA21 + pendiente EMA21
+    if close_now > ema21_now and ema21_now > ema21_prev:
+        h1_trend = "BULL"
+    elif close_now < ema21_now and ema21_now < ema21_prev:
+        h1_trend = "BEAR"
+    else:
+        h1_trend = "NEUTRAL"
+
+    # H1 ATR
+    atr_h1 = calc_atr(high, low, close, 14)
+    atr_h1_val = float(atr_h1.iloc[-1])
+
+    # Pivotes H1 (últimas 40 velas, look 3)
+    ph_vals, pl_vals = [], []
+    plen = 3
+    for idx in range(plen, min(len(df)-plen, 40)):
+        h_window = high.iloc[idx-plen:idx+plen+1]
+        l_window = low.iloc[idx-plen:idx+plen+1]
+        if float(high.iloc[idx]) == float(h_window.max()):
+            ph_vals.append(float(high.iloc[idx]))
+        if float(low.iloc[idx]) == float(l_window.min()):
+            pl_vals.append(float(low.iloc[idx]))
+
+    resistances = sorted([v for v in ph_vals if v > close_now])
+    supports    = sorted([v for v in pl_vals if v < close_now], reverse=True)
+
+    h1_resistance = resistances[0] if resistances else close_now * 1.08
+    h1_support    = supports[0]    if supports    else close_now * 0.92
+
+    dist_to_res = (h1_resistance - close_now) / close_now * 100
+    dist_to_sup = (close_now    - h1_support)  / close_now * 100
+
+    # Momentum H1: RSI H1
+    rsi_h1 = calc_rsi(close, 14)
+    rsi_h1_val = float(rsi_h1.iloc[-1])
+
+    return {
+        "h1_trend":      h1_trend,
+        "h1_ema21":      ema21_now,
+        "h1_resistance": h1_resistance,
+        "h1_support":    h1_support,
+        "h1_atr":        atr_h1_val,
+        "h1_rsi":        round(rsi_h1_val, 1),
+        "dist_to_res":   round(dist_to_res, 2),
+        "dist_to_sup":   round(dist_to_sup, 2),
+        "close_h1":      close_now,
+    }
+
+# ── PATRONES DE VELA (V11 NUEVO) ─────────────────────────────────────────────
+
+def detect_pin_bar(df, i, direction):
+    """
+    Pin Bar: cuerpo pequeño, cola larga de rechazo.
+    LONG: cola inferior ≥55% del rango → rechazo bajista → entrada alcista.
+    SHORT: cola superior ≥55% del rango → rechazo alcista → entrada bajista.
+    Retorna (bool, fuerza 0-100).
+    """
+    o = float(df["open"].iloc[i])
+    h = float(df["high"].iloc[i])
+    l = float(df["low"].iloc[i])
+    c = float(df["close"].iloc[i])
+
+    total_range = h - l
+    if total_range < 1e-10:
+        return False, 0.0
+
+    body       = abs(c - o)
+    body_ratio = body / total_range
+
+    if body_ratio > PIN_BAR_RATIO:   # cuerpo demasiado grande
+        return False, 0.0
+
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    if direction == "LONG":
+        tail_ratio = lower_wick / total_range
+        if tail_ratio >= PIN_TAIL_RATIO and lower_wick >= 2 * max(body, 1e-10):
+            strength = min(tail_ratio * 120, 100.0)
+            return True, round(strength, 1)
+    else:  # SHORT
+        tail_ratio = upper_wick / total_range
+        if tail_ratio >= PIN_TAIL_RATIO and upper_wick >= 2 * max(body, 1e-10):
+            strength = min(tail_ratio * 120, 100.0)
+            return True, round(strength, 1)
+
+    return False, 0.0
+
+
+def detect_engulfing(df, i, direction):
+    """
+    Vela Envolvente: el cuerpo actual engulfa completamente al cuerpo anterior.
+    LONG: vela alcista actual engloba vela bajista anterior.
+    SHORT: vela bajista actual engloba vela alcista anterior.
+    """
+    if i < 1:
+        return False, 0.0
+
+    o_cur = float(df["open"].iloc[i]);   c_cur = float(df["close"].iloc[i])
+    o_pre = float(df["open"].iloc[i-1]); c_pre = float(df["close"].iloc[i-1])
+
+    body_cur = abs(c_cur - o_cur)
+    body_pre = abs(c_pre - o_pre)
+
+    if body_pre < 1e-10:
+        return False, 0.0
+
+    ratio = body_cur / body_pre
+    if ratio < ENGULF_MIN_RATIO:
+        return False, 0.0
+
+    if direction == "LONG":
+        # Actual alcista, previa bajista, actual envuelve
+        if c_cur > o_cur and c_pre < o_pre:
+            if c_cur > max(o_pre, c_pre) and o_cur < min(o_pre, c_pre):
+                strength = min(ratio * 45, 100.0)
+                return True, round(strength, 1)
+    else:  # SHORT
+        if c_cur < o_cur and c_pre > o_pre:
+            if c_cur < min(o_pre, c_pre) and o_cur > max(o_pre, c_pre):
+                strength = min(ratio * 45, 100.0)
+                return True, round(strength, 1)
+
+    return False, 0.0
+
+
+def detect_momentum_candle(df, i, direction, atr):
+    """
+    Vela de Impulso: cuerpo grande (≥65% rango), mecha mínima contraria,
+    tamaño ≥0.5×ATR. Es la vela de "tren bala" sin ambigüedades.
+    """
+    o = float(df["open"].iloc[i])
+    h = float(df["high"].iloc[i])
+    l = float(df["low"].iloc[i])
+    c = float(df["close"].iloc[i])
+
+    total_range = h - l
+    if total_range < 1e-10 or atr < 1e-10:
+        return False, 0.0
+
+    body       = abs(c - o)
+    body_ratio = body / total_range
+
+    if body_ratio < MOMENTUM_BODY_MIN:
+        return False, 0.0
+    if body < atr * 0.5:    # vela demasiado pequeña
+        return False, 0.0
+
+    if direction == "LONG" and c > o:
+        upper_wick = h - c
+        if upper_wick < body * 0.35:  # mecha superior contenida
+            strength = min(body_ratio * 90, 100.0)
+            return True, round(strength, 1)
+    elif direction == "SHORT" and c < o:
+        lower_wick = c - l
+        if lower_wick < body * 0.35:
+            strength = min(body_ratio * 90, 100.0)
+            return True, round(strength, 1)
+
+    return False, 0.0
+
+
+def detect_inside_bar_breakout(df, i, direction):
+    """
+    Inside bar breakout: vela actual rompe el rango de la vela madre.
+    Señal de continuación tras compresión.
+    """
+    if i < 2:
+        return False, 0.0
+
+    # Inside bar = i-1 dentro del rango de i-2
+    h_m2 = float(df["high"].iloc[i-2])
+    l_m2 = float(df["low"].iloc[i-2])
+    h_m1 = float(df["high"].iloc[i-1])
+    l_m1 = float(df["low"].iloc[i-1])
+    h_now = float(df["high"].iloc[i])
+    l_now = float(df["low"].iloc[i])
+    c_now = float(df["close"].iloc[i])
+
+    is_inside = (h_m1 <= h_m2) and (l_m1 >= l_m2)
+    if not is_inside:
+        return False, 0.0
+
+    if direction == "LONG" and c_now > h_m2:
+        return True, 65.0
+    elif direction == "SHORT" and c_now < l_m2:
+        return True, 65.0
+
+    return False, 0.0
+
+
+def is_choppy_market(df, adx_val):
+    """
+    Anti-chop: mercado lateral si ADX < min O rango promedio < 0.75×ATR.
+    """
+    if not ANTI_CHOP:
+        return False
+    if adx_val < ADX_MIN:
+        return True
+    if len(df) < 15:
+        return False
+    recent    = df.iloc[-12:]
+    avg_range = float((recent["high"] - recent["low"]).mean())
+    atr_s     = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
+    atr_val   = float(atr_s.iloc[-1])
+    if atr_val > 0 and avg_range < atr_val * 0.75:
+        return True
+    return False
 
 # ── RECALC SL/TP ──────────────────────────────────────────────────────────────
 def recalc_sl_tp(sig, live_price):
@@ -435,7 +777,42 @@ def recalc_sl_tp(sig, live_price):
     if final_dist_pct < MIN_DIST_PCT * 0.9:
         return None, None
 
+    rr = abs(tp_price - live_price) / abs(live_price - sl_price)
+    if rr < MIN_RR:
+        return None, None
+
     return round(sl_price, 6), round(tp_price, 6)
+
+# ── POSITION SIZING V11 (FÓRMULA CORREGIDA) ──────────────────────────────────
+def calc_qty(balance, entry, sl):
+    """
+    V11: Formula correcta de position sizing.
+    notional = risk_usdt / dist_pct
+    El leverage en BingX futures se aplica sobre el margen (margen = notional/leverage).
+    No multiplicar por leverage en notional — ya está implícito en la cuenta de futuros.
+
+    Con balance=180 USDT, risk=1.5%, dist=0.8%:
+    notional = 2.7 / 0.008 = 337.5 USDT (margen = 337.5/5 = 67.5 USDT)
+    Pero limitamos a MAX_ORDER_USDT y MAX_MARGIN_PCT.
+    """
+    dist_pct = abs(entry - sl) / entry
+    if dist_pct < 1e-8:
+        return 0, 0
+
+    risk_usdt = balance * (RISK_PERCENT / 100)
+
+    # Notional correcto: arriesgamos exactamente risk_usdt si SL se activa
+    notional = risk_usdt / dist_pct
+
+    # Límite de margen máximo como % del balance
+    max_margin   = balance * (MAX_MARGIN_PCT / 100)
+    max_notional_by_margin = max_margin * LEVERAGE
+    max_notional = min(MAX_ORDER_USDT, max_notional_by_margin)
+
+    notional = max(MIN_ORDER_USDT, min(notional, max_notional))
+    qty = notional / entry
+
+    return round(max(qty, 0.001), 4), round(notional, 2)
 
 # ── ORDEN ─────────────────────────────────────────────────────────────────────
 def open_order(symbol, side, qty, sl, tp):
@@ -484,166 +861,67 @@ def open_order_with_retry(symbol, side, qty, sl, tp, retries=1):
             else:
                 raise
 
-# ── TRAILING STOP (V10 NUEVO) ─────────────────────────────────────────────────
+# ── TRAILING STOP ─────────────────────────────────────────────────────────────
 def update_trailing_stops(positions):
-    """
-    Para cada posición abierta, comprueba si debe mover el SL a breakeven.
-    Requiere tener el ATR original almacenado (lo estimamos del SL actual).
-    Solo activa si el precio ha movido +BE_ATR_MULT × ATR a favor.
-    """
     if not TRAILING_STOP or not positions:
         return
     for sym, pos in positions.items():
         try:
-            side = pos.get("positionSide", "LONG")
+            side  = pos.get("positionSide", "LONG")
             entry = float(pos.get("avgPrice", 0) or 0)
             if entry == 0:
                 continue
             live = get_live_price(sym)
-            # Estimar ATR: si tenemos cache, lo calculamos; si no, skip
             with ws_cache_lock:
                 df = ws_kline_cache.get(sym)
             if df is None or len(df) < 20:
                 continue
             atr_s = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
-            atr = float(atr_s.iloc[-2]) if len(atr_s) > 1 else 0
+            atr   = float(atr_s.iloc[-2]) if len(atr_s) > 1 else 0
             if atr == 0:
                 continue
-            # ¿El precio ya fue +BE_ATR_MULT × ATR a favor?
             if side == "LONG" and live >= entry + atr * BE_ATR_MULT:
-                new_sl = round(entry * 1.001, 6)  # BE + 0.1%
+                new_sl = round(entry * 1.001, 6)
                 bx_post("/openApi/swap/v2/trade/order", {
-                    "symbol": sym,
-                    "type": "STOP_MARKET",
-                    "side": "SELL",
-                    "positionSide": "LONG",
-                    "stopPrice": new_sl,
-                    "closePosition": "true",
+                    "symbol": sym, "type": "STOP_MARKET",
+                    "side": "SELL", "positionSide": "LONG",
+                    "stopPrice": new_sl, "closePosition": "true",
                     "workingType": "MARK_PRICE"
                 })
-                log.info(f"✅ Trailing BE movido {sym} LONG → SL={new_sl}")
+                log.info(f"✅ Trailing BE {sym} LONG → SL={new_sl}")
             elif side == "SHORT" and live <= entry - atr * BE_ATR_MULT:
                 new_sl = round(entry * 0.999, 6)
                 bx_post("/openApi/swap/v2/trade/order", {
-                    "symbol": sym,
-                    "type": "STOP_MARKET",
-                    "side": "BUY",
-                    "positionSide": "SHORT",
-                    "stopPrice": new_sl,
-                    "closePosition": "true",
+                    "symbol": sym, "type": "STOP_MARKET",
+                    "side": "BUY", "positionSide": "SHORT",
+                    "stopPrice": new_sl, "closePosition": "true",
                     "workingType": "MARK_PRICE"
                 })
-                log.info(f"✅ Trailing BE movido {sym} SHORT → SL={new_sl}")
+                log.info(f"✅ Trailing BE {sym} SHORT → SL={new_sl}")
         except Exception as e:
             log.debug(f"Trailing stop {sym}: {e}")
 
-# ── KLINES ────────────────────────────────────────────────────────────────────
-def get_klines(symbol, limit=300):
-    # Intentar desde WS cache primero
-    if USE_WS_CACHE:
-        with ws_cache_lock:
-            df = ws_kline_cache.get(symbol)
-        if df is not None and len(df) >= limit // 2:
-            return df.copy()
-
-    # REST fallback
-    params = {"symbol": symbol, "interval": INTERVAL_MAP.get(TIMEFRAME, "15m"), "limit": limit}
-    data = bx_get("/openApi/swap/v3/quote/klines", params)
-    rows = data.get("data", [])
-    if not rows or not isinstance(rows, list):
-        return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=["open_time","open","high","low","close","volume","close_time"])
-    for col in ("open","high","low","close","volume"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-    df.dropna(subset=["open","high","low","close","volume"], inplace=True)
-    df = df.sort_values("open_time").reset_index(drop=True)
-
-    # Guardar en cache
-    if USE_WS_CACHE:
-        with ws_cache_lock:
-            ws_kline_cache[symbol] = df.copy()
-
-    return df
-
-# ── INDICADORES ───────────────────────────────────────────────────────────────
-def calc_atr(high, low, close, period):
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.ewm(alpha=1/period, adjust=False).mean()
-
-def calc_ema_angle(ema_s, atr_s, look):
-    price_change = ema_s - ema_s.shift(look)
-    denom = atr_s * look
-    angle = np.degrees(np.arctan2(price_change.values, denom.values))
-    return pd.Series(angle, index=ema_s.index)
-
-def calc_adx(high, low, close, period):
-    up   = high.diff()
-    down = -low.diff()
-    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    alpha = 1.0 / period
-    def wilder(arr):
-        return pd.Series(arr, index=high.index).ewm(alpha=alpha, adjust=False).mean()
-    tr_s   = wilder(tr)
-    pdm_s  = wilder(plus_dm)
-    mdm_s  = wilder(minus_dm)
-    di_plus  = 100 * pdm_s / tr_s.replace(0, np.nan)
-    di_minus = 100 * mdm_s / tr_s.replace(0, np.nan)
-    dx  = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
-    adx = dx.ewm(alpha=alpha, adjust=False).mean()
-    return di_plus, di_minus, adx
-
-def calc_rsi(close, period):
-    delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs  = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def ph_series(high, left, right):
-    out = pd.Series(np.nan, index=high.index)
-    for i in range(left, len(high) - right):
-        w = high.iloc[i - left:i + right + 1]
-        if high.iloc[i] == w.max():
-            out.iloc[i] = high.iloc[i]
-    return out
-
-def pl_series(low, left, right):
-    out = pd.Series(np.nan, index=low.index)
-    for i in range(left, len(low) - right):
-        w = low.iloc[i - left:i + right + 1]
-        if low.iloc[i] == w.min():
-            out.iloc[i] = low.iloc[i]
-    return out
-
-# ── ESTRATEGIA PRINCIPAL ──────────────────────────────────────────────────────
+# ── ESTRATEGIA PRINCIPAL V11 ──────────────────────────────────────────────────
 def scan_symbol(symbol):
-    # V10: cooldown check
+    """
+    V11 DUAL-TF: escaneo con M5 entradas + H1 confirmación.
+    Detecta patrones de vela (Pin Bar, Engulfing, Momentum, Inside Bar).
+    SL ajustado en la vela señal. TP a 3×distancia. R:R mínimo 2.5.
+    """
+    # Cooldown check
     if symbol in sl_cooldown:
         elapsed = (datetime.now(timezone.utc) - sl_cooldown[symbol]).total_seconds() / 60
         if elapsed < COOLDOWN_MINS:
             return None
 
     try:
+        # ── 1. DATOS 5m ───────────────────────────────────────────────────────
         df = get_klines(symbol, limit=300)
-        min_bars = max(PIVOT_LEN * 2 + 2, ATR_LEN + 1, EMA_TREND + 10,
-                       ADX_LEN * 2 + 5, RSI_LEN + 5, 80)
+        min_bars = max(EMA_TREND + 10, ADX_LEN * 2 + 5, RSI_LEN + 5, 60)
         if df.empty or len(df) < min_bars:
             return None
 
+        # ── 2. INDICADORES 5m ─────────────────────────────────────────────────
         atr_s        = calc_atr(df["high"], df["low"], df["close"], ATR_LEN)
         ema_f        = df["close"].ewm(span=EMA_FAST,  adjust=False).mean()
         ema_s        = df["close"].ewm(span=EMA_SLOW,  adjust=False).mean()
@@ -652,17 +930,19 @@ def scan_symbol(symbol):
         di_p, di_m, adx_s = calc_adx(df["high"], df["low"], df["close"], ADX_LEN)
         rsi_s        = calc_rsi(df["close"], RSI_LEN)
         vol_ma       = df["volume"].rolling(20).mean()
-        peak         = ph_series(df["high"], PIVOT_LEN, PIVOT_LEN).ffill()
-        valley       = pl_series(df["low"],  PIVOT_LEN, PIVOT_LEN).ffill()
 
-        i = len(df) - 2
-        if i < max(PIVOT_LEN + 1, EMA_TREND + 2, ADX_LEN * 2):
+        i = len(df) - 2   # última vela completamente cerrada
+        if i < max(EMA_TREND + 2, ADX_LEN * 2, 50):
             return None
 
         close_now     = float(df["close"].iloc[i])
-        close_prev    = float(df["close"].iloc[i - 1])
+        open_now      = float(df["open"].iloc[i])
+        high_now      = float(df["high"].iloc[i])
+        low_now       = float(df["low"].iloc[i])
         ema_f_now     = float(ema_f.iloc[i])
         ema_s_now     = float(ema_s.iloc[i])
+        ema_f_prev    = float(ema_f.iloc[i-1])
+        ema_s_prev    = float(ema_s.iloc[i-1])
         ema_trend_now = float(ema_trend.iloc[i])
         angle_now     = float(angle.iloc[i])
         adx_now       = float(adx_s.iloc[i])
@@ -671,13 +951,11 @@ def scan_symbol(symbol):
         rsi_now       = float(rsi_s.iloc[i])
         vol_now       = float(df["volume"].iloc[i])
         vma           = float(vol_ma.iloc[i])
-        cpeak         = float(peak.iloc[i])
-        cvalley       = float(valley.iloc[i])
         catr          = float(atr_s.iloc[i])
 
-        if any(np.isnan(x) for x in [angle_now, adx_now, cpeak, cvalley, catr,
-                                      ema_f_now, ema_s_now, ema_trend_now,
-                                      rsi_now, di_p_now, di_m_now]):
+        if any(np.isnan(x) for x in [angle_now, adx_now, catr, ema_f_now,
+                                      ema_s_now, ema_trend_now, rsi_now,
+                                      di_p_now, di_m_now]):
             return None
         if vma <= 0 or catr <= 0:
             return None
@@ -686,115 +964,194 @@ def scan_symbol(symbol):
         if atr_pct > ATR_MAX_PCT:
             return None
 
-        vratio = round(vol_now / vma, 2)
+        # ── 3. ANTI-CHOP ──────────────────────────────────────────────────────
+        if is_choppy_market(df, adx_now):
+            return None
 
-        vol_confirm  = (not USE_VOL) or (vratio >= VOL_MULT)
-        adx_confirm  = (not USE_ADX) or (adx_now > ADX_MIN)
+        vratio = round(vol_now / vma, 2) if vma > 0 else 0.0
 
+        # ── 4. CONDICIONES DE TENDENCIA 5m ────────────────────────────────────
         trend_long  = close_now > ema_trend_now
         trend_short = close_now < ema_trend_now
 
-        # V10: RSI más estricto — no entrar LONG si RSI > OB, no SHORT si RSI < OS
-        rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)
-        rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)
+        ema_cross_long  = ema_f_now > ema_s_now
+        ema_cross_short = ema_f_now < ema_s_now
 
-        di_long_ok  = (not USE_DI) or (di_p_now > di_m_now)
-        di_short_ok = (not USE_DI) or (di_m_now > di_p_now)
-
+        # V11: pendiente ≥30° — "tren bala"
         angle_long_ok  = angle_now >= SLOPE_LIMIT
         angle_short_ok = angle_now <= -SLOPE_LIMIT
 
-        # V10: Añadido filtro de aceleración — EMA fast debe estar acelerando
-        ema_f_prev = float(ema_f.iloc[i - 1])
-        ema_s_prev = float(ema_s.iloc[i - 1])
-        accel_long  = ema_f_now > ema_f_prev  # EMA fast acelerando hacia arriba
+        # V11: EMA fast acelerando (no solo cruzando)
+        accel_long  = ema_f_now > ema_f_prev
         accel_short = ema_f_now < ema_f_prev
 
-        slope_long = (
-            ema_f_now > ema_s_now  and
-            angle_long_ok          and
-            adx_confirm            and
-            vol_confirm            and
-            trend_long             and
-            rsi_long_ok            and
-            di_long_ok             and
-            accel_long             # V10: nuevo filtro
+        # V11: EMA fast/slow también acelerando en la misma dirección
+        ema_gap_widening_long  = (ema_f_now - ema_s_now) > (ema_f_prev - ema_s_prev)
+        ema_gap_widening_short = (ema_s_now - ema_f_now) > (ema_s_prev - ema_f_prev)
+
+        vol_confirm  = (not USE_VOL) or (vratio >= VOL_MULT)
+        adx_confirm  = (not USE_ADX) or (adx_now > ADX_MIN)
+        rsi_long_ok  = (not USE_RSI) or (rsi_now < RSI_OB)
+        rsi_short_ok = (not USE_RSI) or (rsi_now > RSI_OS)
+        di_long_ok   = (not USE_DI)  or (di_p_now > di_m_now)
+        di_short_ok  = (not USE_DI)  or (di_m_now > di_p_now)
+
+        base_long = (
+            ema_cross_long and angle_long_ok and adx_confirm and
+            vol_confirm and trend_long and rsi_long_ok and
+            di_long_ok and accel_long and ema_gap_widening_long
         )
-        slope_short = (
-            ema_f_now < ema_s_now  and
-            angle_short_ok         and
-            adx_confirm            and
-            vol_confirm            and
-            trend_short            and
-            rsi_short_ok           and
-            di_short_ok            and
-            accel_short            # V10: nuevo filtro
+        base_short = (
+            ema_cross_short and angle_short_ok and adx_confirm and
+            vol_confirm and trend_short and rsi_short_ok and
+            di_short_ok and accel_short and ema_gap_widening_short
         )
 
-        zz_long  = (close_prev <= cpeak)   and (close_now > cpeak)
-        zz_short = (close_prev >= cvalley) and (close_now < cvalley)
-
-        if STRATEGY_MODE == "slope":
-            is_long, is_short = slope_long, slope_short
-            method = "SLOPE+ADX"
-        elif STRATEGY_MODE == "zigzag":
-            is_long  = zz_long  and vol_confirm and trend_long
-            is_short = zz_short and vol_confirm and trend_short
-            method = "ZIGZAG"
-        else:
-            is_long  = slope_long  and zz_long
-            is_short = slope_short and zz_short
-            method = "DUAL"
-
-        if not is_long and not is_short:
+        if not base_long and not base_short:
             return None
 
-        direction = "LONG" if is_long else "SHORT"
+        # ── 5. H1 CONFIRMACIÓN (GOLDEN SETUP) ────────────────────────────────
+        h1_ctx    = None
+        h1_bonus  = 0
+        h1_trend  = "UNKNOWN"
+        h1_ok     = True
 
-        sl_distance = catr * SL_ATR_MULT
+        if USE_H1_CONFIRM:
+            h1_ctx = analyze_h1(symbol)
+            if h1_ctx:
+                h1_trend = h1_ctx["h1_trend"]
+
+                # Golden setup: M5 + H1 alineados
+                if base_long and h1_trend == "BULL":
+                    h1_bonus = 20
+                elif base_short and h1_trend == "BEAR":
+                    h1_bonus = 20
+                elif h1_trend == "NEUTRAL":
+                    h1_bonus = 5   # neutral ok pero sin bonus máximo
+                else:
+                    # M5 contra H1 = descartado
+                    h1_ok = False
+
+                # S/R filter: no comprar en resistencia, no vender en soporte H1
+                if USE_H1_SR and h1_ctx and h1_ok:
+                    if base_long and h1_ctx["dist_to_res"] < H1_SR_DIST_MIN:
+                        h1_ok = False  # resistencia H1 muy cerca arriba
+                    elif base_short and h1_ctx["dist_to_sup"] < H1_SR_DIST_MIN:
+                        h1_ok = False  # soporte H1 muy cerca abajo
+
+        if not h1_ok:
+            return None
+
+        direction = "LONG" if base_long else "SHORT"
+
+        # ── 6. DETECCIÓN DE PATRÓN DE VELA ───────────────────────────────────
+        pattern_name  = "SLOPE"
+        pattern_score = 0.0
+        sl_candle     = None   # SL ajustado a la vela de señal
+
+        if USE_CANDLE_PATTERNS:
+            is_pin, pin_str    = detect_pin_bar(df, i, direction)
+            is_eng, eng_str    = detect_engulfing(df, i, direction)
+            is_mom, mom_str    = detect_momentum_candle(df, i, direction, catr)
+            is_ib,  ib_str     = detect_inside_bar_breakout(df, i, direction)
+
+            # Prioridad: Pin > Engulf > Momentum > Inside > solo slope
+            if is_pin:
+                pattern_name  = "PIN_BAR"
+                pattern_score = pin_str
+                # SL debajo del mínimo / encima del máximo de la vela pin
+                margin = catr * 0.08
+                sl_candle = (low_now  - margin) if direction == "LONG" else (high_now + margin)
+            elif is_eng:
+                pattern_name  = "ENGULF"
+                pattern_score = eng_str
+                margin = catr * 0.10
+                sl_candle = (low_now  - margin) if direction == "LONG" else (high_now + margin)
+            elif is_mom:
+                pattern_name  = "MOMENTUM"
+                pattern_score = mom_str
+                margin = catr * 0.12
+                sl_candle = (low_now  - margin) if direction == "LONG" else (high_now + margin)
+            elif is_ib:
+                pattern_name  = "INSIDE_BR"
+                pattern_score = ib_str
+                # SL debajo de la inside bar
+                prev_low  = float(df["low"].iloc[i-1])
+                prev_high = float(df["high"].iloc[i-1])
+                margin = catr * 0.10
+                sl_candle = (prev_low - margin) if direction == "LONG" else (prev_high + margin)
+
+        # ── 7. CALCULAR SL / TP ───────────────────────────────────────────────
+        sl_atr_dist = catr * SL_ATR_MULT   # fallback por ATR
 
         if direction == "LONG":
-            sl_pivot  = min(cvalley, close_now - sl_distance)
-            sl_price  = min(sl_pivot, close_now - sl_distance)
-            if sl_price >= close_now or (close_now - sl_price) / close_now * 100 < MIN_DIST_PCT:
+            # Usa el SL de la vela si es más ajustado que el ATR-based
+            if sl_candle is not None:
+                candle_dist = close_now - sl_candle
+                atr_dist    = sl_atr_dist
+                # Elegir el más ajustado (pero respetar MIN_DIST_PCT)
+                sl_price = sl_candle if candle_dist <= atr_dist else (close_now - sl_atr_dist)
+            else:
+                sl_price = close_now - sl_atr_dist
+
+            # Garantizar MIN_DIST_PCT
+            if (close_now - sl_price) / close_now * 100 < MIN_DIST_PCT:
                 sl_price = close_now * (1 - MIN_DIST_PCT / 100)
-            tp_price  = close_now + (close_now - sl_price) * TP_MULT
-            if sl_price >= close_now or tp_price <= close_now:
+
+            if sl_price >= close_now:
                 return None
-        else:
-            sl_pivot  = max(cpeak, close_now + sl_distance)
-            sl_price  = max(sl_pivot, close_now + sl_distance)
-            if sl_price <= close_now or (sl_price - close_now) / close_now * 100 < MIN_DIST_PCT:
+
+            tp_price = close_now + (close_now - sl_price) * TP_MULT
+
+        else:  # SHORT
+            if sl_candle is not None:
+                candle_dist = sl_candle - close_now
+                atr_dist    = sl_atr_dist
+                sl_price = sl_candle if candle_dist <= atr_dist else (close_now + sl_atr_dist)
+            else:
+                sl_price = close_now + sl_atr_dist
+
+            if (sl_price - close_now) / close_now * 100 < MIN_DIST_PCT:
                 sl_price = close_now * (1 + MIN_DIST_PCT / 100)
-            tp_price  = close_now - (sl_price - close_now) * TP_MULT
-            if sl_price <= close_now or tp_price >= close_now:
+
+            if sl_price <= close_now:
                 return None
+
+            tp_price = close_now - (sl_price - close_now) * TP_MULT
 
         dist     = abs(close_now - sl_price)
         dist_pct = (dist / close_now) * 100
+
         if dist_pct < MIN_DIST_PCT:
             return None
 
         rr = abs(tp_price - close_now) / dist
+        if rr < MIN_RR:
+            return None
 
-        # V10: scoring mejorado con pesos más realistas
-        score  = min(abs(angle_now) / SLOPE_LIMIT * 25, 30)   # ángulo: peso 30
-        score += min((adx_now - ADX_MIN) / ADX_MIN * 20, 25)  # ADX: peso 25
-        score += min(vratio * 8, 15)                           # volumen: peso 15
-        score += min(rr * 6, 15)                               # RR: peso 15
-        score += 10 if (trend_long or trend_short) else 0      # tendencia: peso 10
-        score += min(abs(di_p_now - di_m_now) / 10, 5)        # DI spread: peso 5
+        # ── 8. SCORING V11 ────────────────────────────────────────────────────
+        # Pesos: ángulo(30) + ADX(20) + H1(20) + patrón(12) + vol(8) + RR(6) + DI(4)
+        score  = min(abs(angle_now) / SLOPE_LIMIT * 30, 30)    # ángulo: max 30
+        score += min((adx_now - ADX_MIN) / ADX_MIN * 20, 20)   # ADX: max 20
+        score += h1_bonus                                        # H1 confirm: max 20
+        score += min(pattern_score / 8, 12)                     # patrón: max 12
+        score += min(vratio * 5, 8)                             # volumen: max 8
+        score += min((rr - MIN_RR) * 3, 6)                     # R:R extra: max 6
+        score += min(abs(di_p_now - di_m_now) / 10, 4)         # DI spread: max 4
 
         if score < MIN_SCORE:
             return None
 
+        method_str = f"{pattern_name}|TF:{TIMEFRAME}+1H|{h1_trend}"
+
         return {
             "symbol":    symbol,
             "signal":    direction,
-            "method":    method,
+            "method":    method_str,
+            "pattern":   pattern_name,
             "close":     close_now,
-            "sl":        sl_price,
-            "tp":        tp_price,
+            "sl":        round(sl_price, 6),
+            "tp":        round(tp_price, 6),
             "atr":       catr,
             "atr_pct":   round(atr_pct, 2),
             "vol_ratio": vratio,
@@ -805,30 +1162,14 @@ def scan_symbol(symbol):
             "rr":        round(rr, 2),
             "dist_pct":  round(dist_pct, 3),
             "di_spread": round(abs(di_p_now - di_m_now), 1),
+            "h1_trend":  h1_trend,
+            "h1_ctx":    h1_ctx,
+            "pat_score": round(pattern_score, 1),
         }
+
     except Exception as e:
         log.debug(f"Scan {symbol}: {e}")
         return None
-
-# ── POSITION SIZING V10 ───────────────────────────────────────────────────────
-def calc_qty(balance, entry, sl):
-    """
-    V10: position sizing con límites MIN/MAX en USDT.
-    """
-    risk = balance * (RISK_PERCENT / 100)
-    dist = abs(entry - sl)
-    if dist == 0:
-        return 0
-    qty = max(round((risk * LEVERAGE) / entry, 4), 0.001)
-
-    # Calcular notional
-    notional = qty * entry
-    if notional < MIN_ORDER_USDT:
-        qty = round(MIN_ORDER_USDT / entry, 4)
-    elif notional > MAX_ORDER_USDT:
-        qty = round(MAX_ORDER_USDT / entry, 4)
-
-    return qty
 
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
 async def _send(msg):
@@ -848,39 +1189,53 @@ def tg(msg):
 
 def tg_startup(balance, symbols):
     tg(
-        f"🚀 <b>EMA+ADX+ZigZag Elite V10.0 — TURBO EDITION</b>\n"
+        f"🚀 <b>EMA+ADX+ZigZag Elite V11.0 — BULLET TRAIN EDITION</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🔀 <b>Modo:</b> {STRATEGY_MODE.upper()} | <b>TF:</b> {TIMEFRAME}\n"
+        f"🔀 <b>Modo:</b> DUAL TF ({TIMEFRAME} entradas + 1H tendencia)\n"
         f"<b>EMA:</b> {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND} | "
-        f"<b>Slope≥:</b> {SLOPE_LIMIT}° | <b>ADX≥:</b> {ADX_MIN}\n"
+        f"<b>Slope≥:</b> {SLOPE_LIMIT}° 🚄 | <b>ADX≥:</b> {ADX_MIN}\n"
         f"<b>TP mult:</b> {TP_MULT}x | <b>SL ATR:</b> {SL_ATR_MULT}x | "
-        f"<b>Score≥:</b> {MIN_SCORE}\n"
-        f"<b>DI:</b> {'✅' if USE_DI else '❌'} | "
-        f"<b>Vol≥:</b> {VOL_MULT}x | <b>RSI:</b> {RSI_OS}-{RSI_OB}\n"
-        f"<b>WS Cache:</b> {'✅' if USE_WS_CACHE else '❌'} | "
+        f"<b>Min R:R:</b> {MIN_RR} | <b>Score≥:</b> {MIN_SCORE}\n"
+        f"<b>H1 confirm:</b> {'✅' if USE_H1_CONFIRM else '❌'} | "
+        f"<b>H1 S/R:</b> {'✅' if USE_H1_SR else '❌'}\n"
+        f"<b>Patrones:</b> {'✅ PIN+ENG+MOM+IB' if USE_CANDLE_PATTERNS else '❌'}\n"
+        f"<b>Anti-chop:</b> {'✅' if ANTI_CHOP else '❌'} | "
         f"<b>Trailing:</b> {'✅' if TRAILING_STOP else '❌'} (BE@{BE_ATR_MULT}x ATR)\n"
+        f"<b>Vol≥:</b> {VOL_MULT}x | <b>RSI:</b> {RSI_OS}–{RSI_OB}\n"
         f"<b>Pos size:</b> {MIN_ORDER_USDT}–{MAX_ORDER_USDT} USDT | "
         f"<b>Max trades:</b> {MAX_OPEN_TRADES}\n"
         f"<b>Balance:</b> {balance:.2f} USDT | <b>Símbolos:</b> {len(symbols)}\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
-def tg_entry(sig, qty, balance, spread_pct=None):
+def tg_entry(sig, qty, notional, balance, spread_pct=None):
     d = "🟢 LONG" if sig["signal"] == "LONG" else "🔴 SHORT"
     spread_str = f" | <b>Spread:</b> {spread_pct:.3f}%" if spread_pct is not None else ""
+    h1_str = f" | <b>H1:</b> {sig.get('h1_trend','?')}"
+    pat    = sig.get("pattern", "SLOPE")
+    pat_icon = {"PIN_BAR":"📌","ENGULF":"🔄","MOMENTUM":"💥","INSIDE_BR":"📦","SLOPE":"📈"}.get(pat,"⚡")
+    h1_ctx = sig.get("h1_ctx")
+    sr_str = ""
+    if h1_ctx:
+        sr_str = (f"\n<b>H1 Res:</b> {h1_ctx['h1_resistance']:.6g} "
+                  f"(+{h1_ctx['dist_to_res']:.1f}%) | "
+                  f"<b>H1 Sup:</b> {h1_ctx['h1_support']:.6g} "
+                  f"(-{h1_ctx['dist_to_sup']:.1f}%)")
     tg(
         f"<b>✅ ORDEN ABIERTA — {sig['symbol']}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>Dir:</b> {d} | <b>Score:</b> {sig['score']}/100\n"
-        f"<b>Modo:</b> {sig['method']} | <b>ADX:</b> {sig['adx']} | "
-        f"<b>Ang:</b> {sig['angle']}° | <b>RSI:</b> {sig['rsi']}\n"
-        f"<b>Vol:</b> {sig['vol_ratio']}x | <b>ATR:</b> {sig['atr_pct']}%{spread_str}\n"
-        f"<b>DI spread:</b> {sig.get('di_spread','?')}\n"
+        f"{pat_icon} <b>Patrón:</b> {pat} ({sig.get('pat_score',0):.0f}){h1_str}\n"
+        f"<b>Ang:</b> {sig['angle']}° | <b>ADX:</b> {sig['adx']} | "
+        f"<b>RSI:</b> {sig['rsi']} | <b>DI±:</b> {sig.get('di_spread','?')}\n"
+        f"<b>Vol:</b> {sig['vol_ratio']}x | <b>ATR:</b> {sig['atr_pct']}%{spread_str}"
+        f"{sr_str}\n"
         f"<b>Entrada:</b>     <code>{sig['close']:.6g}</code>\n"
         f"<b>Stop Loss:</b>   <code>{sig['sl']:.6g}</code> ({sig['dist_pct']}%)\n"
         f"<b>Take Profit:</b> <code>{sig['tp']:.6g}</code>\n"
-        f"<b>RR:</b> 1:{sig['rr']} | <b>Qty:</b> {qty:.4f} | "
-        f"<b>Riesgo:</b> {balance * RISK_PERCENT / 100:.2f} USDT\n"
+        f"<b>R:R:</b> 1:{sig['rr']} | <b>Qty:</b> {qty:.4f} | "
+        f"<b>Notional:</b> {notional:.2f} USDT\n"
+        f"<b>Riesgo máx:</b> {balance * RISK_PERCENT / 100:.2f} USDT\n"
         f"🕐 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -891,10 +1246,12 @@ def tg_scan(signals, total, open_count):
         f"🔍 <b>{len(signals)} señal(es) / {total}</b> | Trades: {open_count}/{MAX_OPEN_TRADES}",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
+    pat_icons = {"PIN_BAR":"📌","ENGULF":"🔄","MOMENTUM":"💥","INSIDE_BR":"📦","SLOPE":"📈"}
     for s in signals[:6]:
-        e = "🟢" if s["signal"] == "LONG" else "🔴"
+        e  = "🟢" if s["signal"] == "LONG" else "🔴"
+        pi = pat_icons.get(s.get("pattern","SLOPE"),"⚡")
         lines.append(
-            f"{e} <b>{s['symbol']}</b> [{s['method']}] "
+            f"{e}{pi} <b>{s['symbol']}</b> H1:{s.get('h1_trend','?')} "
             f"Score:{s['score']} Ang:{s['angle']}° ADX:{s['adx']} "
             f"RSI:{s['rsi']} Vol:{s['vol_ratio']}x RR:1:{s['rr']}"
         )
@@ -913,10 +1270,11 @@ def tg_diag(signals, skip_reasons):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 def main():
-    log.info(f"=== EMA+ADX+ZigZag Elite V10.0 TURBO [{STRATEGY_MODE.upper()}] TF={TIMEFRAME} ===")
-    log.info(f"  ADX≥{ADX_MIN} | Slope≥{SLOPE_LIMIT}° | TP×{TP_MULT} | SL×{SL_ATR_MULT} | Score≥{MIN_SCORE}")
-    log.info(f"  DI={USE_DI} | Vol≥{VOL_MULT}x | WS={USE_WS_CACHE} | Trailing={TRAILING_STOP}")
-    log.info(f"  Pos: {MIN_ORDER_USDT}–{MAX_ORDER_USDT} USDT | Cooldown: {COOLDOWN_MINS}min")
+    log.info("=== EMA+ADX+ZigZag Elite V11.0 BULLET TRAIN EDITION ===")
+    log.info(f"  TF: {TIMEFRAME} + 1H | EMA {EMA_FAST}/{EMA_SLOW}/T{EMA_TREND}")
+    log.info(f"  Slope≥{SLOPE_LIMIT}° | ADX≥{ADX_MIN} | TP×{TP_MULT} | SL×{SL_ATR_MULT} | Min R:R {MIN_RR}")
+    log.info(f"  H1={USE_H1_CONFIRM} | Patrones={USE_CANDLE_PATTERNS} | AntiChop={ANTI_CHOP}")
+    log.info(f"  Score≥{MIN_SCORE} | Pos: {MIN_ORDER_USDT}–{MAX_ORDER_USDT} USDT | Cooldown: {COOLDOWN_MINS}min")
 
     symbols   = CUSTOM_SYMBOLS if CUSTOM_SYMBOLS else get_all_symbols(MAX_SYMBOLS)
     if not symbols:
@@ -926,22 +1284,30 @@ def main():
     positions = get_all_positions()
     log.info(f"Balance: {balance:.4f} | Symbols: {len(symbols)} | Open: {len(positions)}")
 
-    # Pre-cargar klines en cache via REST para los top símbolos
-    log.info("Pre-cargando klines en cache REST...")
+    # Pre-cargar klines en cache REST (5m)
+    log.info("Pre-cargando klines 5m en cache REST...")
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         list(ex.map(lambda s: get_klines(s, 300), symbols[:100]))
     log.info("Cache REST listo.")
 
-    # Iniciar WebSocket cache en background
+    # Pre-cargar H1 para los top símbolos (en background para no bloquear)
+    def _prefetch_h1():
+        log.info("Pre-cargando klines H1...")
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(lambda s: get_h1_klines(s, 60), symbols[:80]))
+        log.info("Cache H1 listo.")
+    threading.Thread(target=_prefetch_h1, daemon=True).start()
+
+    # WebSocket cache en background
     start_ws_cache(symbols)
-    time.sleep(2)  # dar tiempo al WS para conectar
+    time.sleep(2)
 
     # Configurar leverage
     with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
         list(ex.map(set_lev, symbols))
 
     tg_startup(balance, symbols)
-    log.info("✅ Bot V10 iniciado. Loop comenzando.")
+    log.info("✅ Bot V11 iniciado. Loop comenzando.")
 
     errors = 0
 
@@ -952,13 +1318,16 @@ def main():
             positions  = get_all_positions()
             open_count = len(positions)
 
-            log.info(f"── V10 [{STRATEGY_MODE}] {balance:.4f} USDT | "
-                     f"{open_count}/{MAX_OPEN_TRADES} trades | {len(symbols)} sym ──")
+            log.info(
+                f"── V11 [DUAL-TF] {balance:.4f} USDT | "
+                f"{open_count}/{MAX_OPEN_TRADES} trades | {len(symbols)} sym ──"
+            )
 
-            # V10: actualizar trailing stops en posiciones abiertas
+            # Trailing stops en posiciones abiertas
             if TRAILING_STOP and positions:
                 update_trailing_stops(positions)
 
+            # Scan
             signals = []
             with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as ex:
                 futs = {ex.submit(scan_symbol, s): s for s in symbols}
@@ -974,13 +1343,14 @@ def main():
                 tg_scan(signals, len(symbols), open_count)
                 for s in signals[:5]:
                     log.info(
-                        f"  → {s['symbol']} {s['signal']} [{s['method']}] "
-                        f"score={s['score']} ang={s['angle']}° adx={s['adx']} "
-                        f"rsi={s['rsi']} vol={s['vol_ratio']}x rr=1:{s['rr']}"
+                        f"  → {s['symbol']} {s['signal']} [{s['pattern']}] "
+                        f"H1:{s.get('h1_trend','?')} score={s['score']} "
+                        f"ang={s['angle']}° adx={s['adx']} rsi={s['rsi']} "
+                        f"vol={s['vol_ratio']}x rr=1:{s['rr']}"
                     )
 
-            entered: set = set()
-            skip_reasons: dict = {}
+            entered      : set  = set()
+            skip_reasons : dict = {}
             orders_opened = 0
 
             for sig in signals:
@@ -995,11 +1365,11 @@ def main():
                 if open_count >= MAX_OPEN_TRADES:
                     log.info(f"Max trades ({MAX_OPEN_TRADES}) alcanzado.")
                     break
-                if balance < 1:
+                if balance < 2:
                     skip_reasons[sym] = f"balance bajo ({balance:.2f})"
                     break
 
-                # V10: filtro de spread antes de operar
+                # Filtro de spread
                 spread = get_spread_pct(sym)
                 if spread > MAX_SPREAD_PCT:
                     reason = f"spread {spread:.3f}% > max {MAX_SPREAD_PCT}%"
@@ -1015,31 +1385,28 @@ def main():
                         live_price = get_live_price(sym)
                         log.info(f"Live price {sym}: scan={sig['close']:.6g} live={live_price:.6g}")
                     except Exception as ep:
-                        reason = f"sin precio: {str(ep)[:60]}"
-                        skip_reasons[sym] = reason
+                        skip_reasons[sym] = f"sin precio: {str(ep)[:60]}"
                         continue
 
                     sl_live, tp_live = recalc_sl_tp(sig, live_price)
                     if sl_live is None:
-                        reason = f"SL/TP inválido live={live_price:.6g}"
-                        skip_reasons[sym] = reason
+                        skip_reasons[sym] = f"SL/TP inválido live={live_price:.6g}"
                         continue
 
-                    qty = calc_qty(balance, live_price, sl_live)
+                    qty, notional = calc_qty(balance, live_price, sl_live)
                     if qty <= 0:
-                        reason = "qty=0"
-                        skip_reasons[sym] = reason
+                        skip_reasons[sym] = "qty=0"
                         continue
 
-                    # Verificar que notional mínimo sea correcto
-                    notional = qty * live_price
-                    log.info(f"Orden {sym} {side} qty={qty:.4f} "
-                             f"notional={notional:.2f} USDT "
-                             f"live={live_price:.6g} sl={sl_live:.6g} tp={tp_live:.6g} "
-                             f"spread={spread:.3f}%")
+                    log.info(
+                        f"Orden {sym} {side} qty={qty:.4f} "
+                        f"notional={notional:.2f} USDT "
+                        f"live={live_price:.6g} sl={sl_live:.6g} tp={tp_live:.6g} "
+                        f"spread={spread:.3f}% rr=1:{sig['rr']}"
+                    )
 
                     res = open_order_with_retry(sym, side, qty, sl_live, tp_live, retries=1)
-                    log.info(f"✅ {sym} {side} qty={qty:.4f} | {res}")
+                    log.info(f"✅ {sym} {side} qty={qty:.4f} notional={notional:.2f} | {res}")
 
                     sig["close"]    = live_price
                     sig["sl"]       = sl_live
@@ -1047,9 +1414,9 @@ def main():
                     sig["dist_pct"] = round(abs(live_price - sl_live) / live_price * 100, 3)
                     sig["rr"]       = round(abs(tp_live - live_price) / abs(live_price - sl_live), 2)
 
-                    tg_entry(sig, qty, balance, spread_pct=spread)
+                    tg_entry(sig, qty, notional, balance, spread_pct=spread)
                     entered.add(sym)
-                    open_count += 1
+                    open_count    += 1
                     orders_opened += 1
                     time.sleep(0.5)
 
@@ -1057,7 +1424,6 @@ def main():
                     reason = str(e)[:100]
                     log.error(f"Order FAILED {sym}: {e}")
                     skip_reasons[sym] = f"error: {reason}"
-                    # V10: si es un SL activado, añadir cooldown
                     if "stop" in reason.lower() or "liquidat" in reason.lower():
                         sl_cooldown[sym] = datetime.now(timezone.utc)
                     tg(f"⚠️ <b>Error {sym}</b>: <code>{str(e)[:150]}</code>")
@@ -1069,7 +1435,7 @@ def main():
             errors = 0
 
         except KeyboardInterrupt:
-            tg("🛑 <b>Bot V10 detenido</b>")
+            tg("🛑 <b>Bot V11 detenido</b>")
             break
         except Exception as e:
             errors += 1
@@ -1081,6 +1447,7 @@ def main():
                 break
 
         time.sleep(max(0, LOOP_SECONDS - (time.time() - t0)))
+
 
 if __name__ == "__main__":
     main()
