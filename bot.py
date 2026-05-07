@@ -135,23 +135,59 @@ def get_positions():
         log.error(f"positions: {e}")
         return {}
 
+FALLBACK_SYMS = [
+    "BTC-USDT","ETH-USDT","BNB-USDT","SOL-USDT","XRP-USDT",
+    "DOGE-USDT","ADA-USDT","AVAX-USDT","DOT-USDT","LINK-USDT",
+    "INJ-USDT","SUI-USDT","ARB-USDT","OP-USDT","WIF-USDT",
+    "PEPE-USDT","NEAR-USDT","APT-USDT","HBAR-USDT","AAVE-USDT",
+    "LDO-USDT","RUNE-USDT","TIA-USDT","SEI-USDT","WLD-USDT",
+    "FIL-USDT","ICP-USDT","ATOM-USDT","MATIC-USDT","UNI-USDT",
+    "LTC-USDT","BCH-USDT","ETC-USDT","SAND-USDT","MANA-USDT",
+    "GRT-USDT","CRV-USDT","DYDX-USDT","ENS-USDT","1INCH-USDT",
+]
+
 def get_symbols():
+    # Intento 1: contracts API — sin filtro duro de asset
     try:
         data = bx("/openApi/swap/v2/quote/contracts",{})
         syms = []
         for c in data.get("data",[]):
             sym = c.get("symbol","")
-            if (sym.endswith("-USDT") and c.get("asset","")=="USDT"
-                    and c.get("status")==1
-                    and not any(e in sym for e in EXCLUDED)):
-                syms.append((sym, float(c.get("tradeAmount",0) or 0)))
-        syms.sort(key=lambda x: x[1], reverse=True)
-        result = [s for s,_ in syms[:MAX_SYMBOLS]]
-        log.info(f"Símbolos: {len(result)} (top {MAX_SYMBOLS} por volumen)")
-        return result
+            if not sym.endswith("-USDT"): continue
+            if any(e in sym for e in EXCLUDED): continue
+            if c.get("status") not in (1, "1", None, ""): continue
+            syms.append((sym, float(c.get("tradeAmount",0) or 0)))
+        if syms:
+            syms.sort(key=lambda x: x[1], reverse=True)
+            result = [s for s,_ in syms[:MAX_SYMBOLS]]
+            log.info(f"Símbolos: {len(result)} (contracts API)")
+            return result
+        log.warning("contracts API devolvió 0 símbolos")
     except Exception as e:
-        log.error(f"symbols: {e}")
-        return []
+        log.warning(f"contracts API error: {e}")
+
+    # Intento 2: ticker API
+    try:
+        data = bx("/openApi/swap/v2/quote/ticker",{})
+        tickers = data.get("data",[])
+        syms = []
+        for t in tickers:
+            sym = t.get("symbol","")
+            if not sym.endswith("-USDT"): continue
+            if any(e in sym for e in EXCLUDED): continue
+            syms.append((sym, float(t.get("quoteVolume",0) or 0)))
+        if syms:
+            syms.sort(key=lambda x: x[1], reverse=True)
+            result = [s for s,_ in syms[:MAX_SYMBOLS]]
+            log.info(f"Símbolos: {len(result)} (ticker API)")
+            return result
+        log.warning("ticker API devolvió 0 símbolos")
+    except Exception as e:
+        log.warning(f"ticker API error: {e}")
+
+    # Fallback hardcoded
+    log.warning(f"Usando fallback hardcoded ({len(FALLBACK_SYMS)} syms)")
+    return FALLBACK_SYMS
 
 def set_leverage(symbol):
     for side in ("LONG","SHORT"):
