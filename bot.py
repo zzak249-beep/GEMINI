@@ -37,13 +37,13 @@ RISK_PERCENT     = float(os.environ.get("RISK_PERCENT",  "1.5"))
 LEVERAGE         = int(os.environ.get("LEVERAGE",        "5"))
 LOOP_SECONDS     = int(os.environ.get("LOOP_SECONDS",    "45"))
 MAX_OPEN_TRADES  = int(os.environ.get("MAX_OPEN_TRADES", "8"))
-SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",    "30"))
+SCAN_WORKERS     = int(os.environ.get("SCAN_WORKERS",    "20"))
 MAX_SYMBOLS      = int(os.environ.get("MAX_SYMBOLS",     "150"))  # top 150 por volumen
 
 EMA_FAST         = int(os.environ.get("EMA_FAST",    "7"))
 EMA_SLOW         = int(os.environ.get("EMA_SLOW",    "21"))
-SLOPE_MIN        = float(os.environ.get("SLOPE_MIN", "8.0"))    # grados mínimos
-ADX_MIN          = float(os.environ.get("ADX_MIN",   "20.0"))
+SLOPE_MIN        = float(os.environ.get("SLOPE_MIN", "6.0"))    # grados mínimos
+ADX_MIN          = float(os.environ.get("ADX_MIN",   "15.0"))
 RSI_OB           = float(os.environ.get("RSI_OB",    "74.0"))
 RSI_OS           = float(os.environ.get("RSI_OS",    "26.0"))
 VOL_MULT         = float(os.environ.get("VOL_MULT",  "0.8"))    # vol mínimo vs media
@@ -81,10 +81,18 @@ cooldowns = {}        # {symbol: timestamp}
 h1_cache  = {}        # {symbol: {"bias": "BULL"/"BEAR"/"NEUTRAL", "ts": float}}
 
 # ══════════════════════════════════════════════════════════════════════
-#  API
+#  API — sesión por hilo (fix "connection pool full")
 # ══════════════════════════════════════════════════════════════════════
-SESSION = requests.Session()
-SESSION.headers.update({"X-BX-APIKEY": BINGX_API_KEY})
+_tls = threading.local()
+
+def _get_session():
+    if not hasattr(_tls, "session"):
+        s = requests.Session()
+        s.headers.update({"X-BX-APIKEY": BINGX_API_KEY})
+        a = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=2, max_retries=1)
+        s.mount("https://", a)
+        _tls.session = s
+    return _tls.session
 
 def _sign(params: dict) -> str:
     qs = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
@@ -94,10 +102,11 @@ def bx(path, params=None, method="GET", body=None):
     p = dict(params or {})
     p["timestamp"] = int(time.time()*1000)
     p["signature"] = _sign(p)
+    s = _get_session()
     if method == "GET":
-        r = SESSION.get(BINGX_BASE+path, params=p, timeout=10)
+        r = s.get(BINGX_BASE+path, params=p, timeout=10)
     else:
-        r = SESSION.post(BINGX_BASE+path, params=p, json=body, timeout=10)
+        r = s.post(BINGX_BASE+path, params=p, json=body, timeout=10)
     r.raise_for_status()
     return r.json()
 
@@ -452,7 +461,7 @@ def scan(symbol, balance):
         pat, pat_sc, sl_can = candle_pattern(O, H, L, C, i, direction, atr_v)
         score += min(pat_sc/10, 10)  # patrón: max 10
 
-        if score < 35:  # umbral mínimo simple
+        if score < 25:  # umbral reducido para generar señales
             return None
 
         # ── SL / TP ───────────────────────────────────────────────────
