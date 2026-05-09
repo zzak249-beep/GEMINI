@@ -17,14 +17,19 @@ async def scan_explosive_pairs(
     balance: float
 ) -> List[str]:
     """
-    Scans ALL BingX perpetual futures and returns the TOP_PAIRS
-    most likely to have explosive moves today.
+    Escanea TODOS los pares perpetuos USDT de BingX y retorna los
+    TOP_PAIRS con mayor probabilidad de movimiento explosivo hoy.
+
+    Para dinero real en 3m, TOP_PAIRS=15 es el punto óptimo:
+      • < 10 pares → pocas señales, días sin operar
+      • 15 pares   → equilibrio calidad/frecuencia (recomendado)
+      • > 20 pares → pares de baja liquidez + rate limit + señales basura
     """
     log.info("🔭 Iniciando scan de pares explosivos...")
 
     scorer = ExplosionScorer()
 
-    # ── 1. Obtener todos los contratos USDT ──────────────────────────
+    # ── 1. Contratos USDT ────────────────────────────────────────────
     contracts = await client.get_contracts()
     usdt_pairs = [
         c["symbol"] for c in contracts
@@ -32,44 +37,42 @@ async def scan_explosive_pairs(
     ]
     log.info(f"   → {len(usdt_pairs)} pares USDT encontrados")
 
-    # ── 2. Obtener tickers 24h ───────────────────────────────────────
-    tickers = await client.get_tickers()
+    # ── 2. Tickers 24h ───────────────────────────────────────────────
+    tickers    = await client.get_tickers()
     ticker_map = {t["symbol"]: t for t in tickers if "symbol" in t}
 
-    # ── 3. Filtro primario rápido (quoteVolume mínimo) ───────────────
-    MIN_QUOTE_VOL = 5_000_000  # 5M USDT mínimo en 24h para liquidez
+    # ── 3. Filtro primario: volumen mínimo 5M USDT/24h ───────────────
+    MIN_QUOTE_VOL = 5_000_000
     candidates = [
         sym for sym in usdt_pairs
         if float(ticker_map.get(sym, {}).get("quoteVolume", 0)) > MIN_QUOTE_VOL
-        and float(ticker_map.get(sym, {}).get("lastPrice", 0)) > config.MIN_PRICE_USDT
+        and float(ticker_map.get(sym, {}).get("lastPrice",   0)) > config.MIN_PRICE_USDT
     ]
     log.info(f"   → {len(candidates)} pares con volumen suficiente")
 
-    # ── 4. Scoring con klines diarias (en paralelo, batches de 20) ───
-    scored = []
+    # ── 4. Scoring con klines diarias (batches de 20) ────────────────
+    scored     = []
     batch_size = 20
 
     for i in range(0, len(candidates), batch_size):
-        batch  = candidates[i:i + batch_size]
-        tasks  = [client.get_24h_volume_history(sym) for sym in batch]
+        batch   = candidates[i:i + batch_size]
+        tasks   = [client.get_24h_volume_history(sym) for sym in batch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for sym, res in zip(batch, results):
             if isinstance(res, Exception) or not res:
                 continue
-            ticker   = ticker_map.get(sym, {})
-            score    = scorer.score(ticker, res)
+            ticker = ticker_map.get(sym, {})
+            score  = scorer.score(ticker, res)
             scored.append((sym, score))
 
-        await asyncio.sleep(0.2)  # rate limit suave
+        await asyncio.sleep(0.2)
 
-    # ── 5. Ordenar y tomar top N ─────────────────────────────────────
+    # ── 5. Top N ─────────────────────────────────────────────────────
     scored.sort(key=lambda x: x[1], reverse=True)
     top_pairs = [sym for sym, _ in scored[:config.TOP_PAIRS]]
 
-    log.info(f"   ✅ Top {len(top_pairs)} pares seleccionados: {top_pairs[:5]}...")
+    log.info(f"   ✅ Top {len(top_pairs)} pares: {top_pairs[:5]}...")
 
-    # ── 6. Notificar por Telegram ────────────────────────────────────
     await tg.scanner_result(session, top_pairs, balance)
-
     return top_pairs

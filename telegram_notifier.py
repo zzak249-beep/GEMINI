@@ -23,15 +23,18 @@ async def send(session: aiohttp.ClientSession, text: str, parse_mode: str = "HTM
 
 async def bot_start(session):
     await send(session,
-        "🤖 <b>ZigZag Channel Fade Bot</b>\n"
+        "🤖 <b>ZigZag V32 — Apex Quantum Shield</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "✅ Bot iniciado\n"
-        f"📊 Timeframe:      <code>{config.TIMEFRAME}</code>\n"
-        f"⚡ Leverage:       <code>{config.LEVERAGE}x</code>\n"
-        f"💰 Riesgo/trade:  <code>{config.RISK_PCT}%</code>\n"
-        f"🔴 SHORT trigger: <code>+{config.SHORT_PIPS} pips encima GREEN</code>\n"
-        f"🟢 LONG trigger:  <code>-{config.LONG_PIPS} pips debajo RED</code>\n"
-        f"📐 Pip size:      <code>{config.PIP_SIZE} USDT</code>\n"
+        f"📊 Timeframe:     <code>{config.TIMEFRAME}</code>\n"
+        f"⚡ Leverage:      <code>{config.LEVERAGE}x</code>\n"
+        f"💰 Riesgo/trade: <code>{config.RISK_PCT}%</code>\n"
+        f"🔴 SHORT:        <code>+{config.SHORT_PIPS}p encima GREEN + EMA cross + ADX{config.ADX_MIN}+</code>\n"
+        f"🟢 LONG:         <code>-{config.LONG_PIPS}p debajo RED + EMA cross + ADX{config.ADX_MIN}+</code>\n"
+        f"📐 Pip size:     <code>{config.PIP_SIZE}</code>\n"
+        f"⏱ Time-stop:    <code>{config.TIME_STOP_MINUTES} min</code>\n"
+        f"📦 Max pos:      <code>{config.MAX_POSITIONS}</code>\n"
+        f"🏆 Pares:        <code>{config.TOP_PAIRS}</code>\n"
         f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
@@ -48,27 +51,29 @@ async def scanner_result(session, pairs: list, balance: float):
 
 async def signal_channel_fade(session, symbol: str, side: str,
                                green: float, red: float, close: float,
-                               trigger: float, canal_w: float, vol_ratio: float):
+                               trigger: float, canal_w: float, vol_ratio: float,
+                               adx: float, rr: float):
     emoji = "🔴 SHORT" if side == "SELL" else "🟢 LONG"
-    if side == "SELL":
-        desc = f"Close {close:.4f} > GREEN+pips {trigger:.4f}"
-    else:
-        desc = f"Close {close:.4f} < RED-pips {trigger:.4f}"
+    desc  = (f"Close {close:.4f} > GREEN+pips {trigger:.4f}"
+             if side == "SELL"
+             else f"Close {close:.4f} < RED-pips {trigger:.4f}")
     await send(session,
-        f"{emoji} <b>SEÑAL DETECTADA</b> — <code>{symbol}</code>\n"
+        f"{emoji} <b>SEÑAL V32</b> — <code>{symbol}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 {desc}\n"
-        f"🟩 Línea Verde: <code>{green:.4f}</code>\n"
-        f"🟥 Línea Roja:  <code>{red:.4f}</code>\n"
-        f"📏 Ancho canal: <code>{canal_w:.2f} USDT</code>\n"
-        f"📊 Vol ratio:   <code>{vol_ratio:.2f}x</code>"
+        f"🟩 Verde: <code>{green:.4f}</code>\n"
+        f"🟥 Roja:  <code>{red:.4f}</code>\n"
+        f"📏 Canal: <code>{canal_w:.4f}</code>\n"
+        f"📊 Vol:   <code>{vol_ratio:.2f}x</code> (inst ✓)\n"
+        f"📈 ADX:   <code>{adx:.1f}</code> ✓\n"
+        f"⚖️ RR:    <code>1:{rr:.2f}</code>"
     )
 
 
 async def trade_entry(session, symbol: str, side: str, entry: float,
                       sl: float, tp: float, qty: float, balance: float,
-                      rr: float, atr: float):
-    emoji = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
+                      rr: float, atr: float, adx: float, vol_ratio: float):
+    emoji  = "🟢 LONG" if side == "BUY" else "🔴 SHORT"
     sl_pct = abs(entry - sl) / entry * 100
     tp_pct = abs(tp - entry) / entry * 100
     await send(session,
@@ -78,8 +83,11 @@ async def trade_entry(session, symbol: str, side: str, entry: float,
         f"🛑 SL:       <code>{sl:.6g}</code>  (-{sl_pct:.2f}%)\n"
         f"🎯 TP:       <code>{tp:.6g}</code>  (+{tp_pct:.2f}%)\n"
         f"📦 Qty:      <code>{qty:.4f}</code>\n"
-        f"⚖️ RR:       <code>1:{rr:.1f}</code>\n"
+        f"⚖️ RR:       <code>1:{rr:.2f}</code>\n"
         f"🌊 ATR:      <code>{atr:.4f}</code>\n"
+        f"📈 ADX:      <code>{adx:.1f}</code>\n"
+        f"📊 Vol:      <code>{vol_ratio:.2f}x</code>\n"
+        f"⏱ T-Stop:   <code>{config.TIME_STOP_MINUTES} min</code>\n"
         f"💵 Balance:  <code>{balance:.2f} USDT</code>\n"
         f"⏰ {datetime.utcnow().strftime('%H:%M:%S')} UTC"
     )

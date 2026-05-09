@@ -8,15 +8,14 @@ import aiohttp
 from typing import Optional
 import config
 
+
 class BingXClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.api_key = config.BINGX_API_KEY
         self.secret  = config.BINGX_SECRET_KEY
         self.session = session
 
-    # ──────────────────────────────────────────────
-    # AUTH
-    # ──────────────────────────────────────────────
+    # ── Auth ─────────────────────────────────────────────────────────
     def _sign(self, params: dict) -> str:
         query = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(
@@ -28,9 +27,7 @@ class BingXClient:
     def _auth_headers(self):
         return {"X-BX-APIKEY": self.api_key}
 
-    # ──────────────────────────────────────────────
-    # HTTP HELPERS
-    # ──────────────────────────────────────────────
+    # ── HTTP ──────────────────────────────────────────────────────────
     async def _get(self, path: str, params: dict = None, signed: bool = False) -> dict:
         params = params or {}
         if signed:
@@ -38,20 +35,16 @@ class BingXClient:
             params["signature"] = self._sign(params)
         url = f"{config.BASE_URL}{path}"
         async with self.session.get(url, params=params, headers=self._auth_headers()) as r:
-            data = await r.json()
-            return data
+            return await r.json()
 
     async def _post(self, path: str, params: dict) -> dict:
         params["timestamp"] = int(time.time() * 1000)
         params["signature"] = self._sign(params)
         url = f"{config.BASE_URL}{path}"
         async with self.session.post(url, params=params, headers=self._auth_headers()) as r:
-            data = await r.json()
-            return data
+            return await r.json()
 
-    # ──────────────────────────────────────────────
-    # MARKET DATA
-    # ──────────────────────────────────────────────
+    # ── Market Data ───────────────────────────────────────────────────
     async def get_contracts(self) -> list:
         r = await self._get("/openApi/swap/v2/quote/contracts")
         return r.get("data", [])
@@ -59,30 +52,21 @@ class BingXClient:
     async def get_tickers(self) -> list:
         r = await self._get("/openApi/swap/v2/quote/ticker")
         data = r.get("data", [])
-        if isinstance(data, list):
-            return data
-        return []
+        return data if isinstance(data, list) else []
 
     async def get_klines(self, symbol: str, interval: str = "1m", limit: int = 100) -> list:
         r = await self._get("/openApi/swap/v3/quote/klines", {
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
+            "symbol": symbol, "interval": interval, "limit": limit
         })
         return r.get("data", [])
 
     async def get_24h_volume_history(self, symbol: str) -> list:
-        """Get daily klines for volume comparison (7D)."""
         r = await self._get("/openApi/swap/v3/quote/klines", {
-            "symbol": symbol,
-            "interval": "1d",
-            "limit": 8
+            "symbol": symbol, "interval": "1d", "limit": 8
         })
         return r.get("data", [])
 
-    # ──────────────────────────────────────────────
-    # ACCOUNT
-    # ──────────────────────────────────────────────
+    # ── Account ───────────────────────────────────────────────────────
     async def get_balance(self) -> float:
         r = await self._get("/openApi/swap/v2/user/balance", signed=True)
         try:
@@ -102,28 +86,19 @@ class BingXClient:
         }, signed=True)
         return r.get("data", {}).get("orders", []) or []
 
-    # ──────────────────────────────────────────────
-    # TRADING
-    # ──────────────────────────────────────────────
+    # ── Trading ───────────────────────────────────────────────────────
     async def set_leverage(self, symbol: str, leverage: int):
         for side in ("LONG", "SHORT"):
             await self._post("/openApi/swap/v2/trade/leverage", {
-                "symbol": symbol,
-                "side": side,
-                "leverage": leverage
+                "symbol": symbol, "side": side, "leverage": leverage
             })
-        # Set one-way mode
         await self._post("/openApi/swap/v2/trade/positionSide/dual", {
             "dualSidePosition": "false"
         })
 
     async def place_market_order(
-        self,
-        symbol: str,
-        side: str,           # "BUY" | "SELL"
-        qty: float,
-        stop_loss: float,
-        take_profit: float,
+        self, symbol: str, side: str, qty: float,
+        stop_loss: float, take_profit: float,
     ) -> dict:
         sl_json = json.dumps({
             "type": "STOP_MARKET",
@@ -135,27 +110,19 @@ class BingXClient:
             "stopPrice": round(take_profit, 6),
             "workingType": "MARK_PRICE"
         })
-        params = {
-            "symbol":       symbol,
-            "side":         side,
-            "positionSide": "BOTH",
-            "type":         "MARKET",
-            "quantity":     round(qty, 4),
-            "stopLoss":     sl_json,
-            "takeProfit":   tp_json,
-        }
-        return await self._post("/openApi/swap/v2/trade/order", params)
+        return await self._post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": side, "positionSide": "BOTH",
+            "type": "MARKET", "quantity": round(qty, 4),
+            "stopLoss": sl_json, "takeProfit": tp_json,
+        })
 
     async def close_position_market(self, symbol: str, side: str, qty: float) -> dict:
         close_side = "SELL" if side == "BUY" else "BUY"
-        params = {
-            "symbol":       symbol,
-            "side":         close_side,
-            "positionSide": "BOTH",
-            "type":         "MARKET",
-            "quantity":     round(qty, 4),
-        }
-        return await self._post("/openApi/swap/v2/trade/order", params)
+        return await self._post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": close_side,
+            "positionSide": "BOTH", "type": "MARKET",
+            "quantity": round(qty, 4),
+        })
 
     async def cancel_all_orders(self, symbol: str) -> dict:
         return await self._post("/openApi/swap/v2/trade/allOpenOrders", {

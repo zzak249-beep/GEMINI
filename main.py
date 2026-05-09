@@ -1,14 +1,18 @@
 """
-ZigZag Institutional Elite V6 — BingX Perpetual Futures Bot
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ZigZag V32 — Apex Quantum Shield
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Deploy: Railway (GitHub) | Python 3.11+
+Filtros: ZigZag + ADX + EMA crossover + Volumen institucional + Time-stop
 """
 
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, timezone
+
 import aiohttp
+from aiohttp import web
 
 import config
 import telegram_notifier as tg
@@ -26,7 +30,26 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
+# ── Healthcheck server (Railway requiere respuesta HTTP en PORT) ──────
+async def _health(request):
+    return web.Response(text="OK")
+
+
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/", _health)
+    app.router.add_get("/health", _health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", config.PORT)
+    await site.start()
+    log.info(f"🌐 Health server en puerto {config.PORT}")
+
+
 async def main():
+    # Inicia healthcheck antes de todo
+    await start_health_server()
+
     connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
     async with aiohttp.ClientSession(connector=connector) as session:
         client = BingXClient(session)
@@ -40,7 +63,6 @@ async def main():
         # ── Scan inicial ─────────────────────────────────────────────
         active_pairs = await scan_explosive_pairs(client, session, balance)
         last_scan_day = datetime.now(timezone.utc).day
-
         log.info(f"🚀 Bot activo con {len(active_pairs)} pares.")
 
         # ── Main loop ─────────────────────────────────────────────────
@@ -63,7 +85,7 @@ async def main():
                     last_scan_day = now.day
                     log.info(f"🔄 Nuevo día — {len(active_pairs)} pares activos")
 
-                # ── Una sola llamada a balance + posiciones por ciclo ─
+                # ── Balance + posiciones (una sola llamada por ciclo) ─
                 balance = await client.get_balance()
                 await trader.refresh_live_positions()
 
@@ -71,7 +93,6 @@ async def main():
                 if active_pairs and not trader.paused:
                     tasks = [trader.process_pair(sym, balance) for sym in active_pairs]
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-
                     for sym, res in zip(active_pairs, results):
                         if isinstance(res, Exception):
                             log.error(f"[{sym}] Error no manejado: {res}")
@@ -81,7 +102,6 @@ async def main():
                 await tg.error_alert(session, f"Main loop error: {e}")
                 await asyncio.sleep(10)
 
-            # ── Esperar siguiente vela ────────────────────────────────
             await asyncio.sleep(config.CANDLE_SLEEP)
 
 

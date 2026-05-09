@@ -1,12 +1,14 @@
 """
-ZigZag Channel Fade Strategy — 3m
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Línea VERDE = último pivot HIGH confirmado
-Línea ROJA  = último pivot LOW  confirmado
-
-SHORT: close supera green + SHORT_PIPS → TP en red line
-LONG : close rompe red - LONG_PIPS    → TP en green line
-SL   : ATR × SL_ATR_MULT en dirección contraria
+ZigZag Channel Fade — V32 Apex Quantum Shield
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Filtros combinados:
+  1. ZigZag pivot channel (línea verde/roja)
+  2. Overshoot en pips (SHORT > verde+45p | LONG < roja-30p)
+  3. ADX > 25 (evita mercados laterales)
+  4. EMA 7 × EMA 17 crossover (confirma el giro)
+  5. Volumen institucional > 1.5× MA20
+  6. ATR SL × 1.5 (ajustado a V32)
+  7. Time-stop externo en trader.py (45 min = 15 velas×3m)
 """
 import logging
 import numpy as np
@@ -17,7 +19,7 @@ log = logging.getLogger("strategy")
 
 
 # ─────────────────────────────────────────────────────────────────────
-# PARSER DE KLINES (dict Y lista, vela abierta ignorada)
+# PARSER DE KLINES
 # ─────────────────────────────────────────────────────────────────────
 def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
     if not raw:
@@ -41,7 +43,7 @@ def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
             closes.append(c); volumes.append(v)
         except (TypeError, ValueError):
             continue
-    return (np.array(opens),  np.array(highs), np.array(lows),
+    return (np.array(opens), np.array(highs), np.array(lows),
             np.array(closes), np.array(volumes))
 
 
@@ -61,10 +63,68 @@ def calc_atr(H: np.ndarray, L: np.ndarray, C: np.ndarray, period: int = 14) -> f
 
 
 # ─────────────────────────────────────────────────────────────────────
+# EMA
+# ─────────────────────────────────────────────────────────────────────
+def calc_ema(arr: np.ndarray, period: int) -> np.ndarray:
+    """Retorna array EMA del mismo tamaño; primeras (period-1) posiciones = 0."""
+    if len(arr) < period:
+        return np.zeros(len(arr))
+    k = 2.0 / (period + 1)
+    result = np.zeros(len(arr))
+    result[period - 1] = np.mean(arr[:period])
+    for i in range(period, len(arr)):
+        result[i] = arr[i] * k + result[i - 1] * (1.0 - k)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────
+# ADX (Wilder, igual que DMI de TradingView)
+# ─────────────────────────────────────────────────────────────────────
+def calc_adx(H: np.ndarray, L: np.ndarray, C: np.ndarray, period: int = 14) -> float:
+    """Retorna el valor ADX actual (última barra)."""
+    n = len(C)
+    if n < period * 2 + 2:
+        return 0.0
+
+    # True Range y DM
+    tr   = np.maximum(H[1:] - L[1:],
+           np.maximum(np.abs(H[1:] - C[:-1]),
+                      np.abs(L[1:] - C[:-1])))
+    pdm  = np.where((H[1:] - H[:-1]) > (L[:-1] - L[1:]),
+                    np.maximum(H[1:] - H[:-1], 0.0), 0.0)
+    mdm  = np.where((L[:-1] - L[1:]) > (H[1:] - H[:-1]),
+                    np.maximum(L[:-1] - L[1:], 0.0), 0.0)
+
+    # Wilder smoothing
+    def _smooth(arr):
+        s = np.zeros(len(arr))
+        s[period - 1] = np.sum(arr[:period])
+        for i in range(period, len(arr)):
+            s[i] = s[i - 1] - s[i - 1] / period + arr[i]
+        return s
+
+    atr_s = _smooth(tr)
+    pdm_s = _smooth(pdm)
+    mdm_s = _smooth(mdm)
+
+    pdi = 100.0 * pdm_s / (atr_s + 1e-10)
+    mdi = 100.0 * mdm_s / (atr_s + 1e-10)
+    dx  = 100.0 * np.abs(pdi - mdi) / (pdi + mdi + 1e-10)
+
+    # ADX = Wilder-smooth sobre DX
+    adx = np.zeros(len(dx))
+    if len(dx) >= period:
+        adx[period - 1] = np.mean(dx[:period])
+        for i in range(period, len(dx)):
+            adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+
+    return float(adx[-1])
+
+
+# ─────────────────────────────────────────────────────────────────────
 # PIVOT DETECTION
 # ─────────────────────────────────────────────────────────────────────
 def find_pivots(H: np.ndarray, L: np.ndarray, pivot_len: int):
-    """Retorna (ph_list, pl_list) → listas de (valor, índice)."""
     n = len(H)
     ph: List[Tuple[float, int]] = []
     pl: List[Tuple[float, int]] = []
@@ -83,15 +143,27 @@ def _last(lst: list) -> Optional[float]:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# SEÑAL CHANNEL FADE
+# SEÑAL CHANNEL FADE — V32 APEX QUANTUM SHIELD
 # ─────────────────────────────────────────────────────────────────────
 class ChannelFadeSignal:
     """
-    SHORT: close > green + SHORT_PIPS × PIP_SIZE  (overshoot arriba → fade)
-           TP = red line   SL = entry + SL_ATR × ATR
+    Condiciones de entrada:
 
-    LONG : close < red - LONG_PIPS × PIP_SIZE     (overshoot abajo → fade)
-           TP = green line  SL = entry - SL_ATR × ATR
+    SHORT:
+      ① close > green + SHORT_PIPS × PIP_SIZE  (overshoot arriba)
+      ② EMA_FAST acaba de cruzar por debajo de EMA_MED (giro bajista)
+      ③ ADX > ADX_MIN (hay tendencia, no lateral)
+      ④ Volumen > VOL_MULT × MA20 (confirmación institucional)
+      SL = entry + ATR × SL_ATR_MULT
+      TP = red line
+
+    LONG:
+      ① close < red - LONG_PIPS × PIP_SIZE  (overshoot abajo)
+      ② EMA_FAST acaba de cruzar por encima de EMA_MED (giro alcista)
+      ③ ADX > ADX_MIN
+      ④ Volumen > VOL_MULT × MA20
+      SL = entry - ATR × SL_ATR_MULT
+      TP = green line
     """
 
     def compute(self,
@@ -99,9 +171,11 @@ class ChannelFadeSignal:
                 closes: np.ndarray, volumes: np.ndarray) -> Optional[dict]:
 
         n = len(closes)
-        min_bars = config.PIVOT_LEN * 2 + config.ATR_LEN + 2
+        min_bars = max(config.PIVOT_LEN * 2 + config.ATR_LEN + 2,
+                       config.ADX_LEN * 2 + 2,
+                       config.EMA_MED + 2)
         if n < min_bars:
-            log.debug(f"  ✗ Pocas velas: {n}")
+            log.debug(f"  ✗ Pocas velas: {n} < {min_bars}")
             return None
 
         # Ignorar última vela (abierta en BingX)
@@ -110,68 +184,94 @@ class ChannelFadeSignal:
         if len(C) < 3:
             return None
 
-        # ATR
+        # ── 1. ATR ───────────────────────────────────────────────────
         atr = calc_atr(H, L, C, config.ATR_LEN)
         if atr == 0:
             return None
 
-        # Niveles del canal
-        ph_list, pl_list = find_pivots(H, L, config.PIVOT_LEN)
-        green = _last(ph_list)   # línea verde = último pivot HIGH
-        red   = _last(pl_list)   # línea roja  = último pivot LOW
-
-        if green is None or red is None or green <= red:
-            log.debug(f"  ✗ Canal no disponible: green={green} red={red}")
+        # ── 2. ADX ───────────────────────────────────────────────────
+        adx = calc_adx(H, L, C, config.ADX_LEN)
+        if adx < config.ADX_MIN:
+            log.debug(f"  ✗ ADX={adx:.1f} < {config.ADX_MIN} (mercado lateral)")
             return None
 
-        close  = C[-1]
-        is_bull = close > O[-1]
-        is_bear = close < O[-1]
+        # ── 3. EMAs ──────────────────────────────────────────────────
+        ema_fast = calc_ema(C, config.EMA_FAST)
+        ema_med  = calc_ema(C, config.EMA_MED)
 
-        # Filtro de volumen (opcional, controlado por VOL_FILTER)
+        if ema_fast[-1] == 0 or ema_med[-1] == 0:
+            return None
+
+        # Crossover en la última barra cerrada
+        cross_bear = (ema_fast[-2] >= ema_med[-2]) and (ema_fast[-1] < ema_med[-1])
+        cross_bull = (ema_fast[-2] <= ema_med[-2]) and (ema_fast[-1] > ema_med[-1])
+
+        # ── 4. Volumen institucional ─────────────────────────────────
+        vol_ok = True
         vol_ratio = 1.0
         if config.VOL_FILTER:
-            vol_ma    = np.mean(V[-20:]) if len(V) >= 20 else np.mean(V)
-            vol_ratio = V[-1] / vol_ma if vol_ma > 0 else 1.0
-            if vol_ratio < config.VOL_MULT:
-                log.debug(f"  ✗ Vol insuficiente: {vol_ratio:.2f}x < {config.VOL_MULT}x")
-                return None
+            vol_window = min(20, len(V))
+            vol_ma     = np.mean(V[-vol_window:]) if vol_window > 0 else 1.0
+            vol_ratio  = V[-1] / vol_ma if vol_ma > 0 else 1.0
+            vol_ok     = vol_ratio >= config.VOL_MULT
+            if not vol_ok:
+                log.debug(f"  ✗ Vol={vol_ratio:.2f}x < {config.VOL_MULT}x (retail)")
 
-        canal_w = green - red
+        # ── 5. Canal ZigZag ──────────────────────────────────────────
+        ph_list, pl_list = find_pivots(H, L, config.PIVOT_LEN)
+        green = _last(ph_list)
+        red   = _last(pl_list)
+
+        if green is None or red is None or green <= red:
+            log.debug(f"  ✗ Canal inválido: green={green} red={red}")
+            return None
+
+        close     = C[-1]
+        canal_w   = green - red
 
         # ── SHORT ────────────────────────────────────────────────────
         short_trigger = green + config.SHORT_PIPS * config.PIP_SIZE
-        if close >= short_trigger and is_bear:
+        if (close >= short_trigger and cross_bear and adx >= config.ADX_MIN and vol_ok):
             sl = close + atr * config.SL_ATR_MULT
             tp = red
             if tp < close < sl:
+                rr = abs(tp - close) / abs(sl - close)
                 log.info(
-                    f"  🔴 SHORT fade | close={close:.4f} > green+{config.SHORT_PIPS}p={short_trigger:.4f} "
-                    f"| TP={tp:.4f} SL={sl:.4f} canal={canal_w:.2f}"
+                    f"  🔴 SHORT V32 | close={close:.4f} green+pips={short_trigger:.4f} "
+                    f"ADX={adx:.1f} Vol={vol_ratio:.2f}x EMA_cross=✓ "
+                    f"| TP={tp:.4f} SL={sl:.4f} RR=1:{rr:.2f}"
                 )
-                return {"side": "SELL", "entry": close, "sl": sl, "tp": tp,
-                        "atr": atr, "green": green, "red": red,
-                        "trigger": short_trigger, "vol_ratio": vol_ratio,
-                        "canal_width": canal_w}
+                return {
+                    "side": "SELL", "entry": close, "sl": sl, "tp": tp,
+                    "atr": atr, "adx": adx, "green": green, "red": red,
+                    "trigger": short_trigger, "vol_ratio": vol_ratio,
+                    "canal_width": canal_w, "rr": rr,
+                    "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
+                }
 
         # ── LONG ─────────────────────────────────────────────────────
         long_trigger = red - config.LONG_PIPS * config.PIP_SIZE
-        if close <= long_trigger and is_bull:
+        if (close <= long_trigger and cross_bull and adx >= config.ADX_MIN and vol_ok):
             sl = close - atr * config.SL_ATR_MULT
             tp = green
             if sl < close < tp:
+                rr = abs(tp - close) / abs(close - sl)
                 log.info(
-                    f"  🟢 LONG fade | close={close:.4f} < red-{config.LONG_PIPS}p={long_trigger:.4f} "
-                    f"| TP={tp:.4f} SL={sl:.4f} canal={canal_w:.2f}"
+                    f"  🟢 LONG V32 | close={close:.4f} red-pips={long_trigger:.4f} "
+                    f"ADX={adx:.1f} Vol={vol_ratio:.2f}x EMA_cross=✓ "
+                    f"| TP={tp:.4f} SL={sl:.4f} RR=1:{rr:.2f}"
                 )
-                return {"side": "BUY", "entry": close, "sl": sl, "tp": tp,
-                        "atr": atr, "green": green, "red": red,
-                        "trigger": long_trigger, "vol_ratio": vol_ratio,
-                        "canal_width": canal_w}
+                return {
+                    "side": "BUY", "entry": close, "sl": sl, "tp": tp,
+                    "atr": atr, "adx": adx, "green": green, "red": red,
+                    "trigger": long_trigger, "vol_ratio": vol_ratio,
+                    "canal_width": canal_w, "rr": rr,
+                    "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
+                }
 
         log.debug(
-            f"  · close={close:.4f} green={green:.4f}(+{config.SHORT_PIPS}p→{short_trigger:.4f}) "
-            f"red={red:.4f}(-{config.LONG_PIPS}p→{long_trigger:.4f})"
+            f"  · close={close:.4f} | green+p={short_trigger:.4f} red-p={long_trigger:.4f} "
+            f"ADX={adx:.1f} Vol={vol_ratio:.2f}x bear={cross_bear} bull={cross_bull}"
         )
         return None
 

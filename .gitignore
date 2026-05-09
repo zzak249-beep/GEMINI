@@ -1,0 +1,17 @@
+# Entorno
+.env
+*.env
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Datos locales
+*.json
+*.log
+*.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
