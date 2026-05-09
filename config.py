@@ -1,13 +1,22 @@
 import os
 
 def _int(key, default):
-    return int(os.getenv(key, str(default)).strip())
+    v = os.getenv(key, "").strip()
+    try:
+        return int(v) if v else default
+    except ValueError:
+        return default
 
 def _float(key, default):
-    return float(os.getenv(key, str(default)).strip())
+    v = os.getenv(key, "").strip()
+    try:
+        return float(v) if v else default
+    except ValueError:
+        return default
 
 def _bool(key, default):
-    return os.getenv(key, str(default)).strip().lower() == "true"
+    v = os.getenv(key, "").strip().lower()
+    return v == "true" if v else default
 
 # ==========================================
 # BINGX API
@@ -27,7 +36,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 # ==========================================
 PIVOT_LEN = _int("PIVOT_LEN", 5)
 ATR_LEN   = _int("ATR_LEN", 14)
-TIMEFRAME = os.getenv("TIMEFRAME", "3m").strip()
+TIMEFRAME = os.getenv("TIMEFRAME", "3m").strip() or "3m"
 
 # ==========================================
 # ESTRATEGIA: CHANNEL FADE V32
@@ -40,13 +49,13 @@ SL_ATR_MULT = _float("SL_ATR_MULT", 1.5)
 # ==========================================
 # FILTROS V32 — APEX QUANTUM SHIELD
 # ==========================================
-ADX_MIN    = _int("ADX_MIN", 25)
-ADX_LEN    = _int("ADX_LEN", 14)
-EMA_FAST   = _int("EMA_FAST", 7)
-EMA_MED    = _int("EMA_MED",  17)
-EMA_SLOW   = _int("EMA_SLOW", 21)
-VOL_FILTER = _bool("VOL_FILTER", True)
-VOL_MULT   = _float("VOL_MULT", 1.5)
+ADX_MIN           = _int("ADX_MIN", 25)
+ADX_LEN           = _int("ADX_LEN", 14)
+EMA_FAST          = _int("EMA_FAST", 7)
+EMA_MED           = _int("EMA_MED",  17)
+EMA_SLOW          = _int("EMA_SLOW", 21)
+VOL_FILTER        = _bool("VOL_FILTER", True)
+VOL_MULT          = _float("VOL_MULT", 1.5)
 TIME_STOP_MINUTES = _int("TIME_STOP_MINUTES", 45)
 
 # ==========================================
