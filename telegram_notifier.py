@@ -31,7 +31,6 @@ async def bot_start(session):
         f"💰 Riesgo/trade: <code>{config.RISK_PCT}%</code>\n"
         f"🔴 SHORT:        <code>+{config.SHORT_PIPS}p encima GREEN + EMA cross + ADX{config.ADX_MIN}+</code>\n"
         f"🟢 LONG:         <code>-{config.LONG_PIPS}p debajo RED + EMA cross + ADX{config.ADX_MIN}+</code>\n"
-        f"📐 Pip size:     <code>{config.PIP_SIZE}</code>\n"
         f"⏱ Time-stop:    <code>{config.TIME_STOP_MINUTES} min</code>\n"
         f"📦 Max pos:      <code>{config.MAX_POSITIONS}</code>\n"
         f"🏆 Pares:        <code>{config.TOP_PAIRS}</code>\n"
