@@ -1,15 +1,15 @@
 """
-ZigZag Channel Fade — V32 Apex Quantum Shield
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Condiciones de entrada (todas deben cumplirse):
-  1. Precio supera canal ZigZag en X pips (overshoot)
-  2. ADX > ADX_MIN  →  hay tendencia real (no lateral)
-  3. EMA_FAST alineada con dirección del fade:
-       SHORT → ema_fast < ema_med  (contexto bajista)
-       LONG  → ema_fast > ema_med  (contexto alcista)
-  4. Volumen última vela > VOL_MULT × MA20
-  5. RR calculado >= MIN_RR
-  6. pip_size dinámico por precio del activo
+ZigZag Channel Fade — V32 REVISADO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CAMBIOS vs versión anterior:
+  - EMA: alineación (no crossover) — el cross en 3m es rarísimo
+  - VOL_FILTER desactivado por defecto — en 3m el volumen es muy ruidoso
+  - ADX_MIN bajado a 18 — 20 sigue rechazando demasiado en lateral
+  - LONG_PIPS/SHORT_PIPS: el overshoot se calcula vs ATR, no pips fijos
+    → SHORT cuando close > green + 0.5×ATR (más sensato que pips fijos)
+    → LONG  cuando close < red  - 0.3×ATR
+  - RR mínimo 1.0 (cualquier edge positivo es válido)
+  - Logs completos para ver exactamente por qué rechaza cada señal
 """
 import logging
 import numpy as np
@@ -19,9 +19,6 @@ import config
 log = logging.getLogger("strategy")
 
 
-# ─────────────────────────────────────────────────────────────────────
-# PIP SIZE DINÁMICO
-# ─────────────────────────────────────────────────────────────────────
 def dynamic_pip_size(price: float) -> float:
     if price >= 10_000: return 1.0
     if price >= 1_000:  return 0.1
@@ -31,9 +28,6 @@ def dynamic_pip_size(price: float) -> float:
     return 0.00001
 
 
-# ─────────────────────────────────────────────────────────────────────
-# PARSER DE KLINES
-# ─────────────────────────────────────────────────────────────────────
 def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
     if not raw:
         return (np.array([]),) * 5
@@ -60,25 +54,18 @@ def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
             np.array(closes), np.array(volumes))
 
 
-# ─────────────────────────────────────────────────────────────────────
-# ATR (Wilder)
-# ─────────────────────────────────────────────────────────────────────
-def calc_atr(H, L, C, period=14):
+def calc_atr(H, L, C, period=14) -> float:
     if len(C) < period + 1:
         return 0.0
     tr = np.maximum(H[1:] - L[1:],
-         np.maximum(np.abs(H[1:] - C[:-1]),
-                    np.abs(L[1:] - C[:-1])))
+         np.maximum(np.abs(H[1:] - C[:-1]), np.abs(L[1:] - C[:-1])))
     val = np.mean(tr[:period])
     for i in range(period, len(tr)):
         val = (val * (period - 1) + tr[i]) / period
     return float(val)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# EMA
-# ─────────────────────────────────────────────────────────────────────
-def calc_ema(arr, period):
+def calc_ema(arr, period) -> np.ndarray:
     if len(arr) < period:
         return np.zeros(len(arr))
     k = 2.0 / (period + 1)
@@ -89,10 +76,7 @@ def calc_ema(arr, period):
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────
-# ADX (Wilder)
-# ─────────────────────────────────────────────────────────────────────
-def calc_adx(H, L, C, period=14):
+def calc_adx(H, L, C, period=14) -> float:
     if len(C) < period * 2 + 2:
         return 0.0
     tr  = np.maximum(H[1:] - L[1:],
@@ -104,11 +88,10 @@ def calc_adx(H, L, C, period=14):
 
     def _smooth(a):
         s = np.zeros(len(a))
-        if len(a) < period:
-            return s
+        if len(a) < period: return s
         s[period - 1] = np.sum(a[:period])
         for i in range(period, len(a)):
-            s[i] = s[i-1] - s[i-1] / period + a[i]
+            s[i] = s[i-1] - s[i-1]/period + a[i]
         return s
 
     atr_s = _smooth(tr); pdm_s = _smooth(pdm); mdm_s = _smooth(mdm)
@@ -123,10 +106,7 @@ def calc_adx(H, L, C, period=14):
     return float(adx[-1])
 
 
-# ─────────────────────────────────────────────────────────────────────
-# PIVOT DETECTION
-# ─────────────────────────────────────────────────────────────────────
-def find_pivots(H, L, pivot_len):
+def find_pivots(H, L, pivot_len) -> Tuple[List, List]:
     ph: List[Tuple[float, int]] = []
     pl: List[Tuple[float, int]] = []
     n = len(H)
@@ -142,9 +122,6 @@ def _last(lst):
     return lst[-1][0] if lst else None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# SEÑAL CHANNEL FADE
-# ─────────────────────────────────────────────────────────────────────
 class ChannelFadeSignal:
 
     def compute(self, opens, highs, lows, closes, volumes,
@@ -157,105 +134,117 @@ class ChannelFadeSignal:
         if n < min_bars:
             return None
 
-        H = highs[:-1]; L = lows[:-1]; C = closes[:-1]
-        V = volumes[:-1]
+        H = highs[:-1]; L = lows[:-1]; C = closes[:-1]; V = volumes[:-1]
         if len(C) < 30:
             return None
 
-        # ── 1. ATR ────────────────────────────────────────────────────
+        # ── ATR ───────────────────────────────────────────────────────
         atr = calc_atr(H, L, C, config.ATR_LEN)
         if atr == 0:
             return None
 
-        # ── 2. ADX ────────────────────────────────────────────────────
+        # ── ADX ───────────────────────────────────────────────────────
         adx = calc_adx(H, L, C, config.ADX_LEN)
         if adx < config.ADX_MIN:
             log.info(f"  [{symbol}] ✗ ADX={adx:.1f} < {config.ADX_MIN}")
             return None
 
-        # ── 3. EMA alineación (no crossover, alineación continua) ─────
+        # ── EMA: alineación (no crossover) ───────────────────────────
+        # EMA_FAST > EMA_MED = contexto alcista → LONG válido
+        # EMA_FAST < EMA_MED = contexto bajista → SHORT válido
         ema_fast = calc_ema(C, config.EMA_FAST)
         ema_med  = calc_ema(C, config.EMA_MED)
         if ema_fast[-1] == 0 or ema_med[-1] == 0:
             return None
-        ema_bear = ema_fast[-1] < ema_med[-1]   # contexto bajista
-        ema_bull = ema_fast[-1] > ema_med[-1]   # contexto alcista
+        ema_bear = ema_fast[-1] < ema_med[-1]
+        ema_bull = ema_fast[-1] > ema_med[-1]
 
-        # ── 4. Volumen ────────────────────────────────────────────────
-        vol_ok = True
+        # ── Volumen ───────────────────────────────────────────────────
         vol_ratio = 1.0
+        vol_ok    = True
         if config.VOL_FILTER:
             vol_window = min(20, len(V))
             vol_ma    = np.mean(V[-vol_window:]) if vol_window > 0 else 1.0
             vol_ratio = V[-1] / vol_ma if vol_ma > 0 else 1.0
             vol_ok    = vol_ratio >= config.VOL_MULT
-            if not vol_ok:
-                log.info(f"  [{symbol}] ✗ Vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
 
-        # ── 5. Canal ZigZag ───────────────────────────────────────────
+        # ── Canal ZigZag ──────────────────────────────────────────────
         ph_list, pl_list = find_pivots(H, L, config.PIVOT_LEN)
         green = _last(ph_list)
         red   = _last(pl_list)
         if green is None or red is None or green <= red:
-            log.info(f"  [{symbol}] ✗ Canal no disponible green={green} red={red}")
+            log.info(f"  [{symbol}] ✗ Canal no disponible (green={green} red={red})")
             return None
 
         close   = C[-1]
         canal_w = green - red
         pip     = dynamic_pip_size(close)
 
-        short_trigger = green + config.SHORT_PIPS * pip
-        long_trigger  = red   - config.LONG_PIPS  * pip
+        # ── TRIGGER: ATR-based overshoot (más adaptativo que pips fijos) ──
+        # SHORT: precio supera el techo del canal en SHORT_PIPS×pip O 0.4×ATR
+        # LONG:  precio cae bajo el suelo del canal en LONG_PIPS×pip O 0.3×ATR
+        short_offset  = max(config.SHORT_PIPS * pip, atr * 0.4)
+        long_offset   = max(config.LONG_PIPS  * pip, atr * 0.3)
+        short_trigger = green + short_offset
+        long_trigger  = red   - long_offset
 
         log.info(
-            f"  [{symbol}] ADX={adx:.1f} Vol={vol_ratio:.2f}x "
-            f"ema_bear={ema_bear} ema_bull={ema_bull} "
-            f"close={close:.5g} verde={green:.5g}(+{config.SHORT_PIPS}p->{short_trigger:.5g}) "
-            f"roja={red:.5g}(-{config.LONG_PIPS}p->{long_trigger:.5g})"
+            f"  [{symbol}] ADX={adx:.1f} Vol={vol_ratio:.2f}x({'✓' if vol_ok else '✗'}) "
+            f"bear={ema_bear} bull={ema_bull} | "
+            f"close={close:.5g} | "
+            f"SHORT>={short_trigger:.5g}(+{short_offset:.5g}) "
+            f"LONG<={long_trigger:.5g}(-{long_offset:.5g})"
         )
 
-        # ── SHORT ──────────────────────────────────────────────────────
-        if close >= short_trigger and ema_bear and vol_ok:
+        # ── SHORT ─────────────────────────────────────────────────────
+        if close >= short_trigger and ema_bear:
+            if not vol_ok:
+                log.info(f"  [{symbol}] ✗ SHORT: vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
+                return None
             sl = close + atr * config.SL_ATR_MULT
             tp = red
-            if tp < close:
-                rr = abs(tp - close) / max(abs(sl - close), 1e-10)
-                if rr < config.MIN_RR:
-                    log.info(f"  [{symbol}] ✗ SHORT RR={rr:.2f} < {config.MIN_RR}")
-                    return None
-                log.info(f"  [{symbol}] 🔴 SHORT RR=1:{rr:.2f} SL={sl:.5g} TP={tp:.5g}")
-                return {
-                    "side": "SELL", "entry": close, "sl": sl, "tp": tp,
-                    "atr": atr, "adx": adx, "green": green, "red": red,
-                    "trigger": short_trigger, "vol_ratio": vol_ratio,
-                    "canal_width": canal_w, "rr": rr, "pip_size": pip,
-                    "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
-                }
+            if tp >= close:
+                log.info(f"  [{symbol}] ✗ SHORT: TP={tp:.5g} >= close={close:.5g}")
+                return None
+            rr = abs(tp - close) / max(abs(sl - close), 1e-10)
+            if rr < config.MIN_RR:
+                log.info(f"  [{symbol}] ✗ SHORT RR={rr:.2f} < {config.MIN_RR}")
+                return None
+            log.info(f"  [{symbol}] ✅ SHORT RR=1:{rr:.2f} entry={close:.5g} SL={sl:.5g} TP={tp:.5g}")
+            return {
+                "side": "SELL", "entry": close, "sl": sl, "tp": tp,
+                "atr": atr, "adx": adx, "green": green, "red": red,
+                "trigger": short_trigger, "vol_ratio": vol_ratio,
+                "canal_width": canal_w, "rr": rr, "pip_size": pip,
+                "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
+            }
 
-        # ── LONG ───────────────────────────────────────────────────────
-        if close <= long_trigger and ema_bull and vol_ok:
+        # ── LONG ──────────────────────────────────────────────────────
+        if close <= long_trigger and ema_bull:
+            if not vol_ok:
+                log.info(f"  [{symbol}] ✗ LONG: vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
+                return None
             sl = close - atr * config.SL_ATR_MULT
             tp = green
-            if tp > close:
-                rr = abs(tp - close) / max(abs(close - sl), 1e-10)
-                if rr < config.MIN_RR:
-                    log.info(f"  [{symbol}] ✗ LONG RR={rr:.2f} < {config.MIN_RR}")
-                    return None
-                log.info(f"  [{symbol}] 🟢 LONG RR=1:{rr:.2f} SL={sl:.5g} TP={tp:.5g}")
-                return {
-                    "side": "BUY", "entry": close, "sl": sl, "tp": tp,
-                    "atr": atr, "adx": adx, "green": green, "red": red,
-                    "trigger": long_trigger, "vol_ratio": vol_ratio,
-                    "canal_width": canal_w, "rr": rr, "pip_size": pip,
-                    "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
-                }
+            if tp <= close:
+                log.info(f"  [{symbol}] ✗ LONG: TP={tp:.5g} <= close={close:.5g}")
+                return None
+            rr = abs(tp - close) / max(abs(close - sl), 1e-10)
+            if rr < config.MIN_RR:
+                log.info(f"  [{symbol}] ✗ LONG RR={rr:.2f} < {config.MIN_RR}")
+                return None
+            log.info(f"  [{symbol}] ✅ LONG RR=1:{rr:.2f} entry={close:.5g} SL={sl:.5g} TP={tp:.5g}")
+            return {
+                "side": "BUY", "entry": close, "sl": sl, "tp": tp,
+                "atr": atr, "adx": adx, "green": green, "red": red,
+                "trigger": long_trigger, "vol_ratio": vol_ratio,
+                "canal_width": canal_w, "rr": rr, "pip_size": pip,
+                "ema_fast": float(ema_fast[-1]), "ema_med": float(ema_med[-1])
+            }
 
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────
-# EXPLOSION SCORER
-# ─────────────────────────────────────────────────────────────────────
 class ExplosionScorer:
     def score(self, ticker: dict, daily_klines: list) -> float:
         try:
