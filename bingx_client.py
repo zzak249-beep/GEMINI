@@ -1,14 +1,3 @@
-"""
-BingX Perpetual Futures Client — FIRMA CORREGIDA
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-BingX exige que stopLoss y takeProfit se firmen como el STRING del JSON,
-no como objeto. El error "Signature verification failed" ocurría porque
-json.dumps() producía un string que luego urllib.parse.urlencode re-codificaba
-de forma diferente a como BingX lo esperaba.
-
-Solución: construir el query string manualmente para la firma,
-igual que BingX espera recibirlo.
-"""
 import hashlib
 import hmac
 import json
@@ -30,27 +19,23 @@ class BingXClient:
         self.session = session
         self._contract_cache: dict = {}
 
-    # ── Firma ────────────────────────────────────────────────────────
-    def _build_query(self, params: dict) -> str:
-        """
-        Construye query string EXACTAMENTE como BingX lo firma:
-        - Orden alfabético por key
-        - urllib.parse.quote para cada valor (safe='')
-        - NO doble-codificación de caracteres especiales en JSON strings
-        """
-        parts = []
-        for k in sorted(params.keys()):
-            v = params[k]
-            # Los valores ya son strings o números — quote igual que BingX
-            parts.append(f"{k}={urllib.parse.quote(str(v), safe='')}")
-        return "&".join(parts)
-
-    def _sign(self, query_string: str) -> str:
+    # ── Firma ─────────────────────────────────────────────────────────
+    def _sign(self, params: dict) -> str:
+        """HMAC-SHA256 sobre query string ordenada alfabéticamente."""
+        query = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(
             self.secret.encode("utf-8"),
-            query_string.encode("utf-8"),
+            query.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
+
+    def _build_url(self, path: str, params: dict) -> str:
+        """
+        Construye URL con query string en el MISMO orden que la firma.
+        Evita que aiohttp reordene los params y rompa la verificación.
+        """
+        query = urllib.parse.urlencode(sorted(params.items()))
+        return f"{config.BASE_URL}{path}?{query}"
 
     def _headers(self) -> dict:
         return {"X-BX-APIKEY": self.api_key}
@@ -60,37 +45,30 @@ class BingXClient:
         p = dict(params or {})
         if signed:
             p["timestamp"] = int(time.time() * 1000)
-            qs = self._build_query(p)
-            p["signature"] = self._sign(qs)
-        url = f"{config.BASE_URL}{path}"
+            p["signature"] = self._sign(p)
+        url = self._build_url(path, p) if p else f"{config.BASE_URL}{path}"
         try:
-            async with self.session.get(url, params=p, headers=self._headers()) as r:
-                data = await r.json(content_type=None)
-                code = data.get("code", 0)
-                if code != 0 and signed:
-                    log.error(f"GET {path} code={code} msg={data.get('msg','')}")
-                return data
+            async with self.session.get(url, headers=self._headers()) as r:
+                return await r.json(content_type=None)
         except Exception as e:
-            log.error(f"GET {path} error: {e}")
+            log.error(f"GET {path}: {e}")
             raise
 
     async def _post(self, path: str, params: dict) -> dict:
-        # CRÍTICO: copiar para no mutar el dict original
-        p = dict(params)
+        p = dict(params)                          # nunca mutar el dict original
         p["timestamp"] = int(time.time() * 1000)
-        # Firmar ANTES de añadir signature al dict
-        qs = self._build_query(p)
-        p["signature"] = self._sign(qs)
-        url = f"{config.BASE_URL}{path}"
+        p["signature"] = self._sign(p)
+        # URL con query string exactamente igual a la cadena firmada
+        url = self._build_url(path, p)
         try:
-            async with self.session.post(url, params=p, headers=self._headers()) as r:
+            async with self.session.post(url, headers=self._headers()) as r:
                 data = await r.json(content_type=None)
-                code = data.get("code", -1)
+                code = data.get("code", 0)
                 if code != 0:
-                    log.error(f"POST {path} FAIL code={code} msg={data.get('msg','?')}")
+                    log.error(f"POST {path} code={code} msg={data.get('msg','?')}")
                 return data
         except Exception as e:
-            log.error(f"POST {path} error: {e}")
+            log.error(f"POST {path}: {e}")
             raise
 
     # ── Market Data ───────────────────────────────────────────────────
@@ -149,22 +127,19 @@ class BingXClient:
         if symbol not in self._contract_cache:
             await self.get_contracts()
         c = self._contract_cache.get(symbol, {})
-        prec = c.get("quantityPrecision")
-        if prec is not None:
-            try:
-                return int(prec)
-            except (ValueError, TypeError):
-                pass
-        min_qty_str = str(c.get("tradeMinQuantity", "0.001"))
         try:
-            mq = float(min_qty_str)
-            if mq >= 1:
-                return 0
-            if "." in min_qty_str:
-                return len(min_qty_str.split(".")[1].rstrip("0")) or 1
+            prec = c.get("quantityPrecision")
+            if prec is not None:
+                return int(prec)
         except Exception:
             pass
-        return 3
+        try:
+            min_qty_str = str(c.get("tradeMinQuantity", "0.001"))
+            if "." in min_qty_str:
+                return len(min_qty_str.split(".")[1].rstrip("0")) or 1
+            return 0
+        except Exception:
+            return 3
 
     def _floor_qty(self, qty: float, precision: int) -> float:
         factor = 10 ** precision
@@ -172,40 +147,51 @@ class BingXClient:
 
     # ── Trading ───────────────────────────────────────────────────────
     async def set_leverage(self, symbol: str, leverage: int):
+        """
+        Establece leverage. Ignora errores no críticos.
+        NO llama a positionSide/dual (endpoint eliminado en cuentas nuevas).
+        """
         for side in ("LONG", "SHORT"):
-            r = await self._post("/openApi/swap/v2/trade/leverage", {
-                "symbol": symbol, "side": side, "leverage": leverage
-            })
-            code = r.get("code", 0)
-            if code not in (0, 80001, -1130):
-                log.warning(f"set_leverage {side} code={code}: {r.get('msg','')}")
-        # One-way mode
-        await self._post("/openApi/swap/v2/trade/positionSide/dual", {
-            "dualSidePosition": "false"
-        })
+            try:
+                r = await self._post("/openApi/swap/v2/trade/leverage", {
+                    "symbol": symbol, "side": side, "leverage": leverage
+                })
+                code = r.get("code", 0)
+                # 0=OK, 80001=ya configurado, otros son warnings no bloqueantes
+                if code not in (0, 80001, -1130, 100001):
+                    log.warning(f"[{symbol}] leverage {side}: code={code}")
+            except Exception as e:
+                log.warning(f"[{symbol}] set_leverage {side}: {e}")
 
     async def place_market_order(
-        self, symbol: str, side: str, qty: float,
-        stop_loss: float, take_profit: float,
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        stop_loss: float,
+        take_profit: float,
     ) -> dict:
         prec    = await self.get_qty_precision(symbol)
         qty_adj = self._floor_qty(qty, prec)
+
         if qty_adj <= 0:
-            return {"code": -1, "msg": f"qty_adj={qty_adj} ≤ 0 (prec={prec} qty={qty:.8f})"}
+            msg = f"qty_adj={qty_adj} ≤ 0 (prec={prec} qty={qty:.8f}) — balance insuficiente para este par"
+            log.warning(f"[{symbol}] ✗ {msg}")
+            return {"code": -1, "msg": msg}
 
-        # SL/TP como JSON string — BingX los recibe como string en el query param
         sl_str = json.dumps({
-            "type": "STOP_MARKET",
-            "stopPrice": round(stop_loss, 6),
-            "workingType": "MARK_PRICE"
-        }, separators=(',', ':'))
-        tp_str = json.dumps({
-            "type": "TAKE_PROFIT_MARKET",
-            "stopPrice": round(take_profit, 6),
+            "type":        "STOP_MARKET",
+            "stopPrice":   round(stop_loss, 6),
             "workingType": "MARK_PRICE"
         }, separators=(',', ':'))
 
-        log.info(f"[{symbol}] ORDER {side} qty={qty_adj} SL={stop_loss:.6g} TP={take_profit:.6g}")
+        tp_str = json.dumps({
+            "type":        "TAKE_PROFIT_MARKET",
+            "stopPrice":   round(take_profit, 6),
+            "workingType": "MARK_PRICE"
+        }, separators=(',', ':'))
+
+        log.info(f"[{symbol}] → {side} qty={qty_adj} SL={stop_loss:.6g} TP={take_profit:.6g}")
 
         return await self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
