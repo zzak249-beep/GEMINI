@@ -1,15 +1,12 @@
 """
-ZigZag Channel Fade — V32 Apex Quantum Shield
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Lógica ADX CORREGIDA para estrategia FADE:
-  • ADX bajo (< 20)  = mercado lateral → IDEAL para mean reversion ✅
-  • ADX medio (20-35)= tendencia moderada → válido con confirmación
-  • ADX alto (> 35)  = tendencia fuerte → el canal se rompe, NO operar ❌
-
-Condiciones de entrada:
-  1. Overshoot del canal ZigZag en X pips
-  2. ADX < ADX_MAX  (evitar tendencias fuertes que rompen el canal)
-  3. EMA_FAST alineada con dirección del fade
+ZigZag Channel Fade — V33 Elite
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Señal de entrada (todas deben cumplirse):
+  1. Overshoot canal ZigZag en pips
+  2. ADX < ADX_MAX  (fade funciona en laterales, NO en tendencia fuerte)
+  3. RSI confirma overbought/oversold:
+       SHORT → RSI > RSI_OB  (precio sobreextendido arriba)
+       LONG  → RSI < RSI_OS  (precio sobreextendido abajo)
   4. Volumen > VOL_MULT × MA20
   5. RR >= MIN_RR
   6. pip_size dinámico por precio
@@ -38,8 +35,11 @@ def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
     for k in raw:
         try:
             if isinstance(k, dict):
-                o,h,l,c,v = (float(k.get(x, k.get(y, 0))) for x,y in
-                             [("open","o"),("high","h"),("low","l"),("close","c"),("volume","v")])
+                o = float(k.get("open",   k.get("o", 0)))
+                h = float(k.get("high",   k.get("h", 0)))
+                l = float(k.get("low",    k.get("l", 0)))
+                c = float(k.get("close",  k.get("c", 0)))
+                v = float(k.get("volume", k.get("v", 0)))
             elif isinstance(k, (list, tuple)) and len(k) >= 6:
                 o,h,l,c,v = float(k[1]),float(k[2]),float(k[3]),float(k[4]),float(k[5])
             else:
@@ -64,15 +64,21 @@ def calc_atr(H, L, C, period=14):
     return float(val)
 
 
-def calc_ema(arr, period):
-    if len(arr) < period:
-        return np.zeros(len(arr))
-    k = 2.0/(period+1)
-    result = np.zeros(len(arr))
-    result[period-1] = np.mean(arr[:period])
-    for i in range(period, len(arr)):
-        result[i] = arr[i]*k + result[i-1]*(1.0-k)
-    return result
+def calc_rsi(C, period=14):
+    """RSI de Wilder — perfecto para detectar overbought/oversold en fade."""
+    if len(C) < period + 2:
+        return 50.0
+    deltas = np.diff(C.astype(float))
+    gains  = np.where(deltas > 0, deltas, 0.0)
+    losses = np.where(deltas < 0, -deltas, 0.0)
+    avg_g  = np.mean(gains[:period])
+    avg_l  = np.mean(losses[:period])
+    for i in range(period, len(deltas)):
+        avg_g = (avg_g*(period-1) + gains[i])  / period
+        avg_l = (avg_l*(period-1) + losses[i]) / period
+    if avg_l < 1e-10:
+        return 100.0
+    return float(100 - 100/(1 + avg_g/avg_l))
 
 
 def calc_adx(H, L, C, period=14):
@@ -83,9 +89,9 @@ def calc_adx(H, L, C, period=14):
     mdm = np.where((L[:-1]-L[1:])>(H[1:]-H[:-1]), np.maximum(L[:-1]-L[1:],0.0), 0.0)
     def _s(a):
         s = np.zeros(len(a))
-        if len(a)<period: return s
+        if len(a) < period: return s
         s[period-1] = np.sum(a[:period])
-        for i in range(period,len(a)): s[i]=s[i-1]-s[i-1]/period+a[i]
+        for i in range(period, len(a)): s[i] = s[i-1]-s[i-1]/period+a[i]
         return s
     atr_s=_s(tr); pdm_s=_s(pdm); mdm_s=_s(mdm)
     pdi=100.0*pdm_s/(atr_s+1e-10); mdi=100.0*mdm_s/(atr_s+1e-10)
@@ -100,8 +106,7 @@ def calc_adx(H, L, C, period=14):
 def find_pivots(H, L, pivot_len):
     ph: List[Tuple[float,int]] = []
     pl: List[Tuple[float,int]] = []
-    n = len(H)
-    for i in range(pivot_len, n-pivot_len):
+    for i in range(pivot_len, len(H)-pivot_len):
         if H[i] >= np.max(H[i-pivot_len:i+pivot_len+1]): ph.append((float(H[i]),i))
         if L[i] <= np.min(L[i-pivot_len:i+pivot_len+1]): pl.append((float(L[i]),i))
     return ph, pl
@@ -116,38 +121,37 @@ class ChannelFadeSignal:
                 symbol: str = "") -> Optional[dict]:
         n = len(closes)
         min_bars = max(config.PIVOT_LEN*2+config.ATR_LEN+2,
-                       config.ADX_LEN*2+2, config.EMA_MED+2)
-        if n < min_bars: return None
-
-        H=highs[:-1]; L=lows[:-1]; C=closes[:-1]; V=volumes[:-1]
-        if len(C) < 30: return None
-
-        atr = calc_atr(H, L, C, config.ATR_LEN)
-        if atr == 0: return None
-
-        # ── ADX — LÓGICA CORREGIDA PARA FADE ─────────────────────────
-        # Fade funciona MEJOR con ADX bajo (lateral).
-        # Solo bloqueamos ADX muy alto (tendencia fuerte rompe el canal).
-        adx = calc_adx(H, L, C, config.ADX_LEN)
-        if adx > config.ADX_MAX:
-            log.info(f"  [{symbol}] ✗ ADX={adx:.1f} > {config.ADX_MAX} (tendencia fuerte, canal roto)")
+                       config.ADX_LEN*2+2,
+                       config.RSI_PERIOD+2)
+        if n < min_bars:
             return None
 
-        # ── EMA alineación ────────────────────────────────────────────
-        ema_fast = calc_ema(C, config.EMA_FAST)
-        ema_med  = calc_ema(C, config.EMA_MED)
-        if ema_fast[-1] == 0 or ema_med[-1] == 0: return None
-        ema_bear = ema_fast[-1] < ema_med[-1]
-        ema_bull = ema_fast[-1] > ema_med[-1]
+        H=highs[:-1]; L=lows[:-1]; C=closes[:-1]; V=volumes[:-1]
+        if len(C) < 30:
+            return None
+
+        # ── ATR ───────────────────────────────────────────────────────
+        atr = calc_atr(H, L, C, config.ATR_LEN)
+        if atr == 0:
+            return None
+
+        # ── ADX (máximo — fade NO opera en tendencia fuerte) ──────────
+        adx = calc_adx(H, L, C, config.ADX_LEN)
+        if adx > config.ADX_MAX:
+            log.info(f"  [{symbol}] ✗ ADX={adx:.1f} > {config.ADX_MAX} (tendencia, no operar)")
+            return None
+
+        # ── RSI (reemplaza EMA alignment — mejor para overbought/sold) ─
+        rsi = calc_rsi(C, config.RSI_PERIOD)
 
         # ── Volumen ───────────────────────────────────────────────────
-        vol_ok = True
+        vol_ok    = True
         vol_ratio = 1.0
         if config.VOL_FILTER:
-            vol_w  = min(20, len(V))
-            vol_ma = np.mean(V[-vol_w:]) if vol_w > 0 else 1.0
+            vol_w     = min(20, len(V))
+            vol_ma    = np.mean(V[-vol_w:]) if vol_w > 0 else 1.0
             vol_ratio = V[-1]/vol_ma if vol_ma > 0 else 1.0
-            vol_ok = vol_ratio >= config.VOL_MULT
+            vol_ok    = vol_ratio >= config.VOL_MULT
             if not vol_ok:
                 log.info(f"  [{symbol}] ✗ Vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
 
@@ -156,7 +160,7 @@ class ChannelFadeSignal:
         green = _last(ph_list)
         red   = _last(pl_list)
         if green is None or red is None or green <= red:
-            log.info(f"  [{symbol}] ✗ Canal inválido")
+            log.info(f"  [{symbol}] ✗ Canal inválido g={green} r={red}")
             return None
 
         close   = C[-1]
@@ -165,44 +169,40 @@ class ChannelFadeSignal:
         short_t = green + config.SHORT_PIPS * pip
         long_t  = red   - config.LONG_PIPS  * pip
 
-        ext_up   = close >= short_t
-        ext_down = close <= long_t
-
         log.info(
-            f"  [{symbol}] ADX={adx:.1f} Vol={vol_ratio:.2f}x "
-            f"ext_up={ext_up} ext_down={ext_down} | "
+            f"  [{symbol}] ADX={adx:.1f} RSI={rsi:.1f} Vol={vol_ratio:.2f}x | "
             f"close={close:.5g} SHORT>={short_t:.5g} LONG<={long_t:.5g}"
         )
 
-        # ── SHORT ──────────────────────────────────────────────────────
-        if ext_up and ema_bear and vol_ok:
+        # ── SHORT: overshoot arriba + RSI overbought ──────────────────
+        if close >= short_t and rsi >= config.RSI_OB and vol_ok:
             sl = close + atr * config.SL_ATR_MULT
             tp = red
             if tp < close:
-                rr = abs(tp-close)/max(abs(sl-close), 1e-10)
+                rr = abs(tp-close) / max(abs(sl-close), 1e-10)
                 if rr < config.MIN_RR:
                     log.info(f"  [{symbol}] ✗ SHORT RR={rr:.2f} < {config.MIN_RR}")
                     return None
-                log.info(f"  [{symbol}] 🔴 SHORT RR=1:{rr:.2f} SL={sl:.5g} TP={tp:.5g}")
+                log.info(f"  [{symbol}] 🔴 SHORT RSI={rsi:.1f} RR=1:{rr:.2f}")
                 return {"side":"SELL","entry":close,"sl":sl,"tp":tp,"atr":atr,
-                        "adx":adx,"green":green,"red":red,"trigger":short_t,
-                        "vol_ratio":vol_ratio,"canal_width":canal_w,"rr":rr,"pip_size":pip,
-                        "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])}
+                        "adx":adx,"rsi":rsi,"green":green,"red":red,
+                        "trigger":short_t,"vol_ratio":vol_ratio,
+                        "canal_width":canal_w,"rr":rr,"pip_size":pip}
 
-        # ── LONG ───────────────────────────────────────────────────────
-        if ext_down and ema_bull and vol_ok:
+        # ── LONG: overshoot abajo + RSI oversold ──────────────────────
+        if close <= long_t and rsi <= config.RSI_OS and vol_ok:
             sl = close - atr * config.SL_ATR_MULT
             tp = green
             if tp > close:
-                rr = abs(tp-close)/max(abs(close-sl), 1e-10)
+                rr = abs(tp-close) / max(abs(close-sl), 1e-10)
                 if rr < config.MIN_RR:
                     log.info(f"  [{symbol}] ✗ LONG RR={rr:.2f} < {config.MIN_RR}")
                     return None
-                log.info(f"  [{symbol}] 🟢 LONG RR=1:{rr:.2f} SL={sl:.5g} TP={tp:.5g}")
+                log.info(f"  [{symbol}] 🟢 LONG RSI={rsi:.1f} RR=1:{rr:.2f}")
                 return {"side":"BUY","entry":close,"sl":sl,"tp":tp,"atr":atr,
-                        "adx":adx,"green":green,"red":red,"trigger":long_t,
-                        "vol_ratio":vol_ratio,"canal_width":canal_w,"rr":rr,"pip_size":pip,
-                        "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])}
+                        "adx":adx,"rsi":rsi,"green":green,"red":red,
+                        "trigger":long_t,"vol_ratio":vol_ratio,
+                        "canal_width":canal_w,"rr":rr,"pip_size":pip}
 
         return None
 
@@ -218,7 +218,7 @@ class ExplosionScorer:
                     return float(k.get("volume",0)) if isinstance(k,dict) else (
                            float(k[5]) if isinstance(k,(list,tuple)) and len(k)>5 else 0.0)
                 avg = np.mean([_v(k) for k in daily_klines[:-1]])
-                vol_score = _v(daily_klines[-1])/avg if avg>0 else 1.0
+                vol_score = _v(daily_klines[-1])/avg if avg > 0 else 1.0
             return price_change*2.0 + vol_score*3.0 + min(quote_vol/1e7, 5.0)
         except Exception:
             return 0.0
