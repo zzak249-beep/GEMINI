@@ -1,23 +1,20 @@
-## RAILWAY VARIABLES — copiar sin comillas
-## Cambia solo los valores, no los nombres
+## RAILWAY VARIABLES — pegar una a una, sin comillas
+## CAMBIO CRÍTICO: VOL_FILTER=false
 
-## Timeframe
 TIMEFRAME=3m
 KLINE_LIMIT=120
 CANDLE_SLEEP=60
+PORT=8080
 
-## Filtros — REVISADOS para mercado actual
 ADX_MIN=18
 ADX_LEN=14
 EMA_FAST=7
 EMA_MED=17
 EMA_SLOW=21
 
-## Volumen — DESACTIVADO en 3m (muy ruidoso)
 VOL_FILTER=false
 VOL_MULT=1.0
 
-## Canal ZigZag
 PIVOT_LEN=5
 ATR_LEN=14
 SHORT_PIPS=20
@@ -25,18 +22,13 @@ LONG_PIPS=15
 SL_ATR_MULT=1.5
 MIN_RR=1.0
 
-## Riesgo
 LEVERAGE=10
 RISK_PCT=1.5
 MAX_POSITIONS=3
 MAX_DAILY_LOSS=5.0
 TIME_STOP_MINUTES=45
 
-## Scanner
 WHITELIST_ONLY=true
 TOP_PAIRS=12
 MIN_QUOTE_VOL=10000000
 MIN_PRICE_USDT=0.001
-
-## Sistema
-PORT=8080

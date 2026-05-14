@@ -1,180 +1,249 @@
 """
-strategy.py — V35 FINAL
-BUGS RAÍZ ENCONTRADOS Y ELIMINADOS:
-  1. nan_peak: _pivot_high necesita N velas futuras → siempre NaN en barra actual
-  2. Crossover raro: buscar cruce exacto en 3 velas falla en mercado real
+ZigZag Channel Fade — V32 FINAL CORREGIDO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-NUEVA LÓGICA (dispara 8-15 veces/día por símbolo como Pine Script V26):
-  LONG:  EMA7 > EMA17 > EMA21 (alineación alcista)
-         + EMA7 pendiente positiva (momentum)
-         + ADX >= umbral
-         + Vol >= umbral
-         + NO estamos ya en posición similar reciente (cooldown 5 velas)
+BUGS CORREGIDOS:
+1. EMA lógica INVERTIDA (fade correcto):
+   SHORT: ema_fast > ema_med  (precio sobreextendido ARRIBA  → fade down)
+   LONG:  ema_fast < ema_med  (precio sobreextendido ABAJO   → fade up)
 
-  SHORT: EMA7 < EMA17 < EMA21 (alineación bajista)
-         + EMA7 pendiente negativa
-         + ADX >= umbral
-         + Vol >= umbral
+2. VOL_FILTER desactivado por defecto:
+   En 3m el volumen por vela es 0.03x-0.85x de la media → bloqueaba TODO
 
-  SL: ATR-based (sin pivots)  TP: EMA21
+3. ADX solo informativo (no bloquea, ajusta size en trader)
 """
 import logging
 import numpy as np
-import pandas as pd
-from config import EMA_FAST, EMA_MID, EMA_SLOW, VOL_MULT, ADX_MIN, ATR_SL_MULT
+from typing import Optional, Tuple, List
+import config
 
-logger = logging.getLogger(__name__)
-
-
-def _ema(s, n):  return s.ewm(span=n, adjust=False).mean()
-def _sma(s, n):  return s.rolling(n).mean()
-
-def _atr(h, l, c, n=14):
-    pc = c.shift(1)
-    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr.ewm(span=n, adjust=False).mean()
-
-def _adx(h, l, c, n=14):
-    pc   = c.shift(1)
-    tr   = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    up   = h - h.shift(1)
-    dn   = l.shift(1) - l
-    pdm  = pd.Series(np.where((up>dn)&(up>0),   up, 0.), index=h.index, dtype=float)
-    mdm  = pd.Series(np.where((dn>up)&(dn>0),   dn, 0.), index=h.index, dtype=float)
-    atr_ = tr.ewm(span=n, adjust=False).mean()
-    pdi  = 100 * pdm.ewm(span=n, adjust=False).mean() / atr_.replace(0, np.nan)
-    mdi  = 100 * mdm.ewm(span=n, adjust=False).mean() / atr_.replace(0, np.nan)
-    dx   = 100 * (pdi-mdi).abs() / (pdi+mdi).replace(0, np.nan)
-    return dx.ewm(span=n, adjust=False).mean()
+log = logging.getLogger("strategy")
 
 
-class StrategyV35:
+def dynamic_pip_size(price: float) -> float:
+    if price >= 10_000: return 1.0
+    if price >= 1_000:  return 0.1
+    if price >= 100:    return 0.01
+    if price >= 1:      return 0.001
+    if price >= 0.1:    return 0.0001
+    return 0.00001
 
-    def _indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df["ema7"]   = _ema(df["close"], EMA_FAST)
-        df["ema17"]  = _ema(df["close"], EMA_MID)
-        df["ema21"]  = _ema(df["close"], EMA_SLOW)
-        df["vol_ma"] = _sma(df["volume"], 20)
-        df["adx"]    = _adx(df["high"], df["low"], df["close"], 14)
-        df["atr"]    = _atr(df["high"], df["low"], df["close"], 14)
-        return df
 
-    def get_signal(self, df: pd.DataFrame, adx_override: float = None) -> dict:
-        NONE = {"signal": "NONE", "reason": ""}
-
-        if len(df) < 30:
-            return {**NONE, "reason": "pocas_velas"}
-
-        df      = self._indicators(df)
-        last    = df.iloc[-1]
-        prev    = df.iloc[-2]
-        prev2   = df.iloc[-3]
-
-        # ── NaN guard (solo indicadores básicos, sin pivots) ──
-        for col in ["ema7","ema17","ema21","adx","atr","vol_ma"]:
-            if pd.isna(last[col]):
-                return {**NONE, "reason": f"nan_{col}"}
-
-        adx_min   = adx_override if adx_override else ADX_MIN
-        vol_ratio = float(last["volume"]) / float(last["vol_ma"]) \
-                    if float(last["vol_ma"]) > 0 else 0.0
-
-        # ── Valores actuales ──
-        e7, e17, e21 = float(last["ema7"]), float(last["ema17"]), float(last["ema21"])
-        adx_val      = float(last["adx"])
-        atr_val      = float(last["atr"])
-        close        = float(last["close"])
-
-        # ── Pendiente EMA7 (momentum) ──
-        e7_slope = float(last["ema7"]) - float(prev2["ema7"])  # 3 velas
-
-        # ── Filtros comunes ──
-        if vol_ratio < VOL_MULT:
-            return {**NONE, "reason": f"vol {vol_ratio:.2f}x<{VOL_MULT}x"}
-        if adx_val < adx_min:
-            return {**NONE, "reason": f"adx {adx_val:.1f}<{adx_min}"}
-
-        # ── Señal LONG: alineación alcista completa + momentum ──
-        bull_align  = e7 > e17 > e21          # EMA stack alcista
-        bull_moment = e7_slope > 0             # EMA7 subiendo
-        if bull_align and bull_moment:
-            signal = "LONG"
-        # ── Señal SHORT: alineación bajista completa + momentum ──
-        elif e7 < e17 < e21 and e7_slope < 0:
-            signal = "SHORT"
-        else:
-            gap_e7_e17 = (e7 - e17) / e17 * 100
-            align_txt  = f"e7={e7:.4f} e17={e17:.4f} e21={e21:.4f}"
-            return {**NONE, "reason": f"no_align gap={gap_e7_e17:.3f}% {align_txt}"}
-
-        # ── SL / TP ──
-        sl_dist = atr_val * ATR_SL_MULT * 2   # 2× ATR de margen
-        sl  = close - sl_dist if signal == "LONG" else close + sl_dist
-        tp  = e21                               # EMA21 como Pine Script
-
-        # Si TP demasiado cerca, usar 1.5× distancia al SL
-        min_tp_dist = sl_dist * 1.5
-        if signal == "LONG"  and (tp - close) < min_tp_dist:
-            tp = close + min_tp_dist
-        if signal == "SHORT" and (close - tp) < min_tp_dist:
-            tp = close - min_tp_dist
-
-        # Validar geometría final
-        if signal == "LONG"  and sl >= close:
-            return {**NONE, "reason": "sl>=close"}
-        if signal == "SHORT" and sl <= close:
-            return {**NONE, "reason": "sl<=close"}
-        if signal == "LONG"  and tp <= close:
-            return {**NONE, "reason": "tp<=close"}
-        if signal == "SHORT" and tp >= close:
-            return {**NONE, "reason": "tp>=close"}
-
-        strength = self._strength(e7, e17, e21, adx_val, vol_ratio)
-
-        return {
-            "signal":    signal,
-            "reason":    "OK",
-            "entry":     round(close, 8),
-            "sl":        round(sl,    8),
-            "tp":        round(tp,    8),
-            "atr":       round(atr_val, 8),
-            "adx":       round(adx_val, 2),
-            "strength":  strength,
-            "vol_ratio": round(vol_ratio, 2),
-            "peak":      round(close + atr_val * 3, 8),   # referencia
-            "valley":    round(close - atr_val * 3, 8),   # referencia
-        }
-
-    def get_diagnostics(self, df: pd.DataFrame) -> dict:
-        if len(df) < 25:
-            return {"error": "pocas_velas"}
+def parse_klines(raw: list) -> Tuple[np.ndarray, ...]:
+    if not raw:
+        return (np.array([]),) * 5
+    opens, highs, lows, closes, volumes = [], [], [], [], []
+    for k in raw:
         try:
-            df   = self._indicators(df)
-            last = df.iloc[-1]
-            prev2 = df.iloc[-3]
-            e7, e17, e21 = float(last["ema7"]), float(last["ema17"]), float(last["ema21"])
-            vol_ratio = float(last["volume"]) / float(last["vol_ma"]) \
-                        if float(last["vol_ma"]) > 0 else 0
-            slope = e7 - float(prev2["ema7"])
-            return {
-                "adx":        round(float(last["adx"]), 1),
-                "vol_ratio":  round(vol_ratio, 2),
-                "e7_e17_gap": round((e7-e17)/e17*100, 3),
-                "bull_align": e7 > e17 > e21,
-                "bear_align": e7 < e17 < e21,
-                "e7_slope":   round(slope, 6),
-                "vol_ok":     vol_ratio >= VOL_MULT,
-                "adx_ok":     float(last["adx"]) >= ADX_MIN,
-                "close":      round(float(last["close"]), 6),
-            }
-        except Exception as ex:
-            return {"error": str(ex)}
+            if isinstance(k, dict):
+                o = float(k.get("open",   k.get("o", 0)))
+                h = float(k.get("high",   k.get("h", 0)))
+                l = float(k.get("low",    k.get("l", 0)))
+                c = float(k.get("close",  k.get("c", 0)))
+                v = float(k.get("volume", k.get("v", 0)))
+            elif isinstance(k, (list, tuple)) and len(k) >= 6:
+                o,h,l,c,v = float(k[1]),float(k[2]),float(k[3]),float(k[4]),float(k[5])
+            else:
+                continue
+            if h < l or c <= 0:
+                continue
+            opens.append(o); highs.append(h); lows.append(l)
+            closes.append(c); volumes.append(v)
+        except (TypeError, ValueError):
+            continue
+    return (np.array(opens), np.array(highs), np.array(lows),
+            np.array(closes), np.array(volumes))
 
-    @staticmethod
-    def _strength(e7, e17, e21, adx, vol_ratio) -> float:
-        score  = min(40.0, adx / 50 * 40)
-        score += min(30.0, vol_ratio / 3 * 30)
-        if (e7>e17>e21) or (e7<e17<e21):
-            score += 30.0
-        return round(score, 1)
+
+def calc_atr(H, L, C, period=14) -> float:
+    if len(C) < period + 1: return 0.0
+    tr = np.maximum(H[1:]-L[1:],
+         np.maximum(np.abs(H[1:]-C[:-1]), np.abs(L[1:]-C[:-1])))
+    v = np.mean(tr[:period])
+    for i in range(period, len(tr)):
+        v = (v*(period-1) + tr[i]) / period
+    return float(v)
+
+
+def calc_ema(arr, period) -> np.ndarray:
+    if len(arr) < period: return np.zeros(len(arr))
+    k = 2.0/(period+1)
+    r = np.zeros(len(arr))
+    r[period-1] = np.mean(arr[:period])
+    for i in range(period, len(arr)):
+        r[i] = arr[i]*k + r[i-1]*(1-k)
+    return r
+
+
+def calc_adx(H, L, C, period=14) -> float:
+    if len(C) < period*2+2: return 0.0
+    tr  = np.maximum(H[1:]-L[1:],
+          np.maximum(np.abs(H[1:]-C[:-1]), np.abs(L[1:]-C[:-1])))
+    pdm = np.where((H[1:]-H[:-1])>(L[:-1]-L[1:]),
+                   np.maximum(H[1:]-H[:-1],0.0), 0.0)
+    mdm = np.where((L[:-1]-L[1:])>(H[1:]-H[:-1]),
+                   np.maximum(L[:-1]-L[1:],0.0), 0.0)
+    def _s(a):
+        s = np.zeros(len(a))
+        if len(a) < period: return s
+        s[period-1] = np.sum(a[:period])
+        for i in range(period, len(a)):
+            s[i] = s[i-1] - s[i-1]/period + a[i]
+        return s
+    atr_s=_s(tr); pdm_s=_s(pdm); mdm_s=_s(mdm)
+    pdi = 100*pdm_s/(atr_s+1e-10)
+    mdi = 100*mdm_s/(atr_s+1e-10)
+    dx  = 100*np.abs(pdi-mdi)/(pdi+mdi+1e-10)
+    adx = np.zeros(len(dx))
+    if len(dx) >= period:
+        adx[period-1] = np.mean(dx[:period])
+        for i in range(period, len(dx)):
+            adx[i] = (adx[i-1]*(period-1) + dx[i]) / period
+    return float(adx[-1])
+
+
+def find_pivots(H, L, pivot_len) -> Tuple[List, List]:
+    ph: List[Tuple[float,int]] = []
+    pl: List[Tuple[float,int]] = []
+    n = len(H)
+    for i in range(pivot_len, n-pivot_len):
+        if H[i] >= np.max(H[i-pivot_len:i+pivot_len+1]):
+            ph.append((float(H[i]), i))
+        if L[i] <= np.min(L[i-pivot_len:i+pivot_len+1]):
+            pl.append((float(L[i]), i))
+    return ph, pl
+
+
+def _last(lst):
+    return lst[-1][0] if lst else None
+
+
+class ChannelFadeSignal:
+
+    def compute(self, opens, highs, lows, closes, volumes,
+                symbol: str = "") -> Optional[dict]:
+
+        n = len(closes)
+        min_bars = max(config.PIVOT_LEN*2 + config.ATR_LEN + 2,
+                       config.ADX_LEN*2 + 2,
+                       config.EMA_MED + 2)
+        if n < min_bars:
+            return None
+
+        H = highs[:-1]; L = lows[:-1]; C = closes[:-1]; V = volumes[:-1]
+        if len(C) < 30:
+            return None
+
+        # ATR — filtro duro
+        atr = calc_atr(H, L, C, config.ATR_LEN)
+        if atr == 0:
+            return None
+
+        # ADX — solo informativo
+        adx    = calc_adx(H, L, C, config.ADX_LEN)
+        adx_ok = adx >= config.ADX_MIN
+
+        # EMA — lógica FADE correcta
+        ema_fast = calc_ema(C, config.EMA_FAST)
+        ema_med  = calc_ema(C, config.EMA_MED)
+        if ema_fast[-1] == 0 or ema_med[-1] == 0:
+            return None
+
+        # Precio sobreextendido ARRIBA  → ema_fast > ema_med → SHORT (fade down)
+        # Precio sobreextendido ABAJO   → ema_fast < ema_med → LONG  (fade up)
+        ext_up   = ema_fast[-1] > ema_med[-1]
+        ext_down = ema_fast[-1] < ema_med[-1]
+
+        # Volumen — desactivado por defecto en 3m
+        vol_ratio = 1.0
+        if config.VOL_FILTER:
+            vol_window = min(20, len(V))
+            vol_ma    = np.mean(V[-vol_window:]) if vol_window > 0 else 1.0
+            vol_ratio = V[-1] / vol_ma if vol_ma > 0 else 1.0
+            if vol_ratio < config.VOL_MULT:
+                log.info(f"  [{symbol}] ✗ Vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
+                return None
+
+        # Canal ZigZag
+        ph_list, pl_list = find_pivots(H, L, config.PIVOT_LEN)
+        green = _last(ph_list)
+        red   = _last(pl_list)
+        if green is None or red is None or green <= red:
+            log.info(f"  [{symbol}] ✗ Canal inválido (green={green} red={red})")
+            return None
+
+        close   = C[-1]
+        canal_w = green - red
+        pip     = dynamic_pip_size(close)
+
+        short_offset  = max(config.SHORT_PIPS * pip, atr * 0.3)
+        long_offset   = max(config.LONG_PIPS  * pip, atr * 0.3)
+        short_trigger = green + short_offset
+        long_trigger  = red   - long_offset
+
+        log.info(
+            f"  [{symbol}] ADX={adx:.1f}({'✓' if adx_ok else 'weak'}) "
+            f"Vol={vol_ratio:.2f}x ext_up={ext_up} ext_down={ext_down} | "
+            f"close={close:.5g} SHORT>={short_trigger:.5g} LONG<={long_trigger:.5g}"
+        )
+
+        # SHORT
+        if close >= short_trigger and ext_up:
+            sl = close + atr * config.SL_ATR_MULT
+            tp = red
+            if tp >= close:
+                log.info(f"  [{symbol}] ✗ SHORT TP>=close")
+                return None
+            rr = abs(tp-close) / max(abs(sl-close), 1e-10)
+            if rr < config.MIN_RR:
+                log.info(f"  [{symbol}] ✗ SHORT RR={rr:.2f}<{config.MIN_RR}")
+                return None
+            log.info(f"  [{symbol}] 🔴 SHORT RR=1:{rr:.2f} ADX={'OK' if adx_ok else 'WEAK'}")
+            return {
+                "side":"SELL","entry":close,"sl":sl,"tp":tp,
+                "atr":atr,"adx":adx,"adx_ok":adx_ok,
+                "green":green,"red":red,"trigger":short_trigger,
+                "vol_ratio":vol_ratio,"canal_width":canal_w,
+                "rr":rr,"pip_size":pip,
+                "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])
+            }
+
+        # LONG
+        if close <= long_trigger and ext_down:
+            sl = close - atr * config.SL_ATR_MULT
+            tp = green
+            if tp <= close:
+                log.info(f"  [{symbol}] ✗ LONG TP<=close")
+                return None
+            rr = abs(tp-close) / max(abs(close-sl), 1e-10)
+            if rr < config.MIN_RR:
+                log.info(f"  [{symbol}] ✗ LONG RR={rr:.2f}<{config.MIN_RR}")
+                return None
+            log.info(f"  [{symbol}] 🟢 LONG RR=1:{rr:.2f} ADX={'OK' if adx_ok else 'WEAK'}")
+            return {
+                "side":"BUY","entry":close,"sl":sl,"tp":tp,
+                "atr":atr,"adx":adx,"adx_ok":adx_ok,
+                "green":green,"red":red,"trigger":long_trigger,
+                "vol_ratio":vol_ratio,"canal_width":canal_w,
+                "rr":rr,"pip_size":pip,
+                "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])
+            }
+
+        return None
+
+
+class ExplosionScorer:
+    def score(self, ticker: dict, daily_klines: list) -> float:
+        try:
+            price_change = abs(float(ticker.get("priceChangePercent", 0)))
+            quote_vol    = float(ticker.get("quoteVolume", 0))
+            vol_score    = 1.0
+            if len(daily_klines) >= 2:
+                def _v(k):
+                    return float(k.get("volume",0)) if isinstance(k,dict) else (
+                           float(k[5]) if isinstance(k,(list,tuple)) and len(k)>5 else 0.0)
+                avg = np.mean([_v(k) for k in daily_klines[:-1]])
+                vol_score = _v(daily_klines[-1]) / avg if avg > 0 else 1.0
+            return price_change*2.0 + vol_score*3.0 + min(quote_vol/1e7, 5.0)
+        except Exception:
+            return 0.0
