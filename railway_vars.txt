@@ -1,17 +1,18 @@
-## RAILWAY VARIABLES — pegar una a una, sin comillas
-## CAMBIO CRÍTICO: VOL_FILTER=false
+## RAILWAY — pegar sin comillas, una por línea
 
 TIMEFRAME=3m
 KLINE_LIMIT=120
 CANDLE_SLEEP=60
 PORT=8080
 
+## ADX solo reduce size si < 18, NO bloquea
 ADX_MIN=18
 ADX_LEN=14
 EMA_FAST=7
 EMA_MED=17
 EMA_SLOW=21
 
+## CRÍTICO: false
 VOL_FILTER=false
 VOL_MULT=1.0
 
