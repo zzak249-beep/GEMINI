@@ -1,19 +1,9 @@
 """
 ZigZag Channel Fade — V32
-━━━━━━━━━━━━━━━━━━━━━━━━━
-
-LÓGICA (Channel Fade):
-  SHORT: precio supera el TECHO del canal + EMA sobreextendida arriba
-  LONG:  precio cae bajo el SUELO del canal + EMA sobreextendida abajo
-
-  EMA fade correcto:
-    SHORT → ema_fast > ema_med  (precio ha subido, EMA lo refleja)
-    LONG  → ema_fast < ema_med  (precio ha caído, EMA lo refleja)
-
-  ADX: solo informativo — si < ADX_MIN el trader usa 50% de size.
-       NO bloquea señales. NO hay límite superior de ADX.
-
-  VOL_FILTER: False por defecto (3m es ruidoso, Vol varía 0.03x-2x)
+SHORT: close > verde+offset AND ema_fast > ema_med
+LONG:  close < roja-offset  AND ema_fast < ema_med
+ADX: solo informativo (no bloquea)
+VOL_FILTER: False por defecto
 """
 import logging
 import numpy as np
@@ -125,8 +115,7 @@ class ChannelFadeSignal:
 
         n = len(closes)
         min_bars = max(config.PIVOT_LEN*2 + config.ATR_LEN + 2,
-                       config.ADX_LEN*2 + 2,
-                       config.EMA_MED + 2)
+                       config.ADX_LEN*2 + 2, config.EMA_MED + 2)
         if n < min_bars:
             return None
 
@@ -134,24 +123,21 @@ class ChannelFadeSignal:
         if len(C) < 30:
             return None
 
-        # ── ATR ───────────────────────────────────────────────────────
         atr = calc_atr(H, L, C, config.ATR_LEN)
         if atr == 0:
             return None
 
-        # ── ADX — solo informativo, nunca bloquea ─────────────────────
         adx    = calc_adx(H, L, C, config.ADX_LEN)
-        adx_ok = adx >= config.ADX_MIN  # solo para ajuste de size
+        adx_ok = adx >= config.ADX_MIN
 
-        # ── EMA — lógica fade ─────────────────────────────────────────
         ema_fast = calc_ema(C, config.EMA_FAST)
         ema_med  = calc_ema(C, config.EMA_MED)
         if ema_fast[-1] == 0 or ema_med[-1] == 0:
             return None
-        ext_up   = ema_fast[-1] > ema_med[-1]   # sobreextendido arriba → SHORT
-        ext_down = ema_fast[-1] < ema_med[-1]   # sobreextendido abajo  → LONG
 
-        # ── Volumen — opcional ────────────────────────────────────────
+        ext_up   = ema_fast[-1] > ema_med[-1]
+        ext_down = ema_fast[-1] < ema_med[-1]
+
         vol_ratio = 1.0
         if config.VOL_FILTER:
             vol_window = min(20, len(V))
@@ -161,12 +147,11 @@ class ChannelFadeSignal:
                 log.info(f"  [{symbol}] ✗ Vol={vol_ratio:.2f}x < {config.VOL_MULT}x")
                 return None
 
-        # ── Canal ZigZag ──────────────────────────────────────────────
         ph_list, pl_list = find_pivots(H, L, config.PIVOT_LEN)
         green = _last(ph_list)
         red   = _last(pl_list)
         if green is None or red is None or green <= red:
-            log.info(f"  [{symbol}] ✗ Canal inválido (green={green} red={red})")
+            log.info(f"  [{symbol}] ✗ Canal inválido green={green} red={red}")
             return None
 
         close   = C[-1]
@@ -179,52 +164,46 @@ class ChannelFadeSignal:
         long_trigger  = red   - long_offset
 
         log.info(
-            f"  [{symbol}] ADX={adx:.1f}({'✓' if adx_ok else 'weak'}) "
+            f"  [{symbol}] ADX={adx:.1f}({'✓' if adx_ok else 'w'}) "
             f"Vol={vol_ratio:.2f}x ext_up={ext_up} ext_down={ext_down} | "
             f"close={close:.5g} SHORT>={short_trigger:.5g} LONG<={long_trigger:.5g}"
         )
 
-        # ── SHORT ─────────────────────────────────────────────────────
+        # SHORT
         if close >= short_trigger and ext_up:
             sl = close + atr * config.SL_ATR_MULT
             tp = red
             if tp >= close:
-                log.info(f"  [{symbol}] ✗ SHORT TP>=close")
                 return None
             rr = abs(tp-close) / max(abs(sl-close), 1e-10)
             if rr < config.MIN_RR:
                 log.info(f"  [{symbol}] ✗ SHORT RR={rr:.2f}<{config.MIN_RR}")
                 return None
-            log.info(f"  [{symbol}] 🔴 SHORT RR=1:{rr:.2f} ADX={'OK' if adx_ok else 'WEAK'}")
-            return {
-                "side":"SELL","entry":close,"sl":sl,"tp":tp,
-                "atr":atr,"adx":adx,"adx_ok":adx_ok,
-                "green":green,"red":red,"trigger":short_trigger,
-                "vol_ratio":vol_ratio,"canal_width":canal_w,
-                "rr":rr,"pip_size":pip,
-                "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])
-            }
+            log.info(f"  [{symbol}] 🔴 SHORT RR=1:{rr:.2f}")
+            return {"side":"SELL","entry":close,"sl":sl,"tp":tp,
+                    "atr":atr,"adx":adx,"adx_ok":adx_ok,
+                    "green":green,"red":red,"trigger":short_trigger,
+                    "vol_ratio":vol_ratio,"canal_width":canal_w,
+                    "rr":rr,"pip_size":pip,
+                    "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])}
 
-        # ── LONG ──────────────────────────────────────────────────────
+        # LONG
         if close <= long_trigger and ext_down:
             sl = close - atr * config.SL_ATR_MULT
             tp = green
             if tp <= close:
-                log.info(f"  [{symbol}] ✗ LONG TP<=close")
                 return None
             rr = abs(tp-close) / max(abs(close-sl), 1e-10)
             if rr < config.MIN_RR:
                 log.info(f"  [{symbol}] ✗ LONG RR={rr:.2f}<{config.MIN_RR}")
                 return None
-            log.info(f"  [{symbol}] 🟢 LONG RR=1:{rr:.2f} ADX={'OK' if adx_ok else 'WEAK'}")
-            return {
-                "side":"BUY","entry":close,"sl":sl,"tp":tp,
-                "atr":atr,"adx":adx,"adx_ok":adx_ok,
-                "green":green,"red":red,"trigger":long_trigger,
-                "vol_ratio":vol_ratio,"canal_width":canal_w,
-                "rr":rr,"pip_size":pip,
-                "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])
-            }
+            log.info(f"  [{symbol}] 🟢 LONG RR=1:{rr:.2f}")
+            return {"side":"BUY","entry":close,"sl":sl,"tp":tp,
+                    "atr":atr,"adx":adx,"adx_ok":adx_ok,
+                    "green":green,"red":red,"trigger":long_trigger,
+                    "vol_ratio":vol_ratio,"canal_width":canal_w,
+                    "rr":rr,"pip_size":pip,
+                    "ema_fast":float(ema_fast[-1]),"ema_med":float(ema_med[-1])}
 
         return None
 

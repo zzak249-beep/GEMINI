@@ -29,8 +29,8 @@ async def bot_start(session):
         f"📊 Timeframe:    <code>{config.TIMEFRAME}</code>\n"
         f"⚡ Leverage:     <code>{config.LEVERAGE}x</code>\n"
         f"💰 Riesgo/trade: <code>{config.RISK_PCT}%</code>\n"
-        f"🔴 SHORT:        <code>close > verde + {config.SHORT_PIPS}pips | EMA ext↑</code>\n"
-        f"🟢 LONG:         <code>close < roja  - {config.LONG_PIPS}pips | EMA ext↓</code>\n"
+        f"🔴 SHORT:        <code>close > verde+{config.SHORT_PIPS}p | EMA↑</code>\n"
+        f"🟢 LONG:         <code>close < roja-{config.LONG_PIPS}p  | EMA↓</code>\n"
         f"⏱ Time-stop:    <code>{config.TIME_STOP_MINUTES} min</code>\n"
         f"📦 Max pos:      <code>{config.MAX_POSITIONS}</code>\n"
         f"🏆 Pares:        <code>{config.TOP_PAIRS}</code>\n"
@@ -53,16 +53,16 @@ async def signal_channel_fade(session, symbol: str, side: str,
                                trigger: float, canal_w: float, vol_ratio: float,
                                adx: float, rr: float):
     emoji = "🔴 SHORT" if side == "SELL" else "🟢 LONG"
-    desc  = (f"Close {close:.4f} > Verde+pips {trigger:.4f}"
+    desc  = (f"Close {close:.5g} > Verde+p {trigger:.5g}"
              if side == "SELL"
-             else f"Close {close:.4f} < Roja-pips {trigger:.4f}")
+             else f"Close {close:.5g} < Roja-p {trigger:.5g}")
     await send(session,
         f"{emoji} <b>SEÑAL</b> — <code>{symbol}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📌 {desc}\n"
-        f"🟩 Verde: <code>{green:.4f}</code>\n"
-        f"🟥 Roja:  <code>{red:.4f}</code>\n"
-        f"📏 Canal: <code>{canal_w:.4f}</code>\n"
+        f"🟩 Verde: <code>{green:.5g}</code>\n"
+        f"🟥 Roja:  <code>{red:.5g}</code>\n"
+        f"📏 Canal: <code>{canal_w:.5g}</code>\n"
         f"📊 Vol:   <code>{vol_ratio:.2f}x</code>\n"
         f"📈 ADX:   <code>{adx:.1f}</code>\n"
         f"⚖️ RR:    <code>1:{rr:.2f}</code>"
@@ -83,7 +83,7 @@ async def trade_entry(session, symbol: str, side: str, entry: float,
         f"🎯 TP:       <code>{tp:.6g}</code>  (+{tp_pct:.2f}%)\n"
         f"📦 Qty:      <code>{qty:.4f}</code>\n"
         f"⚖️ RR:       <code>1:{rr:.2f}</code>\n"
-        f"🌊 ATR:      <code>{atr:.4f}</code>\n"
+        f"🌊 ATR:      <code>{atr:.5g}</code>\n"
         f"📈 ADX:      <code>{adx:.1f}</code>\n"
         f"📊 Vol:      <code>{vol_ratio:.2f}x</code>\n"
         f"⏱ T-Stop:   <code>{config.TIME_STOP_MINUTES} min</code>\n"

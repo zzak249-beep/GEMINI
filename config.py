@@ -16,49 +16,38 @@ def _bool(key, default):
     if v in ("false","0","no"): return False
     return default
 
-# BingX
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "").strip()
 BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "").strip()
 BASE_URL         = "https://open-api.bingx.com"
 
-# Telegram
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# ZigZag
 PIVOT_LEN = _int("PIVOT_LEN", 5)
 ATR_LEN   = _int("ATR_LEN", 14)
 TIMEFRAME = os.getenv("TIMEFRAME", "3m").strip().strip('"') or "3m"
 
-# Señal — overshoot vs canal
 SHORT_PIPS  = _float("SHORT_PIPS", 20.0)
 LONG_PIPS   = _float("LONG_PIPS",  15.0)
 SL_ATR_MULT = _float("SL_ATR_MULT", 1.5)
 MIN_RR      = _float("MIN_RR", 1.0)
 
-# ADX — SOLO informativo (no bloquea señales)
-ADX_MIN = _int("ADX_MIN", 18)   # Si ADX < 18 → size reducido al 50%
+ADX_MIN = _int("ADX_MIN", 18)
 ADX_LEN = _int("ADX_LEN", 14)
-
-# EMA
 EMA_FAST = _int("EMA_FAST", 7)
 EMA_MED  = _int("EMA_MED",  17)
 EMA_SLOW = _int("EMA_SLOW", 21)
 
-# Volumen — False por defecto (3m demasiado ruidoso)
 VOL_FILTER = _bool("VOL_FILTER", False)
 VOL_MULT   = _float("VOL_MULT", 1.0)
 
-# Tiempo
 TIME_STOP_MINUTES = _int("TIME_STOP_MINUTES", 45)
 
-# Riesgo
 LEVERAGE       = _int("LEVERAGE", 10)
 RISK_PCT       = _float("RISK_PCT", 1.5)
 MAX_POSITIONS  = _int("MAX_POSITIONS", 3)
 MAX_DAILY_LOSS = _float("MAX_DAILY_LOSS", 5.0)
 
-# Scanner
 WHITELIST_ONLY = _bool("WHITELIST_ONLY", True)
 TOP_PAIRS      = _int("TOP_PAIRS", 12)
 MIN_QUOTE_VOL  = _float("MIN_QUOTE_VOL", 10_000_000)
@@ -70,7 +59,6 @@ PAIR_WHITELIST = [
     "LINK-USDT","DOT-USDT","LTC-USDT","BCH-USDT",
 ]
 
-# Timing
 CANDLE_SLEEP = _int("CANDLE_SLEEP", 60)
 KLINE_LIMIT  = _int("KLINE_LIMIT",  120)
 PORT         = _int("PORT", 8080)
