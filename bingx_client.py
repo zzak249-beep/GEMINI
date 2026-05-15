@@ -11,6 +11,7 @@ class BingXClient:
         self.secret  = config.BINGX_SECRET_KEY
         self.session = session
         self._contract_cache: dict = {}
+        self._position_mode = "BOTH"  # BOTH=one-way, LONG/SHORT=hedge
 
     def _sign(self, params: dict) -> str:
         query = urllib.parse.urlencode(sorted(params.items()))
@@ -46,6 +47,7 @@ class BingXClient:
         except Exception as e:
             log.error(f"POST {path}: {e}"); raise
 
+    # ── Market Data ───────────────────────────────────────────────────
     async def get_contracts(self):
         r = await self._get("/openApi/swap/v2/quote/contracts")
         data = r.get("data", []) or []
@@ -68,36 +70,63 @@ class BingXClient:
                             {"symbol": symbol, "interval": "1d", "limit": 8})
         return r.get("data", []) or []
 
+    # ── Balance — intenta múltiples endpoints y formatos ──────────────
     async def get_balance(self) -> float:
-        r = await self._get("/openApi/swap/v2/user/balance", signed=True)
-        log.info(f"RAW balance: {str(r)[:400]}")
-        try:
-            d = r.get("data", {})
-            # Formato anidado: data.balance.availableMargin
-            if isinstance(d, dict):
-                bal = d.get("balance", {})
-                if isinstance(bal, dict):
-                    for k in ("availableMargin","available","equity","balance"):
+        endpoints = [
+            "/openApi/swap/v2/user/balance",
+            "/openApi/swap/v3/user/balance",
+        ]
+        for ep in endpoints:
+            try:
+                r = await self._get(ep, signed=True)
+                log.info(f"balance {ep}: {str(r)[:300]}")
+                v = self._parse_balance(r)
+                if v > 0:
+                    return v
+            except Exception as e:
+                log.warning(f"balance {ep} failed: {e}")
+        log.warning("⚠️ balance=0 — verifica API key y fondos en Futuros Perpetuos")
+        return 0.0
+
+    def _parse_balance(self, r: dict) -> float:
+        """Intenta extraer el balance disponible de múltiples formatos de respuesta."""
+        keys = ("availableMargin", "available", "crossAvailableBalance",
+                "availableBalance", "equity", "balance", "crossWalletBalance",
+                "withdrawAvailable")
+        # data es dict
+        d = r.get("data", {})
+        if isinstance(d, dict):
+            # Formato: data.balance.availableMargin
+            bal = d.get("balance", {})
+            if isinstance(bal, dict):
+                for k in keys:
+                    try:
                         v = float(bal.get(k, 0))
                         if v > 0: return v
-                # Formato plano: data.availableMargin
-                for k in ("availableMargin","available","equity","balance","crossWalletBalance"):
-                    try:
-                        v = float(d.get(k, 0))
-                        if v > 0: return v
                     except: pass
-            # Formato lista
-            if isinstance(d, list):
-                for item in d:
-                    if isinstance(item, dict):
-                        for k in ("availableMargin","available","balance"):
-                            try:
-                                v = float(item.get(k, 0))
-                                if v > 0: return v
-                            except: pass
-        except Exception as e:
-            log.error(f"balance parse: {e}")
-        log.warning("balance=0 — transfiere fondos de Spot a Futuros Perpetuos en BingX")
+            # Formato plano: data.availableMargin
+            for k in keys:
+                try:
+                    v = float(d.get(k, 0))
+                    if v > 0: return v
+                except: pass
+            # Buscar recursivo un nivel más
+            for subkey, subval in d.items():
+                if isinstance(subval, dict):
+                    for k in keys:
+                        try:
+                            v = float(subval.get(k, 0))
+                            if v > 0: return v
+                        except: pass
+        # data es lista
+        if isinstance(d, list):
+            for item in d:
+                if isinstance(item, dict):
+                    for k in keys:
+                        try:
+                            v = float(item.get(k, 0))
+                            if v > 0: return v
+                        except: pass
         return 0.0
 
     async def get_positions(self):
@@ -105,6 +134,19 @@ class BingXClient:
         d = r.get("data", [])
         return d if isinstance(d, list) else []
 
+    # ── Detectar modo de posición de la cuenta ────────────────────────
+    async def detect_position_mode(self):
+        """Detecta si la cuenta está en one-way (BOTH) o hedge mode (LONG/SHORT)."""
+        try:
+            r = await self._get("/openApi/swap/v2/trade/positionSide/dual", signed=True)
+            dual = r.get("data", {}).get("dualSidePosition", False)
+            self._position_mode = "LONG" if dual else "BOTH"
+            log.info(f"Position mode: {'HEDGE' if dual else 'ONE-WAY'} → positionSide={self._position_mode}")
+        except Exception as e:
+            log.warning(f"detect_position_mode: {e} — usando BOTH")
+            self._position_mode = "BOTH"
+
+    # ── Qty Precision ─────────────────────────────────────────────────
     async def get_qty_precision(self, symbol: str) -> int:
         if symbol not in self._contract_cache: await self.get_contracts()
         c = self._contract_cache.get(symbol, {})
@@ -122,6 +164,7 @@ class BingXClient:
         f = 10 ** precision
         return math.floor(qty * f) / f
 
+    # ── Leverage ──────────────────────────────────────────────────────
     async def set_leverage(self, symbol: str, leverage: int):
         for side in ("LONG", "SHORT"):
             try:
@@ -132,29 +175,43 @@ class BingXClient:
             except Exception as e:
                 log.warning(f"[{symbol}] leverage: {e}")
 
+    # ── Orden ─────────────────────────────────────────────────────────
     async def place_market_order(self, symbol, side, qty, stop_loss, take_profit):
         prec    = await self.get_qty_precision(symbol)
         qty_adj = self._floor_qty(qty, prec)
         if qty_adj <= 0:
-            return {"code": -1, "msg": f"qty_adj={qty_adj}<=0"}
+            return {"code": -1, "msg": f"qty_adj={qty_adj}<=0 (prec={prec} qty={qty:.8f})"}
+
         sl_str = json.dumps({"type":"STOP_MARKET","stopPrice":round(stop_loss,6),
                              "workingType":"MARK_PRICE"}, separators=(',',':'))
         tp_str = json.dumps({"type":"TAKE_PROFIT_MARKET","stopPrice":round(take_profit,6),
                              "workingType":"MARK_PRICE"}, separators=(',',':'))
-        log.info(f"[{symbol}] ORDER {side} qty={qty_adj} SL={stop_loss:.5g} TP={take_profit:.5g}")
+
+        # Determinar positionSide según modo de cuenta
+        pos_side = self._position_mode  # "BOTH" o "LONG"/"SHORT"
+        if self._position_mode != "BOTH":
+            pos_side = "LONG" if side == "BUY" else "SHORT"
+
+        log.info(f"[{symbol}] ORDER {side} qty={qty_adj} positionSide={pos_side} "
+                 f"SL={stop_loss:.5g} TP={take_profit:.5g}")
+
         return await self._post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side, "positionSide": "BOTH",
+            "symbol": symbol, "side": side, "positionSide": pos_side,
             "type": "MARKET", "quantity": qty_adj,
             "stopLoss": sl_str, "takeProfit": tp_str,
         })
 
     async def close_position_market(self, symbol, side, qty):
-        prec = await self.get_qty_precision(symbol)
+        prec     = await self.get_qty_precision(symbol)
+        qty_adj  = self._floor_qty(qty, prec)
+        pos_side = self._position_mode
+        if self._position_mode != "BOTH":
+            pos_side = "LONG" if side == "BUY" else "SHORT"
         return await self._post("/openApi/swap/v2/trade/order", {
             "symbol": symbol,
             "side": "SELL" if side == "BUY" else "BUY",
-            "positionSide": "BOTH", "type": "MARKET",
-            "quantity": self._floor_qty(qty, prec),
+            "positionSide": pos_side, "type": "MARKET",
+            "quantity": qty_adj,
         })
 
     async def get_symbol_info(self, symbol) -> Optional[dict]:
