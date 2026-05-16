@@ -1,17 +1,4 @@
-# Entorno
+node_modules/
 .env
-*.env
-venv/
-__pycache__/
-*.pyc
-*.pyo
-
-# Datos locales
-*.json
+logs/
 *.log
-*.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
