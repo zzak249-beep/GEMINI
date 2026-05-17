@@ -1,70 +1,90 @@
+"""
+config.py — Carga y valida todas las variables de entorno del NEXUS Bot.
+"""
 import os
+from dotenv import load_dotenv
 
-def _int(key, default):
-    v = os.getenv(key, "").strip()
-    try: return int(v) if v else default
-    except: return default
+load_dotenv()
 
-def _float(key, default):
-    v = os.getenv(key, "").strip()
-    try: return float(v) if v else default
-    except: return default
 
-def _bool(key, default):
-    v = os.getenv(key, "").strip().lower()
-    return v == "true" if v else default
+def _require(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise EnvironmentError(f"Variable requerida no encontrada: {key}")
+    return val
 
-BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "").strip()
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "").strip()
-BASE_URL         = "https://open-api.bingx.com"
-TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-PIVOT_LEN = _int("PIVOT_LEN", 5)
-ATR_LEN   = _int("ATR_LEN", 14)
-TIMEFRAME = os.getenv("TIMEFRAME", "3m").strip() or "3m"
+class Config:
+    # ── BingX ──────────────────────────────────────────────
+    BINGX_API_KEY:    str   = _require("BINGX_API_KEY")
+    BINGX_SECRET_KEY: str   = _require("BINGX_SECRET_KEY")
 
-SHORT_PIPS  = _float("SHORT_PIPS", 25.0)
-LONG_PIPS   = _float("LONG_PIPS",  18.0)
-SL_ATR_MULT = _float("SL_ATR_MULT", 1.5)
-MIN_RR      = _float("MIN_RR", 1.2)
+    # ── Telegram ───────────────────────────────────────────
+    TELEGRAM_TOKEN:   str   = _require("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID: str   = _require("TELEGRAM_CHAT_ID")
 
-# ADX: solo bloquea tendencias fuertes (fade = lateral)
-ADX_LEN = _int("ADX_LEN", 14)
-ADX_MAX = _float("ADX_MAX", 40.0)   # subido a 40 — más pares elegibles
+    # ── Trading general ────────────────────────────────────
+    SYMBOLS:          list  = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT").split(",")]
+    TIMEFRAME:        str   = os.getenv("TIMEFRAME", "15m")
+    LEVERAGE:         int   = int(os.getenv("LEVERAGE", "5"))
+    RISK_PER_TRADE:   float = float(os.getenv("RISK_PER_TRADE", "1.5"))
 
-# RSI: confirmación overbought/oversold — relajado para más señales
-RSI_PERIOD = _int("RSI_PERIOD", 14)
-RSI_OB     = _float("RSI_OB", 55.0)   # SHORT si RSI > 55
-RSI_OS     = _float("RSI_OS", 45.0)   # LONG  si RSI < 45
+    # ── SAMA ───────────────────────────────────────────────
+    SAMA_LENGTH:      int   = int(os.getenv("SAMA_LENGTH", "200"))
+    SAMA_MAJ_LENGTH:  int   = int(os.getenv("SAMA_MAJ_LENGTH", "14"))
+    SAMA_MIN_LENGTH:  int   = int(os.getenv("SAMA_MIN_LENGTH", "6"))
+    SLOPE_PERIOD:     int   = int(os.getenv("SLOPE_PERIOD", "34"))
+    SLOPE_RANGE:      int   = int(os.getenv("SLOPE_RANGE", "25"))
+    SLOPE_FLAT:       int   = int(os.getenv("SLOPE_FLAT", "17"))
 
-VOL_FILTER        = _bool("VOL_FILTER", False)   # desactivado: ya tenemos RSI+ADX
-VOL_MULT          = _float("VOL_MULT", 1.0)
-TIME_STOP_MINUTES = _int("TIME_STOP_MINUTES", 45)
+    # ── Markov ─────────────────────────────────────────────
+    SLOPE_MIN:        float = float(os.getenv("SLOPE_MIN", "30.0"))
+    LOOKBACK_MARKOV:  int   = int(os.getenv("LOOKBACK_MARKOV", "200"))
+    PROB_THRESHOLD:   float = float(os.getenv("PROB_THRESHOLD", "40.0"))
 
-BREAKEVEN_ATR = _float("BREAKEVEN_ATR", 0.8)
-TRAIL_ATR     = _float("TRAIL_ATR", 1.5)
-TRAIL_DIST    = _float("TRAIL_DIST", 0.7)
+    # ── ADX Adaptativo ─────────────────────────────────────
+    ADX_LEN:          int   = int(os.getenv("ADX_LEN", "14"))
+    ADX_TREND:        int   = int(os.getenv("ADX_TREND", "25"))
+    ADX_RANGE:        int   = int(os.getenv("ADX_RANGE", "20"))
 
-LEVERAGE       = _int("LEVERAGE", 10)
-RISK_PCT       = _float("RISK_PCT", 1.5)
-MAX_POSITIONS  = _int("MAX_POSITIONS", 3)
-MAX_DAILY_LOSS = _float("MAX_DAILY_LOSS", 5.0)
-MIN_NOTIONAL   = _float("MIN_NOTIONAL", 5.0)
+    # ── Filtros institucionales ────────────────────────────
+    RVOL_MIN:         float = float(os.getenv("RVOL_MIN", "1.5"))
+    POC_LOOKBACK:     int   = int(os.getenv("POC_LOOKBACK", "50"))
+    PIVOT_LEN:        int   = int(os.getenv("PIVOT_LEN", "4"))
+    LIQUIDITY_LOOKBACK: int = int(os.getenv("LIQUIDITY_LOOKBACK", "20"))
 
-WHITELIST_ONLY  = _bool("WHITELIST_ONLY", True)
-TOP_PAIRS       = _int("TOP_PAIRS", 15)
-MIN_QUOTE_VOL   = _float("MIN_QUOTE_VOL", 10_000_000)
-MIN_PRICE_USDT  = _float("MIN_PRICE_USDT", 0.001)
-SCAN_INTERVAL_H = _int("SCAN_INTERVAL_H", 6)
+    # ── CVD ────────────────────────────────────────────────
+    CVD_SLOPE_PERIOD:       int = int(os.getenv("CVD_SLOPE_PERIOD", "8"))
+    CVD_DIVERGENCE_LOOKBACK: int = int(os.getenv("CVD_DIVERGENCE_LOOKBACK", "10"))
 
-PAIR_WHITELIST = [
-    "XRP-USDT",  "DOGE-USDT", "ADA-USDT",  "DOT-USDT",
-    "LINK-USDT", "ATOM-USDT", "UNI-USDT",  "OP-USDT",
-    "ARB-USDT",  "SUI-USDT",  "INJ-USDT",  "FIL-USDT",
-    "AVAX-USDT", "MATIC-USDT",
-]
+    # ── Funding Rate ───────────────────────────────────────
+    FUNDING_BULL_THRESHOLD: float = float(os.getenv("FUNDING_BULL_THRESHOLD", "-0.0001"))
+    FUNDING_BEAR_THRESHOLD: float = float(os.getenv("FUNDING_BEAR_THRESHOLD", "0.0005"))
 
-CANDLE_SLEEP = _int("CANDLE_SLEEP", 60)
-KLINE_LIMIT  = _int("KLINE_LIMIT", 150)
-PORT         = _int("PORT", 8080)
+    # ── Kotegawa ───────────────────────────────────────────
+    DIP_PCT:          float = float(os.getenv("DIP_PCT", "20.0"))
+    MA_LEN:           int   = int(os.getenv("MA_LEN", "25"))
+    RSI_LEN:          int   = int(os.getenv("RSI_LEN", "14"))
+    RSI_OVERSOLD:     float = float(os.getenv("RSI_OVERSOLD", "28.0"))
+    BB_LEN:           int   = int(os.getenv("BB_LEN", "20"))
+    BB_MULT:          float = float(os.getenv("BB_MULT", "2.0"))
+
+    # ── Triple barrera ─────────────────────────────────────
+    ATR_MULT_TP:      float = float(os.getenv("ATR_MULT_TP", "2.2"))
+    ATR_MULT_SL:      float = float(os.getenv("ATR_MULT_SL", "1.2"))
+    MAX_BARS_HOLD:    int   = int(os.getenv("MAX_BARS_HOLD", "24"))
+
+    # ── Scoring ────────────────────────────────────────────
+    MIN_SCORE:        float = float(os.getenv("MIN_SCORE", "55.0"))
+
+    # ── Riesgo global ──────────────────────────────────────
+    MAX_DAILY_LOSS_PCT:  float = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
+    MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
+    LOOP_INTERVAL:       int   = int(os.getenv("LOOP_INTERVAL", "60"))
+    HEALTH_PORT:         int   = int(os.getenv("HEALTH_PORT", "8080"))
+
+    def __repr__(self) -> str:
+        return (
+            f"<Config symbols={self.SYMBOLS} tf={self.TIMEFRAME} "
+            f"lev={self.LEVERAGE}x minScore={self.MIN_SCORE}>"
+        )
