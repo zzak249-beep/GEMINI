@@ -1,219 +1,257 @@
-import hashlib, hmac, json, logging, math, time, urllib.parse
-import aiohttp
-from typing import Optional
-import config
+"""
+bot/bingx_client.py
+Cliente asíncrono para BingX Perpetual Futures (USDT-M) vía CCXT.
 
-log = logging.getLogger("bingx")
+Maneja:
+  - Conexión y carga de exchange info (precisiones)
+  - Configuración de leverage (modo one-way por defecto)
+  - OHLCV, balance, posición abierta, funding rate
+  - Apertura con TP + SL automáticos
+  - Cierre de posición (barrera de tiempo)
+  - Cancelación de órdenes pendientes
+"""
+import asyncio
+import logging
+import math
+from typing import Optional
+
+import ccxt.async_support as ccxt
+import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+# Mapa de timeframe NEXUS → CCXT BingX
+_TF_MAP = {
+    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m",
+    "30m": "30m", "1h": "1h", "2h": "2h", "4h": "4h",
+    "6h": "6h", "12h": "12h", "1d": "1d",
+}
+
 
 class BingXClient:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.api_key = config.BINGX_API_KEY
-        self.secret  = config.BINGX_SECRET_KEY
-        self.session = session
-        self._contract_cache: dict = {}
-        self._position_mode = "BOTH"  # BOTH=one-way, LONG/SHORT=hedge
 
-    def _sign(self, params: dict) -> str:
-        query = urllib.parse.urlencode(sorted(params.items()))
-        return hmac.new(self.secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    def __init__(self, api_key: str, secret_key: str):
+        self.api_key    = api_key
+        self.secret_key = secret_key
+        self._exchange: Optional[ccxt.bingx] = None
+        self._markets:  dict = {}
 
-    def _build_url(self, path: str, params: dict) -> str:
-        return f"{config.BASE_URL}{path}?{urllib.parse.urlencode(sorted(params.items()))}"
+    # ─────────────────────────────────────────────────────────
+    # CONEXIÓN
+    # ─────────────────────────────────────────────────────────
 
-    def _headers(self): return {"X-BX-APIKEY": self.api_key}
+    async def connect(self) -> None:
+        self._exchange = ccxt.bingx({
+            "apiKey":  self.api_key,
+            "secret":  self.secret_key,
+            "options": {"defaultType": "swap"},  # perpetual futures
+        })
+        await self._exchange.load_markets()
+        self._markets = self._exchange.markets
+        logger.info(f"BingX conectado — {len(self._markets)} mercados cargados")
 
-    async def _get(self, path, params=None, signed=False):
-        p = dict(params or {})
-        if signed:
-            p["timestamp"] = int(time.time() * 1000)
-            p["signature"] = self._sign(p)
-        url = self._build_url(path, p) if p else f"{config.BASE_URL}{path}"
+    async def disconnect(self) -> None:
+        if self._exchange:
+            await self._exchange.close()
+
+    # ─────────────────────────────────────────────────────────
+    # UTILIDADES DE PRECISIÓN
+    # ─────────────────────────────────────────────────────────
+
+    def _get_market(self, symbol: str) -> dict:
+        return self._markets.get(symbol, {})
+
+    def _round_price(self, symbol: str, price: float) -> float:
+        mkt  = self._get_market(symbol)
+        prec = mkt.get("precision", {}).get("price", 0.01)
+        if prec and prec > 0:
+            return round(math.floor(price / prec) * prec, 8)
+        return round(price, 4)
+
+    def _round_qty(self, symbol: str, qty: float) -> float:
+        mkt  = self._get_market(symbol)
+        prec = mkt.get("precision", {}).get("amount", 0.001)
+        if prec and prec > 0:
+            return round(math.floor(qty / prec) * prec, 8)
+        return round(qty, 4)
+
+    def _min_qty(self, symbol: str) -> float:
+        mkt = self._get_market(symbol)
+        return float(mkt.get("limits", {}).get("amount", {}).get("min", 0.001) or 0.001)
+
+    # ─────────────────────────────────────────────────────────
+    # CONFIGURACIÓN DE SÍMBOLO
+    # ─────────────────────────────────────────────────────────
+
+    async def setup_symbol(self, symbol: str, leverage: int) -> None:
         try:
-            async with self.session.get(url, headers=self._headers()) as r:
-                return await r.json(content_type=None)
+            await self._exchange.set_leverage(leverage, symbol)
+            logger.info(f"{symbol}: leverage={leverage}x configurado")
         except Exception as e:
-            log.error(f"GET {path}: {e}"); raise
+            if "No need to change" not in str(e):
+                logger.warning(f"setup_symbol {symbol}: {e}")
 
-    async def _post(self, path, params):
-        p = dict(params)
-        p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = self._sign(p)
+    # ─────────────────────────────────────────────────────────
+    # DATOS DE MERCADO
+    # ─────────────────────────────────────────────────────────
+
+    async def get_klines(self, symbol: str, timeframe: str,
+                         limit: int = 300) -> Optional[pd.DataFrame]:
+        tf = _TF_MAP.get(timeframe, timeframe)
         try:
-            async with self.session.post(self._build_url(path, p), headers=self._headers()) as r:
-                data = await r.json(content_type=None)
-                if data.get("code", 0) != 0:
-                    log.error(f"POST {path} code={data.get('code')} msg={data.get('msg','?')}")
-                return data
+            raw = await self._exchange.fetch_ohlcv(symbol, tf, limit=limit)
+            if not raw:
+                return None
+            df = pd.DataFrame(raw, columns=["open_time", "open", "high", "low", "close", "volume"])
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df.set_index("open_time", inplace=True)
+            return df
         except Exception as e:
-            log.error(f"POST {path}: {e}"); raise
+            logger.error(f"get_klines {symbol}: {e}")
+            return None
 
-    # ── Market Data ───────────────────────────────────────────────────
-    async def get_contracts(self):
-        r = await self._get("/openApi/swap/v2/quote/contracts")
-        data = r.get("data", []) or []
-        for c in data:
-            if c.get("symbol"): self._contract_cache[c["symbol"]] = c
-        return data
-
-    async def get_tickers(self):
-        r = await self._get("/openApi/swap/v2/quote/ticker")
-        d = r.get("data", [])
-        return d if isinstance(d, list) else []
-
-    async def get_klines(self, symbol, interval="1m", limit=100):
-        r = await self._get("/openApi/swap/v3/quote/klines",
-                            {"symbol": symbol, "interval": interval, "limit": limit})
-        return r.get("data", []) or []
-
-    async def get_24h_volume_history(self, symbol):
-        r = await self._get("/openApi/swap/v3/quote/klines",
-                            {"symbol": symbol, "interval": "1d", "limit": 8})
-        return r.get("data", []) or []
-
-    # ── Balance — intenta múltiples endpoints y formatos ──────────────
     async def get_balance(self) -> float:
-        endpoints = [
-            "/openApi/swap/v2/user/balance",
-            "/openApi/swap/v3/user/balance",
-        ]
-        for ep in endpoints:
-            try:
-                r = await self._get(ep, signed=True)
-                log.info(f"balance {ep}: {str(r)[:300]}")
-                v = self._parse_balance(r)
-                if v > 0:
-                    return v
-            except Exception as e:
-                log.warning(f"balance {ep} failed: {e}")
-        log.warning("⚠️ balance=0 — verifica API key y fondos en Futuros Perpetuos")
-        return 0.0
-
-    def _parse_balance(self, r: dict) -> float:
-        """Intenta extraer el balance disponible de múltiples formatos de respuesta."""
-        keys = ("availableMargin", "available", "crossAvailableBalance",
-                "availableBalance", "equity", "balance", "crossWalletBalance",
-                "withdrawAvailable")
-        # data es dict
-        d = r.get("data", {})
-        if isinstance(d, dict):
-            # Formato: data.balance.availableMargin
-            bal = d.get("balance", {})
-            if isinstance(bal, dict):
-                for k in keys:
-                    try:
-                        v = float(bal.get(k, 0))
-                        if v > 0: return v
-                    except: pass
-            # Formato plano: data.availableMargin
-            for k in keys:
-                try:
-                    v = float(d.get(k, 0))
-                    if v > 0: return v
-                except: pass
-            # Buscar recursivo un nivel más
-            for subkey, subval in d.items():
-                if isinstance(subval, dict):
-                    for k in keys:
-                        try:
-                            v = float(subval.get(k, 0))
-                            if v > 0: return v
-                        except: pass
-        # data es lista
-        if isinstance(d, list):
-            for item in d:
-                if isinstance(item, dict):
-                    for k in keys:
-                        try:
-                            v = float(item.get(k, 0))
-                            if v > 0: return v
-                        except: pass
-        return 0.0
-
-    async def get_positions(self):
-        r = await self._get("/openApi/swap/v2/user/positions", signed=True)
-        d = r.get("data", [])
-        return d if isinstance(d, list) else []
-
-    # ── Detectar modo de posición de la cuenta ────────────────────────
-    async def detect_position_mode(self):
-        """Detecta si la cuenta está en one-way (BOTH) o hedge mode (LONG/SHORT)."""
+        """Saldo USDT disponible (wallet balance)."""
         try:
-            r = await self._get("/openApi/swap/v2/trade/positionSide/dual", signed=True)
-            dual = r.get("data", {}).get("dualSidePosition", False)
-            self._position_mode = "LONG" if dual else "BOTH"
-            log.info(f"Position mode: {'HEDGE' if dual else 'ONE-WAY'} → positionSide={self._position_mode}")
+            balance = await self._exchange.fetch_balance()
+            usdt = balance.get("USDT", {})
+            return float(usdt.get("total", 0.0) or 0.0)
         except Exception as e:
-            log.warning(f"detect_position_mode: {e} — usando BOTH")
-            self._position_mode = "BOTH"
+            logger.error(f"get_balance: {e}")
+            return 0.0
 
-    # ── Qty Precision ─────────────────────────────────────────────────
-    async def get_qty_precision(self, symbol: str) -> int:
-        if symbol not in self._contract_cache: await self.get_contracts()
-        c = self._contract_cache.get(symbol, {})
+    async def get_position(self, symbol: str) -> Optional[dict]:
         try:
-            p = c.get("quantityPrecision")
-            if p is not None: return int(p)
-        except: pass
+            positions = await self._exchange.fetch_positions([symbol])
+            for p in positions:
+                if p["symbol"] == symbol:
+                    size = float(p.get("contracts", 0) or 0)
+                    side_raw = p.get("side", "")
+                    side = "LONG" if side_raw == "long" else ("SHORT" if side_raw == "short" else "FLAT")
+                    if size == 0:
+                        side = "FLAT"
+                    return {
+                        "symbol":      symbol,
+                        "size":        size if side == "LONG" else -size if side == "SHORT" else 0,
+                        "side":        side,
+                        "entry_price": float(p.get("entryPrice", 0) or 0),
+                        "unrealized":  float(p.get("unrealizedPnl", 0) or 0),
+                        "leverage":    int(p.get("leverage", 1) or 1),
+                    }
+            return None
+        except Exception as e:
+            logger.error(f"get_position {symbol}: {e}")
+            return None
+
+    async def get_funding_rate(self, symbol: str) -> float:
+        """Tasa de financiación actual del par."""
         try:
-            s = str(c.get("tradeMinQuantity", "0.001"))
-            if "." in s: return len(s.split(".")[1].rstrip("0")) or 1
-            return 0
-        except: return 3
+            fr = await self._exchange.fetch_funding_rate(symbol)
+            return float(fr.get("fundingRate", 0.0) or 0.0)
+        except Exception as e:
+            logger.debug(f"get_funding_rate {symbol}: {e}")
+            return 0.0
 
-    def _floor_qty(self, qty: float, precision: int) -> float:
-        f = 10 ** precision
-        return math.floor(qty * f) / f
+    # ─────────────────────────────────────────────────────────
+    # ÓRDENES
+    # ─────────────────────────────────────────────────────────
 
-    # ── Leverage ──────────────────────────────────────────────────────
-    async def set_leverage(self, symbol: str, leverage: int):
-        for side in ("LONG", "SHORT"):
-            try:
-                r = await self._post("/openApi/swap/v2/trade/leverage",
-                                     {"symbol": symbol, "side": side, "leverage": leverage})
-                if r.get("code", 0) not in (0, 80001, -1130):
-                    log.warning(f"[{symbol}] leverage {side}: {r.get('msg','')}")
-            except Exception as e:
-                log.warning(f"[{symbol}] leverage: {e}")
+    async def open_long(self, symbol: str, qty: float,
+                        tp_price: float, sl_price: float) -> Optional[dict]:
+        qty = self._round_qty(symbol, qty)
+        tp  = self._round_price(symbol, tp_price)
+        sl  = self._round_price(symbol, sl_price)
 
-    # ── Orden ─────────────────────────────────────────────────────────
-    async def place_market_order(self, symbol, side, qty, stop_loss, take_profit):
-        prec    = await self.get_qty_precision(symbol)
-        qty_adj = self._floor_qty(qty, prec)
-        if qty_adj <= 0:
-            return {"code": -1, "msg": f"qty_adj={qty_adj}<=0 (prec={prec} qty={qty:.8f})"}
+        if qty < self._min_qty(symbol):
+            logger.warning(f"{symbol}: qty {qty} < mínimo {self._min_qty(symbol)}")
+            return None
 
-        sl_str = json.dumps({"type":"STOP_MARKET","stopPrice":round(stop_loss,6),
-                             "workingType":"MARK_PRICE"}, separators=(',',':'))
-        tp_str = json.dumps({"type":"TAKE_PROFIT_MARKET","stopPrice":round(take_profit,6),
-                             "workingType":"MARK_PRICE"}, separators=(',',':'))
+        try:
+            # 1. Orden de mercado
+            entry = await self._exchange.create_order(
+                symbol=symbol, type="market", side="buy", amount=qty
+            )
+            logger.info(f"{symbol} LONG abierto qty={qty} ~{tp_price:.4f} TP / {sl_price:.4f} SL")
 
-        # Determinar positionSide según modo de cuenta
-        pos_side = self._position_mode  # "BOTH" o "LONG"/"SHORT"
-        if self._position_mode != "BOTH":
-            pos_side = "LONG" if side == "BUY" else "SHORT"
+            # 2. TP
+            await self._exchange.create_order(
+                symbol=symbol, type="TAKE_PROFIT_MARKET", side="sell", amount=qty,
+                params={"stopPrice": tp, "closePosition": True, "workingType": "MARK_PRICE"}
+            )
+            # 3. SL
+            await self._exchange.create_order(
+                symbol=symbol, type="STOP_MARKET", side="sell", amount=qty,
+                params={"stopPrice": sl, "closePosition": True, "workingType": "MARK_PRICE"}
+            )
+            return {"order": entry, "tp": tp, "sl": sl, "qty": qty, "side": "LONG"}
 
-        log.info(f"[{symbol}] ORDER {side} qty={qty_adj} positionSide={pos_side} "
-                 f"SL={stop_loss:.5g} TP={take_profit:.5g}")
+        except Exception as e:
+            logger.error(f"open_long {symbol}: {e}")
+            return None
 
-        return await self._post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side, "positionSide": pos_side,
-            "type": "MARKET", "quantity": qty_adj,
-            "stopLoss": sl_str, "takeProfit": tp_str,
-        })
+    async def open_short(self, symbol: str, qty: float,
+                         tp_price: float, sl_price: float) -> Optional[dict]:
+        qty = self._round_qty(symbol, qty)
+        tp  = self._round_price(symbol, tp_price)
+        sl  = self._round_price(symbol, sl_price)
 
-    async def close_position_market(self, symbol, side, qty):
-        prec     = await self.get_qty_precision(symbol)
-        qty_adj  = self._floor_qty(qty, prec)
-        pos_side = self._position_mode
-        if self._position_mode != "BOTH":
-            pos_side = "LONG" if side == "BUY" else "SHORT"
-        return await self._post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol,
-            "side": "SELL" if side == "BUY" else "BUY",
-            "positionSide": pos_side, "type": "MARKET",
-            "quantity": qty_adj,
-        })
+        if qty < self._min_qty(symbol):
+            logger.warning(f"{symbol}: qty {qty} < mínimo {self._min_qty(symbol)}")
+            return None
 
-    async def get_symbol_info(self, symbol) -> Optional[dict]:
-        if symbol not in self._contract_cache: await self.get_contracts()
-        return self._contract_cache.get(symbol)
+        try:
+            entry = await self._exchange.create_order(
+                symbol=symbol, type="market", side="sell", amount=qty
+            )
+            logger.info(f"{symbol} SHORT abierto qty={qty} ~{tp_price:.4f} TP / {sl_price:.4f} SL")
+
+            await self._exchange.create_order(
+                symbol=symbol, type="TAKE_PROFIT_MARKET", side="buy", amount=qty,
+                params={"stopPrice": tp, "closePosition": True, "workingType": "MARK_PRICE"}
+            )
+            await self._exchange.create_order(
+                symbol=symbol, type="STOP_MARKET", side="buy", amount=qty,
+                params={"stopPrice": sl, "closePosition": True, "workingType": "MARK_PRICE"}
+            )
+            return {"order": entry, "tp": tp, "sl": sl, "qty": qty, "side": "SHORT"}
+
+        except Exception as e:
+            logger.error(f"open_short {symbol}: {e}")
+            return None
+
+    async def close_position(self, symbol: str, position: dict) -> Optional[dict]:
+        """Cierre de mercado para barrera de tiempo."""
+        size = abs(position.get("size", 0))
+        if size == 0:
+            return None
+        qty  = self._round_qty(symbol, size)
+        side = "sell" if position["side"] == "LONG" else "buy"
+        try:
+            await self.cancel_all_orders(symbol)
+            order = await self._exchange.create_order(
+                symbol=symbol, type="market", side=side, amount=qty,
+                params={"reduceOnly": True}
+            )
+            logger.info(f"{symbol}: posición cerrada por barrera de tiempo")
+            return order
+        except Exception as e:
+            logger.error(f"close_position {symbol}: {e}")
+            return None
+
+    async def cancel_all_orders(self, symbol: str) -> None:
+        try:
+            await self._exchange.cancel_all_orders(symbol)
+        except Exception as e:
+            logger.debug(f"cancel_all_orders {symbol}: {e}")
+
+    async def get_last_trade_pnl(self, symbol: str) -> float:
+        try:
+            trades = await self._exchange.fetch_my_trades(symbol, limit=5)
+            if trades:
+                return float(trades[-1].get("info", {}).get("realizedPnl", 0) or 0)
+            return 0.0
+        except Exception as e:
+            logger.debug(f"get_last_trade_pnl {symbol}: {e}")
+            return 0.0
