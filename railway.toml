@@ -1,11 +1,11 @@
-# railway.toml
 [build]
-builder = "nixpacks"
+builder = "NIXPACKS"
+nixpacksPlan = "python"
+
+[build.nixpacksConfig]
+providers = ["python"]
 
 [deploy]
-startCommand = "node src/bot.js"
-restartPolicyType = "on_failure"
+startCommand = "python main.py"
+restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-
-[env]
-NODE_ENV = "production"
