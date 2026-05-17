@@ -1,7 +1,5 @@
-[build]
-builder = "NIXPACKS"
-
-[deploy]
-startCommand = "python main.py"
-restartPolicyType = "ON_FAILURE"
-restartPolicyMaxRetries = 10
+FROM node:18-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+CMD ["node", "bot.js"]
