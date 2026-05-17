@@ -1,9 +1,5 @@
 [build]
 builder = "NIXPACKS"
-nixpacksPlan = "python"
-
-[build.nixpacksConfig]
-providers = ["python"]
 
 [deploy]
 startCommand = "python main.py"
