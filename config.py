@@ -1,90 +1,132 @@
 """
-config.py — Carga y valida todas las variables de entorno del NEXUS Bot.
+Configuración Central — QF Machine × JP Fusion Bot v3
+Todos los parámetros del indicador y del bot en un solo lugar.
 """
-import os
-from dotenv import load_dotenv
 
-load_dotenv()
+# ── Temporalidades ────────────────────────────────────────────
+HTF = "15m"   # Higher timeframe para confirmación de régimen
 
+# ── Símbolos a operar ─────────────────────────────────────────
+# Añade o quita según tu capital. Más símbolos = más oportunidades
+# pero más margen utilizado. Empieza con 1-2 en paper.
+SYMBOLS = [
+    "BTC-USDT",
+    "ETH-USDT",
+]
 
-def _require(key: str) -> str:
-    val = os.getenv(key)
-    if not val:
-        raise EnvironmentError(f"Variable requerida no encontrada: {key}")
-    return val
+# ── Señal: parámetros del indicador (espejo del Pine Script) ──
+SIGNAL_CFG = {
+    # L1 / General
+    "smo":      3,      # Suavizado de señal
+    "atr_len":  10,     # Longitud ATR
 
+    # L2 Factores
+    "mom":      20,     # Lookback momentum
+    "rev":      8,      # Lookback media-reversión
+    "vol_len":  14,     # Longitud volumen OBV
+    "w1":       0.40,   # Peso momentum
+    "w2":       0.30,   # Peso media-rev
+    "w3":       0.30,   # Peso volumen
 
-class Config:
-    # ── BingX ──────────────────────────────────────────────
-    BINGX_API_KEY:    str   = _require("BINGX_API_KEY")
-    BINGX_SECRET_KEY: str   = _require("BINGX_SECRET_KEY")
+    # L3 Decaimiento
+    "dlen":     40,     # Ventana decaimiento
+    "dthr":     0.50,   # Umbral vida media
 
-    # ── Telegram ───────────────────────────────────────────
-    TELEGRAM_TOKEN:   str   = _require("TELEGRAM_TOKEN")
-    TELEGRAM_CHAT_ID: str   = _require("TELEGRAM_CHAT_ID")
+    # L4 Dark Pool
+    "dpm":      2.5,    # Multiplicador volumen spike
+    "dpb":      20,     # Baseline dark pool (barras)
+    "spl":      5,      # Longitud spread
 
-    # ── Trading general ────────────────────────────────────
-    SYMBOLS:          list  = [s.strip() for s in os.getenv("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT").split(",")]
-    TIMEFRAME:        str   = os.getenv("TIMEFRAME", "15m")
-    LEVERAGE:         int   = int(os.getenv("LEVERAGE", "5"))
-    RISK_PER_TRADE:   float = float(os.getenv("RISK_PER_TRADE", "1.5"))
+    # L5 Ejecución
+    "exl":      12,     # Baseline ejecución
+    "bpt":      0.18,   # Umbral drenaje BP (%)
 
-    # ── SAMA ───────────────────────────────────────────────
-    SAMA_LENGTH:      int   = int(os.getenv("SAMA_LENGTH", "200"))
-    SAMA_MAJ_LENGTH:  int   = int(os.getenv("SAMA_MAJ_LENGTH", "14"))
-    SAMA_MIN_LENGTH:  int   = int(os.getenv("SAMA_MIN_LENGTH", "6"))
-    SLOPE_PERIOD:     int   = int(os.getenv("SLOPE_PERIOD", "34"))
-    SLOPE_RANGE:      int   = int(os.getenv("SLOPE_RANGE", "25"))
-    SLOPE_FLAT:       int   = int(os.getenv("SLOPE_FLAT", "17"))
+    # L6 Asimetría
+    "asl":      10,     # Ventana asimetría
+    "arr":      1.40,   # Ratio alcista/bajista
+    "abr":      1.40,   # Ratio bajista/alcista
 
-    # ── Markov ─────────────────────────────────────────────
-    SLOPE_MIN:        float = float(os.getenv("SLOPE_MIN", "30.0"))
-    LOOKBACK_MARKOV:  int   = int(os.getenv("LOOKBACK_MARKOV", "200"))
-    PROB_THRESHOLD:   float = float(os.getenv("PROB_THRESHOLD", "40.0"))
+    # L7 Trendline
+    "tlb":      30,     # Lookback TL pivotes
+    "tll":      5,      # Pivote barras izq
+    "tlr":      3,      # Pivote barras der
+    "tlm":      0.15,   # Buffer ruptura (ATR)
 
-    # ── ADX Adaptativo ─────────────────────────────────────
-    ADX_LEN:          int   = int(os.getenv("ADX_LEN", "14"))
-    ADX_TREND:        int   = int(os.getenv("ADX_TREND", "25"))
-    ADX_RANGE:        int   = int(os.getenv("ADX_RANGE", "20"))
+    # L8 Swing Analysis
+    "pll":      5,      # Swing low izq
+    "plr":      3,      # Swing low der
+    "phl":      5,      # Swing high izq
+    "phr":      3,      # Swing high der
+    "hlc":      2,      # Min HL ascendentes
+    "hhc":      2,      # Min LH descendentes
+    "hlw":      40,     # Ventana análisis
 
-    # ── Filtros institucionales ────────────────────────────
-    RVOL_MIN:         float = float(os.getenv("RVOL_MIN", "1.5"))
-    POC_LOOKBACK:     int   = int(os.getenv("POC_LOOKBACK", "50"))
-    PIVOT_LEN:        int   = int(os.getenv("PIVOT_LEN", "4"))
-    LIQUIDITY_LOOKBACK: int = int(os.getenv("LIQUIDITY_LOOKBACK", "20"))
+    # L9 FVG
+    "fvg_min":  0.3,    # Tamaño mínimo (× ATR)
+    "fvg_bars": 40,     # Validez FVG (barras)
 
-    # ── CVD ────────────────────────────────────────────────
-    CVD_SLOPE_PERIOD:       int = int(os.getenv("CVD_SLOPE_PERIOD", "8"))
-    CVD_DIVERGENCE_LOOKBACK: int = int(os.getenv("CVD_DIVERGENCE_LOOKBACK", "10"))
+    # L10 Order Blocks
+    "ob_imp":   1.5,    # Impulso mínimo (× ATR)
+    "ob_bars":  50,     # Validez OB (barras)
 
-    # ── Funding Rate ───────────────────────────────────────
-    FUNDING_BULL_THRESHOLD: float = float(os.getenv("FUNDING_BULL_THRESHOLD", "-0.0001"))
-    FUNDING_BEAR_THRESHOLD: float = float(os.getenv("FUNDING_BEAR_THRESHOLD", "0.0005"))
+    # L11 CVD Delta
+    "cvd_len":  20,     # EMA CVD
+    "cvd_div":  5,      # Ventana divergencia
 
-    # ── Kotegawa ───────────────────────────────────────────
-    DIP_PCT:          float = float(os.getenv("DIP_PCT", "20.0"))
-    MA_LEN:           int   = int(os.getenv("MA_LEN", "25"))
-    RSI_LEN:          int   = int(os.getenv("RSI_LEN", "14"))
-    RSI_OVERSOLD:     float = float(os.getenv("RSI_OVERSOLD", "28.0"))
-    BB_LEN:           int   = int(os.getenv("BB_LEN", "20"))
-    BB_MULT:          float = float(os.getenv("BB_MULT", "2.0"))
+    # L12 Squeeze
+    "sq_len":   20,     # Longitud squeeze
+    "sq_bbm":   2.0,    # Multiplicador BB
+    "sq_kcm":   1.5,    # Multiplicador KC
+}
 
-    # ── Triple barrera ─────────────────────────────────────
-    ATR_MULT_TP:      float = float(os.getenv("ATR_MULT_TP", "2.2"))
-    ATR_MULT_SL:      float = float(os.getenv("ATR_MULT_SL", "1.2"))
-    MAX_BARS_HOLD:    int   = int(os.getenv("MAX_BARS_HOLD", "24"))
+# ── Riesgo ────────────────────────────────────────────────────
+RISK_CFG = {
+    # Capital inicial (sincronizar con equity real de BingX)
+    "initial_equity": 500.0,   # USDT
 
-    # ── Scoring ────────────────────────────────────────────
-    MIN_SCORE:        float = float(os.getenv("MIN_SCORE", "55.0"))
+    # Leverage (BingX soporta hasta 100x; usa poco mientras validas)
+    "leverage": 5,
 
-    # ── Riesgo global ──────────────────────────────────────
-    MAX_DAILY_LOSS_PCT:  float = float(os.getenv("MAX_DAILY_LOSS_PCT", "3.0"))
-    MAX_OPEN_POSITIONS:  int   = int(os.getenv("MAX_OPEN_POSITIONS", "2"))
-    LOOP_INTERVAL:       int   = int(os.getenv("LOOP_INTERVAL", "60"))
-    HEALTH_PORT:         int   = int(os.getenv("HEALTH_PORT", "8080"))
+    # Riesgo por operación (% del equity) según tier
+    "risk_pct_suprema": 1.5,   # Señal más fuerte
+    "risk_pct_fuel":    1.0,
+    "risk_pct_std":     0.5,
+    "risk_pct_max":     2.0,   # Techo absoluto, nunca superado
 
-    def __repr__(self) -> str:
-        return (
-            f"<Config symbols={self.SYMBOLS} tf={self.TIMEFRAME} "
-            f"lev={self.LEVERAGE}x minScore={self.MIN_SCORE}>"
-        )
+    # Ratio Reward:Risk según tier
+    "rr_suprema": 3.0,
+    "rr_fuel":    2.5,
+    "rr_std":     2.0,
+
+    # Circuit Breakers
+    "max_daily_loss_pct":      3.0,   # Pérdida máxima diaria (% equity)
+    "max_drawdown_pct":       15.0,   # DD máximo desde pico (para siempre)
+    "max_consecutive_losses":   4,    # Pérdidas seguidas antes de pausa
+    "max_daily_trades":        10,    # Máx operaciones por día
+}
+
+# ── HUNT MODE — opera con Score + Decay altos aunque no se cumplan todas las capas ──
+# Esto captura señales cuando Decay>57% y Score>86% como ves en el dashboard
+# hunt_score_thr: norm_score mínimo (0.08 = 8/100, ajusta según tus tests)
+# hunt_decay_thr: decay ratio mínimo (0.35 = 35%, pon 0.57 para tu umbral exacto)
+HUNT_CFG = {
+    "hunt_score_thr": 0.08,   # score normalizado (≈ 8/100 en el dashboard)
+    "hunt_decay_thr": 0.35,   # decay ratio (35% — sube a 0.57 para ser más selectivo)
+    "hunt_min_conviction": 1, # convicción mínima para HUNT (muy permisivo)
+}
+
+# Añadir a SIGNAL_CFG
+SIGNAL_CFG["hunt_score_thr"] = HUNT_CFG["hunt_score_thr"]
+SIGNAL_CFG["hunt_decay_thr"] = HUNT_CFG["hunt_decay_thr"]
+
+# ── Scanner de mercado ────────────────────────────────────────
+# Variables de entorno para Railway (pueden sobreescribirse):
+# MIN_VOLUME=200000       → volumen mínimo 24h en USDT para incluir un par
+# SCAN_CONCURRENCY=20     → pares analizados en paralelo (más = más rápido, más RAM)
+# SCAN_INTERVAL_S=180     → segundos entre scans (180 = cada 3 min, igual que TF)
+# SCAN_MAX_NOTIFY=3       → máx señales notificadas por scan
+# SUMMARY_EVERY=10        → resumen cada N scans
+# MAX_OPEN_POSITIONS=3    → máx posiciones simultáneas del scanner
+# MIN_TIER_TO_TRADE=HUNT_LONG → tier mínimo para abrir posición automática
+# SCAN_COOLDOWN_MIN=15    → minutos de espera entre señales del mismo par
+# HUNT_MIN_CONVICTION=1   → convicción mínima para señales HUNT
