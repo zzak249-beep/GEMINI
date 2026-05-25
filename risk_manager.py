@@ -1,153 +1,111 @@
 """
-bot/risk_manager.py
-Gestión de riesgo profesional para NEXUS Bot:
-  - Kelly fraccional (1/4 Kelly) para sizing óptimo
-  - Triple Barrera: TP / SL (gestionados por BingX) + tiempo
-  - Protección de drawdown diario
-  - Cooldown post-pérdida por símbolo
-  - Límite de posiciones simultáneas
+risk_manager.py — Sizing · Cooldown · Límite diario
 """
-import logging
-from datetime import date, datetime, timezone
-from dataclasses import dataclass, field
+import json, logging, os, time
+from datetime import datetime, timezone
+import config as C
+from strategy import Signal
 
-from config import Config
-from bot.strategy import SignalResult
-
-logger = logging.getLogger(__name__)
-
-
-@dataclass
-class PositionState:
-    symbol:      str
-    side:        str         # LONG | SHORT
-    entry_price: float
-    quantity:    float
-    tp_price:    float
-    sl_price:    float
-    entry_bar:   int
-    open_time:   datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+log = logging.getLogger(__name__)
+STATE_FILE = "state.json"
 
 
 class RiskManager:
+    def __init__(self):
+        self.daily_pnl        = 0.0
+        self.daily_date       = ""
+        self.cooldown_until   = 0
+        self.consecutive_loss = 0
+        self._load()
 
-    def __init__(self, config: Config):
-        self.cfg              = config
-        self._daily_loss      = 0.0
-        self._last_reset_day  = date.today()
-        self._cooldown_until: dict[str, datetime] = {}
-        self._open_count      = 0
+    def _load(self):
+        if os.path.exists(STATE_FILE):
+            try:
+                s = json.load(open(STATE_FILE))
+                self.daily_pnl        = s.get("daily_pnl", 0.0)
+                self.daily_date       = s.get("daily_date", "")
+                self.cooldown_until   = s.get("cooldown_until", 0)
+                self.consecutive_loss = s.get("consecutive_loss", 0)
+                log.info(f"Estado: pnl={self.daily_pnl:.2f} cooldown={self.cooldown_until}")
+            except Exception as e:
+                log.warning(f"state.json: {e}")
+        self._reset_daily()
 
-    # ─────────────────────────────────────────────────────────
-    # GUARDS DE ENTRADA
-    # ─────────────────────────────────────────────────────────
+    def _save(self):
+        json.dump({
+            "daily_pnl":        self.daily_pnl,
+            "daily_date":       self.daily_date,
+            "cooldown_until":   self.cooldown_until,
+            "consecutive_loss": self.consecutive_loss,
+        }, open(STATE_FILE, "w"))
 
-    def can_trade(self, symbol: str) -> bool:
-        self._reset_daily_if_needed()
+    def _reset_daily(self):
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.daily_date != today:
+            self.daily_pnl  = 0.0
+            self.daily_date = today
+            self._save()
 
-        if self._open_count >= self.cfg.MAX_OPEN_POSITIONS:
-            logger.debug(f"{symbol}: límite de posiciones simultáneas")
-            return False
+    # ── Sizing dinámico ────────────────────────────────────────
 
-        if self._is_cooldown(symbol):
-            logger.debug(f"{symbol}: en cooldown post-pérdida")
-            return False
+    def position_size(self, balance: float, signal: Signal) -> float:
+        if balance <= 0 or signal.atr_val == 0:
+            return 0.0
+        risk_usdt = balance * C.RISK_PER_TRADE
+        # FUERTE → 100% del riesgo, NORMAL → 70%
+        quality_mult = 1.0 if signal.quality == "FUERTE" else 0.7
+        # Reducción por pérdidas consecutivas
+        loss_mult = max(0.3, 1.0 - self.consecutive_loss * 0.2)
+        risk_usdt *= quality_mult * loss_mult
+        sl_dist = abs(signal.entry - signal.sl)
+        if sl_dist == 0:
+            return 0.0
+        qty = (risk_usdt / sl_dist) / C.LEVERAGE
+        log.info(f"Sizing: balance={balance:.2f} risk={risk_usdt:.2f} "
+                 f"sl_dist={sl_dist:.5f} qty={qty:.6f}")
+        return max(qty, 0.0)
 
-        if self._daily_loss >= self.cfg.MAX_DAILY_LOSS_PCT:
-            logger.warning(f"Daily loss {self._daily_loss:.2f}% ≥ {self.cfg.MAX_DAILY_LOSS_PCT}% — pausando")
-            return False
+    # ── Validaciones ───────────────────────────────────────────
 
-        return True
+    def can_trade(self, balance: float, n_positions: int) -> tuple:
+        self._reset_daily()
+        if time.time() < self.cooldown_until:
+            mins = int((self.cooldown_until - time.time()) / 60)
+            return False, f"Cooldown activo — {mins}min restantes"
+        if n_positions >= C.MAX_POSITIONS:
+            return False, f"Máximo posiciones ({C.MAX_POSITIONS}) alcanzado"
+        if balance <= 0:
+            return False, "Balance cero"
+        if self.daily_pnl < 0 and abs(self.daily_pnl) / max(balance, 1) >= C.DAILY_LOSS_LIMIT:
+            return False, f"Límite diario: {self.daily_pnl:.2f} USDT"
+        return True, "OK"
 
-    def register_open(self, symbol: str) -> None:
-        self._open_count = max(0, self._open_count + 1)
+    def anti_hedge(self, direction: str, positions: list) -> tuple:
+        for p in positions:
+            amt = float(p.get("positionAmt", 0))
+            if direction == "LONG"  and amt < 0: return False, "SHORT abierto"
+            if direction == "SHORT" and amt > 0: return False, "LONG abierto"
+        return True, "OK"
 
-    def register_close(self, symbol: str, pnl_pct: float) -> None:
-        self._open_count = max(0, self._open_count - 1)
-        self._reset_daily_if_needed()
+    # ── Registro resultado ─────────────────────────────────────
 
-        if pnl_pct < 0:
-            self._daily_loss += abs(pnl_pct)
-            cool_secs = self.cfg.LOOP_INTERVAL * 2
-            self._cooldown_until[symbol] = datetime.now(timezone.utc).replace(
-                second=datetime.now(timezone.utc).second
-            ).__class__.fromtimestamp(
-                datetime.now(timezone.utc).timestamp() + cool_secs, tz=timezone.utc
-            )
-            logger.info(f"{symbol}: cooldown {cool_secs}s tras pérdida {pnl_pct:.2f}%")
-
-    # ─────────────────────────────────────────────────────────
-    # SIZING — KELLY FRACCIONAL
-    # ─────────────────────────────────────────────────────────
-
-    def calculate_position_size(self, signal: SignalResult,
-                                balance_usdt: float) -> float:
-        """
-        1/4 Kelly con probability de Markov + límite RISK_PER_TRADE%.
-        qty = (notional con leverage) / entry_price
-        """
-        rr     = self.cfg.ATR_MULT_TP / self.cfg.ATR_MULT_SL   # ej: 2.2/1.2 = 1.83
-
-        raw_p  = signal.prob_bull if signal.long else signal.prob_bear
-        p_win  = max(0.45, min(0.75, raw_p / 100.0))           # clip conservador
-
-        kelly_full = (p_win * rr - (1 - p_win)) / rr
-        kelly_frac = max(0.0, kelly_full / 4)                   # 1/4 Kelly
-
-        # Bonus de confianza si score alto
-        score_bonus = min(0.3, (signal.score - 55) / 100)       # +0 a +0.3 según score
-        kelly_frac  = min(kelly_frac * (1 + score_bonus), self.cfg.RISK_PER_TRADE / 100)
-
-        risk_pct   = min(kelly_frac * 100, self.cfg.RISK_PER_TRADE)
-        risk_usdt  = balance_usdt * (risk_pct / 100.0)
-        notional   = risk_usdt * self.cfg.LEVERAGE
-        qty        = notional / signal.entry_price if signal.entry_price > 0 else 0.0
-
-        logger.info(
-            f"Kelly sizing [{signal.symbol}]: p_win={p_win:.2%} rr={rr:.2f} "
-            f"kelly_frac={kelly_frac:.3f} risk={risk_pct:.2f}% qty={qty:.6f}"
-        )
-        return qty
-
-    # ─────────────────────────────────────────────────────────
-    # TRIPLE BARRERA
-    # ─────────────────────────────────────────────────────────
-
-    def compute_barriers(self, entry_price: float, atr14: float,
-                         side: str) -> tuple[float, float]:
-        tp_dist = atr14 * self.cfg.ATR_MULT_TP
-        sl_dist = atr14 * self.cfg.ATR_MULT_SL
-
-        if side == "LONG":
-            tp = entry_price + tp_dist
-            sl = entry_price - sl_dist
+    def record(self, pnl: float):
+        self._reset_daily()
+        self.daily_pnl += pnl
+        if pnl < 0:
+            self.consecutive_loss += 1
+            self.cooldown_until = time.time() + C.COOLDOWN_CANDLES * 3 * 60
+            log.warning(f"Pérdida {pnl:.2f} | consecutivas={self.consecutive_loss}")
         else:
-            tp = entry_price - tp_dist
-            sl = entry_price + sl_dist
+            self.consecutive_loss = 0
+            self.cooldown_until   = 0
+            log.info(f"Ganancia {pnl:.2f}")
+        self._save()
 
-        return round(tp, 6), round(sl, 6)
+    # ── Trailing stop ──────────────────────────────────────────
 
-    def check_time_exit(self, state: PositionState, current_bar: int) -> bool:
-        return (current_bar - state.entry_bar) >= self.cfg.MAX_BARS_HOLD
-
-    # ─────────────────────────────────────────────────────────
-    # INTERNOS
-    # ─────────────────────────────────────────────────────────
-
-    def _reset_daily_if_needed(self) -> None:
-        if date.today() != self._last_reset_day:
-            self._daily_loss    = 0.0
-            self._last_reset_day = date.today()
-            logger.info("Daily PnL counter reseteado")
-
-    def _is_cooldown(self, symbol: str) -> bool:
-        until = self._cooldown_until.get(symbol)
-        return until is not None and datetime.now(timezone.utc) < until
-
-    @property
-    def daily_loss_pct(self) -> float:
-        return self._daily_loss
-
-    @property
-    def open_positions(self) -> int:
-        return self._open_count
+    def trail_sl(self, direction: str, price: float, sl: float, atr: float) -> float:
+        trail = atr * C.TRAIL_ATR_MULT
+        if direction == "LONG":
+            return max(price - trail, sl)
+        return min(price + trail, sl)

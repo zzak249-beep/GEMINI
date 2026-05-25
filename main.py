@@ -1,350 +1,232 @@
 """
-QF Machine × JP Fusion Bot v3.1 — Orquestador Principal
-Loop de trading + Scanner completo de mercado
+main.py — CVD Bot
+Entra LONG/SHORT cuando Score + Decaimiento + CVD coinciden.
+Ciclos cada 3min alineados al cierre de vela.
 """
-import asyncio
-import logging
-import os
-import time
-from datetime import datetime
-from pathlib import Path
+import logging, sys, time
+from datetime import datetime, timezone
 
-import pandas as pd
+from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-from exchange     import BingXClient
-from signals      import QFSignalEngine
-from risk         import RiskManager
-from positions    import Position, PositionTracker
-from telegram_bot import TelegramNotifier
-from scanner      import QFScanner
-from config       import SIGNAL_CFG, RISK_CFG, SYMBOLS, HTF
+import config as C
+from bingx_client import BingXClient
+from strategy import Strategy
+from risk_manager import RiskManager
+from telegram_notifier import Telegram
+from market_data import fetch, ok
+import health_server as hs
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    handlers=[
-        logging.FileHandler("logs/bot.log"),
-        logging.StreamHandler(),
-    ]
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("QFBot")
+log = logging.getLogger("main")
 
-BOT_STATE = {
-    "paused": False,
-    "paper":  os.getenv("PAPER_MODE", "true").lower() != "false",
-}
+# ── Instancias ────────────────────────────────────────────────
+client   = BingXClient()
+risk     = RiskManager()
+tg       = Telegram()
+strategy = Strategy()
 
-# ── Config Scanner ────────────────────────────────────────────
-SCAN_CFG = {
-    "min_volume_usdt":    float(os.getenv("MIN_VOLUME", "200000")),
-    "scan_concurrency":   int(os.getenv("SCAN_CONCURRENCY", "20")),
-    "scan_cooldown_min":  float(os.getenv("SCAN_COOLDOWN_MIN", "15")),
-    "scan_min_conviction":int(os.getenv("SCAN_MIN_CONV", "1")),
-    # Intervalo entre scans completos (segundos)
-    "scan_interval_s":    int(os.getenv("SCAN_INTERVAL_S", "180")),
-    # Máx señales a notificar por scan
-    "scan_max_notify":    int(os.getenv("SCAN_MAX_NOTIFY", "3")),
-    # Resumen cada N scans
-    "summary_every":      int(os.getenv("SUMMARY_EVERY", "10")),
-}
+# Estado de posición activa en memoria
+_pos = {}   # symbol → {direction, sl, tp, entry, qty, atr}
 
 
-class QFBot:
-    def __init__(self):
-        paper = BOT_STATE["paper"]
+# ─────────────────────────────────────────────────────────────
+def setup(symbol: str):
+    client.set_leverage(symbol, C.LEVERAGE)
+    client.set_margin_type(symbol, "ISOLATED")
 
-        self.exchange = BingXClient(
-            api_key=os.environ["BINGX_API_KEY"],
-            secret=os.environ["BINGX_SECRET"],
-            paper=paper,
-        )
-        self.engine    = QFSignalEngine(SIGNAL_CFG)
-        self.risk      = RiskManager(RISK_CFG)
-        self.positions = PositionTracker()
-        self.tg        = TelegramNotifier(
-            token=os.environ["TELEGRAM_TOKEN"],
-            chat_id=os.environ["TELEGRAM_CHAT_ID"],
-            risk_manager=self.risk,
-            bot_state=BOT_STATE,
-        )
-        self.scanner = QFScanner(
-            exchange=self.exchange,
-            signal_engine=self.engine,
-            risk_manager=self.risk,
-            notifier=self.tg,
-            cfg=SCAN_CFG,
-        )
-        self._scan_count   = 0
-        self._last_scan_t  = 0.0
-
-    # ─────────────────────────────────────────────────────────
-    #  ARRANQUE
-    # ─────────────────────────────────────────────────────────
-    async def run(self):
-        await self.tg.start_polling()
-
-        mode = "📋 PAPER MODE" if BOT_STATE["paper"] else "💵 LIVE MODE"
-        min_vol = SCAN_CFG['min_volume_usdt']
-        await self.tg._send(
-            f"🤖 *QF Machine × JP Fusion Bot v3.1*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"Modo: *{mode}*\n"
-            f"🔭 Scanner: todos los pares BingX (vol≥{min_vol/1000:.0f}K USDT)\n"
-            f"⚡ Concurrencia: `{SCAN_CFG['scan_concurrency']}`\n"
-            f"🔄 Ciclo scan: `{SCAN_CFG['scan_interval_s']}s`\n"
-            f"🎯 HUNT mode: Score≥`{SIGNAL_CFG.get('hunt_score_thr',0.08)*100:.0f}` "
-            f"Decay≥`{SIGNAL_CFG.get('hunt_decay_thr',0.35)*100:.0f}%`\n\n"
-            f"{'⚠️ DINERO REAL — cuida el riesgo' if not BOT_STATE['paper'] else '✅ Paper trading activo'}"
-        )
-
-        try:
-            while True:
-                await self._tick()
-                await asyncio.sleep(int(os.getenv("LOOP_SECONDS", "30")))
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception(f"Error crítico: {e}")
-            await self.tg.send_alert(f"❌ Error crítico: {e}")
-        finally:
-            await self.tg.stop_polling()
-            await self.exchange.close()
-
-    # ─────────────────────────────────────────────────────────
-    #  TICK PRINCIPAL
-    # ─────────────────────────────────────────────────────────
-    async def _tick(self):
-        if BOT_STATE.get("paused"):
-            return
-
-        now = time.time()
-
-        # ── 1. Scanner de mercado ─────────────────────────────
-        if now - self._last_scan_t >= SCAN_CFG['scan_interval_s']:
-            await self._run_scanner()
-            self._last_scan_t = now
-
-        # ── 2. Gestionar posiciones abiertas ─────────────────
-        for symbol in list(self.positions.positions.keys()):
-            try:
-                await self._manage_open(symbol)
-            except Exception as e:
-                logger.error(f"Error gestionando {symbol}: {e}")
-
-        # ── 3. Abrir señales en SYMBOLS fijos (opcional) ─────
-        for symbol in SYMBOLS:
-            if not self.positions.has(symbol):
-                try:
-                    await self._process_symbol(symbol)
-                except Exception as e:
-                    logger.error(f"Error en {symbol}: {e}")
-
-    # ─────────────────────────────────────────────────────────
-    #  SCANNER — ciclo completo
-    # ─────────────────────────────────────────────────────────
-    async def _run_scanner(self):
-        self._scan_count += 1
-        can, reason = self.risk.check_circuit()
-
-        try:
-            hits = await self.scanner.run_scan()
-        except Exception as e:
-            logger.error(f"Error en scanner: {e}")
-            return
-
-        n_scanned = len(self.scanner._sent) + len(hits) + 1  # aprox
-
-        # Notificar top señales
-        if can and not BOT_STATE.get("paused"):
-            await self.scanner.notify_top_signals(
-                hits, max_notify=SCAN_CFG['scan_max_notify']
-            )
-            # Intentar operar las mejores señales del scanner
-            await self._execute_scanner_hits(hits)
-
-        # Resumen periódico
-        if self._scan_count % SCAN_CFG['summary_every'] == 1:
-            try:
-                symbols_scanned = await self.exchange.get_all_symbols()
-                n = len(symbols_scanned)
-            except Exception:
-                n = len(hits) * 10
-            await self.scanner.send_summary(hits, n, BOT_STATE["paper"])
-
-    # ─────────────────────────────────────────────────────────
-    #  EJECUTAR HITS DEL SCANNER
-    # ─────────────────────────────────────────────────────────
-    async def _execute_scanner_hits(self, hits: list):
-        """
-        De las mejores señales del scanner, intenta abrir posición
-        en las que no tienen posición abierta ya.
-        Máximo MAX_OPEN_POSITIONS simultáneas.
-        """
-        max_pos = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
-        current = len(self.positions.positions)
-
-        if current >= max_pos:
-            return
-
-        min_tier_to_trade = os.getenv("MIN_TIER_TO_TRADE", "HUNT_LONG")
-        tier_rank = {
-            "SUPREMA": 5, "FUEL": 4, "STD": 3,
-            "HUNT_LONG": 2, "HUNT_SHORT": 2
+def sync(symbol: str):
+    """Recupera posiciones abiertas al arrancar"""
+    for p in client.get_positions(symbol):
+        amt = float(p.get("positionAmt", 0))
+        if amt == 0: continue
+        entry = float(p.get("avgPrice", 0))
+        atr   = entry * 0.004
+        _pos[symbol] = {
+            "direction": "LONG" if amt > 0 else "SHORT",
+            "sl":   entry - atr * C.SL_ATR_MULT if amt > 0 else entry + atr * C.SL_ATR_MULT,
+            "tp":   0.0, "entry": entry, "qty": abs(amt), "atr": atr,
         }
-        min_rank = tier_rank.get(min_tier_to_trade, 2)
+        log.info(f"Posición recuperada: {_pos[symbol]}")
 
-        for r in hits:
-            if current >= max_pos:
-                break
-            if self.positions.has(r.symbol):
-                continue
-            if tier_rank.get(r.tier, 0) < min_rank:
-                continue
 
-            can, reason = self.risk.check_circuit()
-            if not can:
-                break
+# ─────────────────────────────────────────────────────────────
+def manage(symbol: str, price: float, atr: float):
+    """Gestiona SL/TP trailing en posición abierta"""
+    state = _pos.get(symbol)
+    if not state: return
 
-            try:
-                await self._open_position_from_scan(r)
-                current += 1
-            except Exception as e:
-                logger.error(f"Error abriendo {r.symbol}: {e}")
+    positions = client.get_positions(symbol)
+    if not positions:
+        log.info(f"Posición {symbol} cerrada externamente")
+        _on_close(symbol, price, "EXCHANGE")
+        return
 
-    async def _open_position_from_scan(self, r):
-        qty = self.risk.calc_position_size(
-            entry=r.entry, sl=r.sl,
-            tier=r.tier if r.tier not in ("HUNT_LONG","HUNT_SHORT") else "STD",
-            conviction=r.conviction,
-        )
-        if not qty or qty <= 0:
+    # Trailing SL
+    new_sl = risk.trail_sl(state["direction"], price, state["sl"], atr)
+    if new_sl != state["sl"]:
+        log.info(f"Trailing SL: {state['sl']:.5f} → {new_sl:.5f}")
+        state["sl"] = new_sl
+
+    # Check SL / TP
+    d  = state["direction"]
+    sl = state["sl"]
+    tp = state["tp"]
+    sl_hit = (d == "LONG"  and price <= sl) or (d == "SHORT" and price >= sl)
+    tp_hit = tp > 0 and ((d == "LONG" and price >= tp) or (d == "SHORT" and price <= tp))
+
+    if sl_hit or tp_hit:
+        reason = "TP" if tp_hit else "SL"
+        log.info(f"{reason} @ {price:.5f}")
+        client.cancel_all(symbol)
+        client.close_position(symbol, positions[0])
+        _on_close(symbol, price, reason)
+
+
+def _on_close(symbol: str, price: float, reason: str):
+    state = _pos.pop(symbol, None)
+    if not state: return
+    entry = state["entry"]
+    qty   = state["qty"]
+    pnl   = (price - entry) * qty * C.LEVERAGE
+    if state["direction"] == "SHORT": pnl = -pnl
+    risk.record(pnl)
+    tg.close(symbol, state["direction"], entry, price, pnl, reason)
+
+
+# ─────────────────────────────────────────────────────────────
+def cycle():
+    symbol = C.SYMBOL
+    log.info(f"── ciclo {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC ──")
+    try:
+        # Datos
+        df_3m  = fetch(client, symbol, "3m",  C.LOOKBACK)
+        df_15m = fetch(client, symbol, "15m", 100)
+
+        if not ok(df_3m):
+            log.warning("Datos insuficientes")
+            hs.update(error=True)
             return
 
-        await self.exchange.set_leverage(r.symbol, RISK_CFG['leverage'])
+        price = float(df_3m["close"].iloc[-1])
+        atr   = float((df_3m["high"] - df_3m["low"]).iloc[-10:].mean())
 
-        side     = "BUY" if r.direction == "LONG" else "SELL"
-        pos_side = r.direction
+        # Gestionar posición abierta
+        manage(symbol, price, atr)
 
-        order = await self.exchange.place_order(r.symbol, side, pos_side, qty)
-        await self.exchange.set_sl_tp(r.symbol, pos_side, r.sl, r.tp, qty)
-
-        pos = Position(
-            symbol=r.symbol, direction=r.direction, tier=r.tier,
-            entry=r.entry, sl=r.sl, tp=r.tp, qty=qty,
-            open_time=datetime.utcnow().isoformat(),
-            order_id=str(order.get("orderId","?")),
-            paper=BOT_STATE["paper"], trailing_sl=r.sl,
-        )
-        self.positions.open(pos)
-
-        # Notificar apertura
-        mode = "📋 PAPER" if BOT_STATE["paper"] else "💵 REAL"
-        rr   = abs(r.tp-r.entry)/abs(r.entry-r.sl) if abs(r.entry-r.sl)>0 else 0
-        await self.tg._send(
-            f"{'🎯' if 'HUNT' in r.tier else '🚀'} *APERTURA {r.tier}* — {mode}\n"
-            f"{'🟢' if r.direction=='LONG' else '🔴'} *{r.direction}* `{r.symbol}`\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📊 Entrada: `{r.entry:.6f}`\n"
-            f"🛑 SL:      `{r.sl:.6f}`\n"
-            f"🎯 TP:      `{r.tp:.6f}`\n"
-            f"⚖️  R:R:     `{rr:.1f}x`\n"
-            f"📦 Qty:     `{qty:.6f}`\n"
-            f"🧠 Conv: {r.conviction}/10 | Score: {r.score*100:+.0f}"
-        )
-        logger.info(f"✅ {r.direction} {r.symbol} {r.tier} entry={r.entry:.6f} sl={r.sl:.6f} tp={r.tp:.6f}")
-
-    # ─────────────────────────────────────────────────────────
-    #  PROCESS SYMBOL (SYMBOLS fijos)
-    # ─────────────────────────────────────────────────────────
-    async def _process_symbol(self, symbol: str):
-        df_3m  = await self.exchange.get_klines(symbol, "3m",  limit=250)
-        df_htf = await self.exchange.get_klines(symbol, HTF,   limit=100)
-        if len(df_3m) < 100:
+        # Si ya hay posición abierta no abrir otra
+        if symbol in _pos:
+            log.info(f"Posición {_pos[symbol]['direction']} activa — esperando cierre")
+            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} hold")
             return
 
-        sig = self.engine.compute(df_3m, df_htf)
-        if sig.direction == "FLAT" or sig.tier == "NONE":
+        # Generar señal
+        sig = strategy.compute(df_3m, df_15m)
+
+        if sig.direction == "NONE":
+            log.info(f"Sin señal | score={sig.score:+.3f} "
+                     f"decay={sig.decay_pct:.0f}% cvd={'↑' if sig.cvd_rising else '↓'}")
+            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} wait")
             return
 
-        min_conv  = int(os.getenv("MIN_CONVICTION", "6"))
-        hunt_min  = int(os.getenv("HUNT_MIN_CONVICTION", "1"))
-        is_hunt   = sig.tier in ("HUNT_LONG","HUNT_SHORT")
-        threshold = hunt_min if is_hunt else min_conv
-        if sig.conviction < threshold:
+        # Validaciones riesgo
+        balance  = client.get_balance()
+        positions= client.get_positions(symbol)
+        ok_trade, reason = risk.can_trade(balance, len(positions))
+        if not ok_trade:
+            log.info(f"Bloqueado: {reason}")
+            tg.warn(f"⛔ {symbol} bloqueado: {reason}")
+            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} blocked")
             return
 
-        qty = self.risk.calc_position_size(
-            entry=sig.entry_price, sl=sig.sl_price,
-            tier=sig.tier if not is_hunt else "STD",
-            conviction=sig.conviction,
-        )
-        if not qty or qty <= 0:
+        ok_dir, reason2 = risk.anti_hedge(sig.direction, positions)
+        if not ok_dir:
+            log.info(f"Anti-hedge: {reason2}")
+            # Cerrar posición contraria primero
+            for p in positions:
+                client.close_position(symbol, p)
+            time.sleep(1)
+            balance   = client.get_balance()
+            positions = []
+
+        # Sizing
+        qty = risk.position_size(balance, sig)
+        if qty <= 0:
+            log.warning("Cantidad = 0, abortando")
             return
 
-        tp   = self.risk.calc_tp(sig.entry_price, sig.sl_price, sig.direction, sig.tier)
-        side = "BUY" if sig.direction == "LONG" else "SELL"
+        # Ejecutar
+        side   = "BUY" if sig.direction == "LONG" else "SELL"
+        result = client.market_order(symbol, side, qty)
 
-        await self.exchange.set_leverage(symbol, RISK_CFG['leverage'])
-        order = await self.exchange.place_order(symbol, side, sig.direction, qty)
-        await self.exchange.set_sl_tp(symbol, sig.direction, sig.sl_price, tp, qty)
-
-        pos = Position(
-            symbol=symbol, direction=sig.direction, tier=sig.tier,
-            entry=sig.entry_price, sl=sig.sl_price, tp=tp, qty=qty,
-            open_time=datetime.utcnow().isoformat(),
-            order_id=str(order.get("orderId","?")),
-            paper=BOT_STATE["paper"], trailing_sl=sig.sl_price,
-        )
-        self.positions.open(pos)
-        await self.tg.send_signal(sig, symbol, qty, tp, BOT_STATE["paper"])
-
-    # ─────────────────────────────────────────────────────────
-    #  GESTIÓN POSICIÓN ABIERTA
-    # ─────────────────────────────────────────────────────────
-    async def _manage_open(self, symbol: str):
-        pos = self.positions.get(symbol)
-        if not pos:
+        if result.get("code", -1) != 0:
+            log.error(f"Error orden: {result}")
+            tg.warn(f"❌ Error orden {symbol}: {result.get('msg', result)}")
             return
 
-        try:
-            df = await self.exchange.get_klines(symbol, "3m", limit=50)
-        except Exception:
-            return
+        # Guardar estado
+        _pos[symbol] = {
+            "direction": sig.direction,
+            "sl":        sig.sl,
+            "tp":        sig.tp,
+            "entry":     sig.entry,
+            "qty":       qty,
+            "atr":       sig.atr_val,
+        }
 
-        price = float(df['close'].iloc[-1])
-        atr   = float((df['high']-df['low']).rolling(10).mean().iloc[-1])
+        tg.entry(symbol, sig, qty, balance)
+        log.info(f"✅ {sig.direction} {qty:.6f} {symbol} @ {sig.entry:.5f}")
+        hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} {sig.direction}")
 
-        # Trailing stop
-        new_sl = self.positions.calc_trailing_sl(
-            pos, price, atr,
-            trail_atr_mult=float(os.getenv("TRAIL_ATR","1.5"))
-        )
-        if new_sl != pos.trailing_sl:
-            self.positions.update_trailing_sl(symbol, new_sl)
+    except Exception as e:
+        log.exception(f"Error en ciclo: {e}")
+        tg.warn(f"Error ciclo: {e}")
+        hs.update(error=True)
 
-        exit_reason = self.positions.check_exit(symbol, price)
-        if not exit_reason:
-            return
 
-        pnl = self.positions.calc_pnl(symbol, price)
-        if not BOT_STATE["paper"]:
-            await self.exchange.close_position(symbol, pos.direction, pos.qty)
+# ─────────────────────────────────────────────────────────────
+def main():
+    log.info("═══════════════════════════════════")
+    log.info("  CVD Bot — Score + Decay + CVD    ")
+    log.info("═══════════════════════════════════")
 
-        self.risk.record_trade(pnl)
+    hs.start()
 
-        reason_txt = {"stop_loss": "Stop Loss 🛑", "take_profit": "Take Profit ✨"}.get(exit_reason, exit_reason)
-        await self.tg.send_trade_close(
-            symbol=symbol, direction=pos.direction, pnl=pnl,
-            entry=pos.entry, exit_price=price, reason=reason_txt,
-            paper=BOT_STATE["paper"],
-        )
-        self.positions.close(symbol)
+    if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
+        log.error("Credenciales BingX no configuradas")
+        sys.exit(1)
 
-        can, reason = self.risk.check_circuit()
-        if not can:
-            await self.tg.send_circuit_breaker(reason)
+    balance = client.get_balance()
+    log.info(f"Balance: {balance:.2f} USDT")
+
+    setup(C.SYMBOL)
+    sync(C.SYMBOL)
+    tg.startup(C.SYMBOL, balance)
+
+    # Ciclo inmediato al arrancar
+    cycle()
+
+    # Scheduler: cada 3min, 10s después del cierre de vela
+    sched = BlockingScheduler(timezone="UTC")
+    sched.add_job(
+        cycle,
+        CronTrigger(
+            minute="0,3,6,9,12,15,18,21,24,27,30,33,36,39,42,45,48,51,54,57",
+            second=10,
+        ),
+        max_instances=1,
+        misfire_grace_time=30,
+    )
+    log.info("Scheduler listo — cada 3min")
+    try:
+        sched.start()
+    except KeyboardInterrupt:
+        log.info("Bot detenido")
 
 
 if __name__ == "__main__":
-    bot = QFBot()
-    asyncio.run(bot.run())
+    main()

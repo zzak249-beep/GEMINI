@@ -1,132 +1,49 @@
-"""
-Configuración Central — QF Machine × JP Fusion Bot v3
-Todos los parámetros del indicador y del bot en un solo lugar.
-"""
+import os
+from dotenv import load_dotenv
+load_dotenv()
 
-# ── Temporalidades ────────────────────────────────────────────
-HTF = "15m"   # Higher timeframe para confirmación de régimen
+# ── BingX ─────────────────────────────────────────────────────
+BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
+BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY", "")
+BINGX_BASE_URL   = "https://open-api.bingx.com"
 
-# ── Símbolos a operar ─────────────────────────────────────────
-# Añade o quita según tu capital. Más símbolos = más oportunidades
-# pero más margen utilizado. Empieza con 1-2 en paper.
-SYMBOLS = [
-    "BTC-USDT",
-    "ETH-USDT",
-]
+# ── Telegram ──────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ── Señal: parámetros del indicador (espejo del Pine Script) ──
-SIGNAL_CFG = {
-    # L1 / General
-    "smo":      3,      # Suavizado de señal
-    "atr_len":  10,     # Longitud ATR
+# ── Operativa ─────────────────────────────────────────────────
+SYMBOL           = os.getenv("SYMBOL", "BTC-USDT")
+LEVERAGE         = int(os.getenv("LEVERAGE", "10"))
+RISK_PER_TRADE   = float(os.getenv("RISK_PER_TRADE", "0.015"))  # 1.5%
+MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS", "1"))
+DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "0.06")) # 6%
 
-    # L2 Factores
-    "mom":      20,     # Lookback momentum
-    "rev":      8,      # Lookback media-reversión
-    "vol_len":  14,     # Longitud volumen OBV
-    "w1":       0.40,   # Peso momentum
-    "w2":       0.30,   # Peso media-rev
-    "w3":       0.30,   # Peso volumen
+# ── SL / TP ───────────────────────────────────────────────────
+SL_ATR_MULT      = float(os.getenv("SL_ATR_MULT",   "1.5"))
+TP_RR            = float(os.getenv("TP_RR",          "2.5"))
+TRAIL_ATR_MULT   = float(os.getenv("TRAIL_ATR_MULT", "1.0"))
 
-    # L3 Decaimiento
-    "dlen":     40,     # Ventana decaimiento
-    "dthr":     0.50,   # Umbral vida media
+# ── Estrategia — umbrales ─────────────────────────────────────
+SCORE_THR        = float(os.getenv("SCORE_THR",   "0.15"))  # score mínimo para señal
+DECAY_THR        = float(os.getenv("DECAY_THR",   "0.50"))  # decaimiento mínimo
+CVD_DIV_BARS     = int(os.getenv("CVD_DIV_BARS",  "5"))     # ventana divergencia CVD
+REQUIRE_HTF      = os.getenv("REQUIRE_HTF", "true").lower() == "true"
+COOLDOWN_CANDLES = int(os.getenv("COOLDOWN_CANDLES", "3"))
 
-    # L4 Dark Pool
-    "dpm":      2.5,    # Multiplicador volumen spike
-    "dpb":      20,     # Baseline dark pool (barras)
-    "spl":      5,      # Longitud spread
+# ── Parámetros indicadores ────────────────────────────────────
+ATR_PERIOD   = 10
+MOM_LOOKBACK = 20
+REV_LOOKBACK = 8
+VOL_LOOKBACK = 14
+W_MOM        = 0.40
+W_REV        = 0.30
+W_VOL        = 0.30
+SMOOTH       = 3
+DECAY_LEN    = 40
+CVD_EMA_LEN  = 20
+HTF_FAST     = 9
+HTF_SLOW     = 21
+LOOKBACK     = 250
 
-    # L5 Ejecución
-    "exl":      12,     # Baseline ejecución
-    "bpt":      0.18,   # Umbral drenaje BP (%)
-
-    # L6 Asimetría
-    "asl":      10,     # Ventana asimetría
-    "arr":      1.40,   # Ratio alcista/bajista
-    "abr":      1.40,   # Ratio bajista/alcista
-
-    # L7 Trendline
-    "tlb":      30,     # Lookback TL pivotes
-    "tll":      5,      # Pivote barras izq
-    "tlr":      3,      # Pivote barras der
-    "tlm":      0.15,   # Buffer ruptura (ATR)
-
-    # L8 Swing Analysis
-    "pll":      5,      # Swing low izq
-    "plr":      3,      # Swing low der
-    "phl":      5,      # Swing high izq
-    "phr":      3,      # Swing high der
-    "hlc":      2,      # Min HL ascendentes
-    "hhc":      2,      # Min LH descendentes
-    "hlw":      40,     # Ventana análisis
-
-    # L9 FVG
-    "fvg_min":  0.3,    # Tamaño mínimo (× ATR)
-    "fvg_bars": 40,     # Validez FVG (barras)
-
-    # L10 Order Blocks
-    "ob_imp":   1.5,    # Impulso mínimo (× ATR)
-    "ob_bars":  50,     # Validez OB (barras)
-
-    # L11 CVD Delta
-    "cvd_len":  20,     # EMA CVD
-    "cvd_div":  5,      # Ventana divergencia
-
-    # L12 Squeeze
-    "sq_len":   20,     # Longitud squeeze
-    "sq_bbm":   2.0,    # Multiplicador BB
-    "sq_kcm":   1.5,    # Multiplicador KC
-}
-
-# ── Riesgo ────────────────────────────────────────────────────
-RISK_CFG = {
-    # Capital inicial (sincronizar con equity real de BingX)
-    "initial_equity": 500.0,   # USDT
-
-    # Leverage (BingX soporta hasta 100x; usa poco mientras validas)
-    "leverage": 5,
-
-    # Riesgo por operación (% del equity) según tier
-    "risk_pct_suprema": 1.5,   # Señal más fuerte
-    "risk_pct_fuel":    1.0,
-    "risk_pct_std":     0.5,
-    "risk_pct_max":     2.0,   # Techo absoluto, nunca superado
-
-    # Ratio Reward:Risk según tier
-    "rr_suprema": 3.0,
-    "rr_fuel":    2.5,
-    "rr_std":     2.0,
-
-    # Circuit Breakers
-    "max_daily_loss_pct":      3.0,   # Pérdida máxima diaria (% equity)
-    "max_drawdown_pct":       15.0,   # DD máximo desde pico (para siempre)
-    "max_consecutive_losses":   4,    # Pérdidas seguidas antes de pausa
-    "max_daily_trades":        10,    # Máx operaciones por día
-}
-
-# ── HUNT MODE — opera con Score + Decay altos aunque no se cumplan todas las capas ──
-# Esto captura señales cuando Decay>57% y Score>86% como ves en el dashboard
-# hunt_score_thr: norm_score mínimo (0.08 = 8/100, ajusta según tus tests)
-# hunt_decay_thr: decay ratio mínimo (0.35 = 35%, pon 0.57 para tu umbral exacto)
-HUNT_CFG = {
-    "hunt_score_thr": 0.08,   # score normalizado (≈ 8/100 en el dashboard)
-    "hunt_decay_thr": 0.35,   # decay ratio (35% — sube a 0.57 para ser más selectivo)
-    "hunt_min_conviction": 1, # convicción mínima para HUNT (muy permisivo)
-}
-
-# Añadir a SIGNAL_CFG
-SIGNAL_CFG["hunt_score_thr"] = HUNT_CFG["hunt_score_thr"]
-SIGNAL_CFG["hunt_decay_thr"] = HUNT_CFG["hunt_decay_thr"]
-
-# ── Scanner de mercado ────────────────────────────────────────
-# Variables de entorno para Railway (pueden sobreescribirse):
-# MIN_VOLUME=200000       → volumen mínimo 24h en USDT para incluir un par
-# SCAN_CONCURRENCY=20     → pares analizados en paralelo (más = más rápido, más RAM)
-# SCAN_INTERVAL_S=180     → segundos entre scans (180 = cada 3 min, igual que TF)
-# SCAN_MAX_NOTIFY=3       → máx señales notificadas por scan
-# SUMMARY_EVERY=10        → resumen cada N scans
-# MAX_OPEN_POSITIONS=3    → máx posiciones simultáneas del scanner
-# MIN_TIER_TO_TRADE=HUNT_LONG → tier mínimo para abrir posición automática
-# SCAN_COOLDOWN_MIN=15    → minutos de espera entre señales del mismo par
-# HUNT_MIN_CONVICTION=1   → convicción mínima para señales HUNT
+# ── Railway ───────────────────────────────────────────────────
+PORT = int(os.getenv("PORT", "8080"))
