@@ -1,5 +1,6 @@
 """
-risk_manager.py — Sizing · Cooldown · Límite diario
+risk_manager.py — Sizing · Cooldown · Límite diario · Multi-símbolo
+El RiskManager es GLOBAL: controla el total de posiciones abiertas en todos los símbolos.
 """
 import json, logging, os, time
 from datetime import datetime, timezone
@@ -67,13 +68,17 @@ class RiskManager:
 
     # ── Validaciones ───────────────────────────────────────────
 
-    def can_trade(self, balance: float, n_positions: int) -> tuple:
+    def can_trade(self, balance: float, n_open_positions: int) -> tuple:
+        """
+        n_open_positions: total de posiciones abiertas en TODOS los símbolos.
+        MAX_POSITIONS limita el total global, no por símbolo.
+        """
         self._reset_daily()
         if time.time() < self.cooldown_until:
             mins = int((self.cooldown_until - time.time()) / 60)
             return False, f"Cooldown activo — {mins}min restantes"
-        if n_positions >= C.MAX_POSITIONS:
-            return False, f"Máximo posiciones ({C.MAX_POSITIONS}) alcanzado"
+        if n_open_positions >= C.MAX_POSITIONS:
+            return False, f"Máximo posiciones globales ({C.MAX_POSITIONS}) alcanzado"
         if balance <= 0:
             return False, "Balance cero"
         if self.daily_pnl < 0 and abs(self.daily_pnl) / max(balance, 1) >= C.DAILY_LOSS_LIMIT:

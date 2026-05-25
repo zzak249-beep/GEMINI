@@ -1,5 +1,5 @@
 """
-telegram_notifier.py
+telegram_notifier.py — Multi-símbolo
 """
 import logging
 from datetime import datetime, timezone
@@ -78,16 +78,31 @@ class Telegram:
         self._send(f"ℹ️ {msg}")
 
     def startup(self, symbol: str, balance: float):
+        """Compatibilidad hacia atrás — llama a startup_multi con un solo símbolo."""
+        self.startup_multi(balance, [symbol])
+
+    def startup_multi(self, balance: float, symbols: list):
+        mode_icon = "🔍" if C.SYMBOL_MODE == "scanner" else "📋"
+        mode_text = (
+            f"Scanner automático\n"
+            f"  Top {C.SCANNER_TOP_N} por volumen ≥ {C.SCANNER_MIN_VOLUME/1e6:.0f}M USDT"
+            if C.SYMBOL_MODE == "scanner"
+            else f"Lista manual ({len(symbols)} pares)"
+        )
+        sym_list = " · ".join(symbols[:10]) + ("…" if len(symbols) > 10 else "")
         self._send(
-            f"🚀 <b>CVD Bot iniciado</b>\n"
+            f"🚀 <b>CVD Bot Multi-Símbolo iniciado</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📌 Par:      <b>{symbol}</b>\n"
-            f"⏱️  TF:       3min → HTF 15min\n"
-            f"🔑 Apal.:    {C.LEVERAGE}x ISOLATED\n"
-            f"⚠️  Riesgo:   {C.RISK_PER_TRADE*100:.1f}% / operación\n"
-            f"🛑 Límite:   {C.DAILY_LOSS_LIMIT*100:.0f}% diario\n"
-            f"📐 RR:       {C.TP_RR}:1\n"
-            f"💰 Balance:  <code>{balance:.2f} USDT</code>\n"
+            f"{mode_icon} Modo: {mode_text}\n"
+            f"📌 Pares activos: <b>{sym_list}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⏱️  TF:            3min → HTF 15min\n"
+            f"🔑 Apalancamiento: {C.LEVERAGE}x ISOLATED\n"
+            f"⚠️  Riesgo/trade:  {C.RISK_PER_TRADE*100:.1f}%\n"
+            f"📊 Max posiciones: {C.MAX_POSITIONS}\n"
+            f"🛑 Límite diario:  {C.DAILY_LOSS_LIMIT*100:.0f}%\n"
+            f"📐 RR objetivo:    {C.TP_RR}:1\n"
+            f"💰 Balance:        <code>{balance:.2f} USDT</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>Condiciones de entrada:</b>\n"
             f"  ✅ Score {'>'} {C.SCORE_THR} o {'<'} -{C.SCORE_THR}\n"

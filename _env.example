@@ -1,0 +1,63 @@
+# ═══════════════════════════════════════════════════════════════════
+#  VARIABLES DE ENTORNO — CVD BOT MULTI-SÍMBOLO
+#  Pegar en Railway → Variables (una por línea: NOMBRE=valor)
+# ═══════════════════════════════════════════════════════════════════
+
+# ── OBLIGATORIAS ────────────────────────────────────────────────────
+
+BINGX_API_KEY=TU_API_KEY_AQUI
+BINGX_SECRET_KEY=TU_SECRET_KEY_AQUI
+
+TELEGRAM_TOKEN=TU_BOT_TOKEN_AQUI
+TELEGRAM_CHAT_ID=TU_CHAT_ID_AQUI
+
+
+# ── MODO DE SÍMBOLOS ────────────────────────────────────────────────
+# "scanner" → analiza TODO BingX automáticamente (RECOMENDADO)
+# "manual"  → usa solo los pares que pongas en SYMBOLS_LIST
+
+SYMBOL_MODE=scanner
+
+
+# ── ESCÁNER (solo si SYMBOL_MODE=scanner) ───────────────────────────
+# Volumen mínimo 24h en USDT para incluir un símbolo
+SCANNER_MIN_VOLUME=5000000
+
+# Cuántos pares del top tomar (los de mayor volumen)
+SCANNER_TOP_N=20
+
+# Pares a excluir aunque pasen el filtro (separados por comas, o dejar vacío)
+SCANNER_BLACKLIST=
+
+# Cada cuántos ciclos de 3min refrescar la lista (~60min = 20 ciclos)
+SCANNER_REFRESH_CYCLES=20
+
+
+# ── LISTA MANUAL (solo si SYMBOL_MODE=manual) ───────────────────────
+# Descomentar y ajustar si prefieres controlar los pares tú mismo
+# SYMBOLS_LIST=BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT
+
+
+# ── OPERATIVA ────────────────────────────────────────────────────────
+LEVERAGE=10
+RISK_PER_TRADE=0.015
+MAX_POSITIONS=3
+DAILY_LOSS_LIMIT=0.06
+
+
+# ── SL / TP ──────────────────────────────────────────────────────────
+SL_ATR_MULT=1.5
+TP_RR=2.5
+TRAIL_ATR_MULT=1.0
+
+
+# ── ESTRATEGIA ───────────────────────────────────────────────────────
+SCORE_THR=0.15
+DECAY_THR=0.50
+CVD_DIV_BARS=5
+REQUIRE_HTF=true
+COOLDOWN_CANDLES=3
+
+
+# ── RAILWAY (no tocar) ───────────────────────────────────────────────
+PORT=8080

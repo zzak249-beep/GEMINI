@@ -1,6 +1,6 @@
 """
-main.py — CVD Bot
-Entra LONG/SHORT cuando Score + Decaimiento + CVD coinciden.
+main.py — CVD Bot Multi-Símbolo
+Escanea TODO BingX (o lista manual) y opera en los mejores símbolos por volumen.
 Ciclos cada 3min alineados al cierre de vela.
 """
 import logging, sys, time
@@ -24,39 +24,72 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-# ── Instancias ────────────────────────────────────────────────
+# ── Instancias globales ───────────────────────────────────────
 client   = BingXClient()
 risk     = RiskManager()
 tg       = Telegram()
 strategy = Strategy()
 
-# Estado de posición activa en memoria
-_pos = {}   # symbol → {direction, sl, tp, entry, qty, atr}
+# Estado de posiciones activas en memoria: symbol → {direction, sl, tp, entry, qty, atr}
+_pos: dict = {}
+
+# Lista activa de símbolos a escanear (se refresca cada SCANNER_REFRESH_CYCLES ciclos)
+_symbols: list  = []
+_cycle_count    = 0
 
 
-# ─────────────────────────────────────────────────────────────
+# ── Gestión de símbolos ───────────────────────────────────────
+
+def refresh_symbols():
+    """Actualiza la lista de símbolos según el modo configurado."""
+    global _symbols
+    if C.SYMBOL_MODE == "scanner":
+        selected = client.scan_by_volume(
+            C.SCANNER_MIN_VOLUME,
+            C.SCANNER_TOP_N,
+            C.SCANNER_BLACKLIST,
+        )
+        if selected:
+            _symbols = selected
+            log.info(f"[Scanner] {len(_symbols)} símbolos activos: {_symbols}")
+            tg.info(f"🔍 Escáner: {len(_symbols)} pares seleccionados\n" +
+                    " · ".join(_symbols[:10]) + ("…" if len(_symbols) > 10 else ""))
+        else:
+            log.warning("[Scanner] Sin resultados, manteniendo lista anterior")
+    else:
+        _symbols = list(C.SYMBOLS_LIST)
+        log.info(f"[Manual] Símbolos: {_symbols}")
+
+
+# ── Setup y sincronización ────────────────────────────────────
+
 def setup(symbol: str):
-    client.set_leverage(symbol, C.LEVERAGE)
-    client.set_margin_type(symbol, "ISOLATED")
+    try:
+        client.set_leverage(symbol, C.LEVERAGE)
+        client.set_margin_type(symbol, "ISOLATED")
+    except Exception as e:
+        log.warning(f"Setup {symbol}: {e}")
 
-def sync(symbol: str):
-    """Recupera posiciones abiertas al arrancar"""
-    for p in client.get_positions(symbol):
+def sync_all():
+    """Recupera todas las posiciones abiertas al arrancar."""
+    for p in client.get_positions():
         amt = float(p.get("positionAmt", 0))
         if amt == 0: continue
+        sym   = p.get("symbol", "")
         entry = float(p.get("avgPrice", 0))
         atr   = entry * 0.004
-        _pos[symbol] = {
+        _pos[sym] = {
             "direction": "LONG" if amt > 0 else "SHORT",
             "sl":   entry - atr * C.SL_ATR_MULT if amt > 0 else entry + atr * C.SL_ATR_MULT,
             "tp":   0.0, "entry": entry, "qty": abs(amt), "atr": atr,
         }
-        log.info(f"Posición recuperada: {_pos[symbol]}")
+        log.info(f"Posición recuperada: {sym} {_pos[sym]['direction']} @ {entry}")
 
 
-# ─────────────────────────────────────────────────────────────
+# ── Gestión de posición abierta ───────────────────────────────
+
 def manage(symbol: str, price: float, atr: float):
-    """Gestiona SL/TP trailing en posición abierta"""
+    """Gestiona SL/TP trailing en posición abierta."""
     state = _pos.get(symbol)
     if not state: return
 
@@ -69,19 +102,17 @@ def manage(symbol: str, price: float, atr: float):
     # Trailing SL
     new_sl = risk.trail_sl(state["direction"], price, state["sl"], atr)
     if new_sl != state["sl"]:
-        log.info(f"Trailing SL: {state['sl']:.5f} → {new_sl:.5f}")
+        log.info(f"Trailing SL {symbol}: {state['sl']:.5f} → {new_sl:.5f}")
         state["sl"] = new_sl
 
     # Check SL / TP
-    d  = state["direction"]
-    sl = state["sl"]
-    tp = state["tp"]
+    d, sl, tp = state["direction"], state["sl"], state["tp"]
     sl_hit = (d == "LONG"  and price <= sl) or (d == "SHORT" and price >= sl)
     tp_hit = tp > 0 and ((d == "LONG" and price >= tp) or (d == "SHORT" and price <= tp))
 
     if sl_hit or tp_hit:
         reason = "TP" if tp_hit else "SL"
-        log.info(f"{reason} @ {price:.5f}")
+        log.info(f"{reason} {symbol} @ {price:.5f}")
         client.cancel_all(symbol)
         client.close_position(symbol, positions[0])
         _on_close(symbol, price, reason)
@@ -98,101 +129,137 @@ def _on_close(symbol: str, price: float, reason: str):
     tg.close(symbol, state["direction"], entry, price, pnl, reason)
 
 
-# ─────────────────────────────────────────────────────────────
-def cycle():
-    symbol = C.SYMBOL
-    log.info(f"── ciclo {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC ──")
-    try:
-        # Datos
-        df_3m  = fetch(client, symbol, "3m",  C.LOOKBACK)
-        df_15m = fetch(client, symbol, "15m", 100)
+# ── Ciclo principal ───────────────────────────────────────────
 
-        if not ok(df_3m):
-            log.warning("Datos insuficientes")
+def cycle():
+    global _cycle_count
+    _cycle_count += 1
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    log.info(f"══ ciclo #{_cycle_count} {now} UTC — {len(_symbols)} símbolos ══")
+
+    try:
+        # Refrescar lista de símbolos periódicamente
+        if _cycle_count == 1 or _cycle_count % C.SCANNER_REFRESH_CYCLES == 0:
+            refresh_symbols()
+
+        if not _symbols:
+            log.warning("Lista de símbolos vacía")
             hs.update(error=True)
             return
 
-        price = float(df_3m["close"].iloc[-1])
-        atr   = float((df_3m["high"] - df_3m["low"]).iloc[-10:].mean())
+        # Obtener posiciones abiertas globales (una sola llamada API)
+        all_positions = client.get_positions()
+        open_by_sym   = {p["symbol"]: p for p in all_positions if float(p.get("positionAmt", 0)) != 0}
+        n_open        = len(open_by_sym)
 
-        # Gestionar posición abierta
-        manage(symbol, price, atr)
+        balance = client.get_balance()
+        hs.update(
+            last=f"{datetime.now(timezone.utc).strftime('%H:%M')} c#{_cycle_count}",
+            positions=n_open,
+            symbols=len(_symbols),
+        )
 
-        # Si ya hay posición abierta no abrir otra
-        if symbol in _pos:
-            log.info(f"Posición {_pos[symbol]['direction']} activa — esperando cierre")
-            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} hold")
-            return
+        # ── Gestionar posiciones activas ──────────────────────
+        for symbol, state in list(_pos.items()):
+            df_3m = fetch(client, symbol, "3m", 20)
+            if not ok(df_3m, min_rows=5):
+                continue
+            price = float(df_3m["close"].iloc[-1])
+            atr   = float((df_3m["high"] - df_3m["low"]).iloc[-10:].mean())
+            manage(symbol, price, atr)
 
-        # Generar señal
-        sig = strategy.compute(df_3m, df_15m)
-
-        if sig.direction == "NONE":
-            log.info(f"Sin señal | score={sig.score:+.3f} "
-                     f"decay={sig.decay_pct:.0f}% cvd={'↑' if sig.cvd_rising else '↓'}")
-            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} wait")
-            return
-
-        # Validaciones riesgo
-        balance  = client.get_balance()
-        positions= client.get_positions(symbol)
-        ok_trade, reason = risk.can_trade(balance, len(positions))
+        # ── Buscar nuevas señales ─────────────────────────────
+        ok_trade, reason = risk.can_trade(balance, len(_pos))
         if not ok_trade:
-            log.info(f"Bloqueado: {reason}")
-            tg.warn(f"⛔ {symbol} bloqueado: {reason}")
-            hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} blocked")
+            log.info(f"No se buscan nuevas entradas: {reason}")
             return
 
-        ok_dir, reason2 = risk.anti_hedge(sig.direction, positions)
-        if not ok_dir:
-            log.info(f"Anti-hedge: {reason2}")
-            # Cerrar posición contraria primero
-            for p in positions:
-                client.close_position(symbol, p)
-            time.sleep(1)
-            balance   = client.get_balance()
-            positions = []
+        for symbol in _symbols:
+            # Ya tenemos posición en este símbolo
+            if symbol in _pos:
+                continue
 
-        # Sizing
-        qty = risk.position_size(balance, sig)
-        if qty <= 0:
-            log.warning("Cantidad = 0, abortando")
-            return
+            # Límite global alcanzado
+            if len(_pos) >= C.MAX_POSITIONS:
+                log.info(f"MAX_POSITIONS={C.MAX_POSITIONS} alcanzado, no más entradas")
+                break
 
-        # Ejecutar
-        side   = "BUY" if sig.direction == "LONG" else "SELL"
-        result = client.market_order(symbol, side, qty)
+            try:
+                df_3m  = fetch(client, symbol, "3m",  C.LOOKBACK)
+                df_15m = fetch(client, symbol, "15m", 100)
 
-        if result.get("code", -1) != 0:
-            log.error(f"Error orden: {result}")
-            tg.warn(f"❌ Error orden {symbol}: {result.get('msg', result)}")
-            return
+                if not ok(df_3m):
+                    continue
 
-        # Guardar estado
-        _pos[symbol] = {
-            "direction": sig.direction,
-            "sl":        sig.sl,
-            "tp":        sig.tp,
-            "entry":     sig.entry,
-            "qty":       qty,
-            "atr":       sig.atr_val,
-        }
+                price = float(df_3m["close"].iloc[-1])
+                atr   = float((df_3m["high"] - df_3m["low"]).iloc[-10:].mean())
 
-        tg.entry(symbol, sig, qty, balance)
-        log.info(f"✅ {sig.direction} {qty:.6f} {symbol} @ {sig.entry:.5f}")
-        hs.update(last=f"{datetime.now(timezone.utc).strftime('%H:%M')} {sig.direction}")
+                sig = strategy.compute(df_3m, df_15m)
+
+                if sig.direction == "NONE":
+                    log.debug(f"{symbol} sin señal | score={sig.score:+.3f}")
+                    continue
+
+                log.info(f"SEÑAL {sig.direction} {sig.quality} en {symbol} | score={sig.score:+.3f}")
+
+                # Validar riesgo para este símbolo
+                sym_positions = [open_by_sym[symbol]] if symbol in open_by_sym else []
+                ok_dir, reason2 = risk.anti_hedge(sig.direction, sym_positions)
+                if not ok_dir:
+                    log.info(f"Anti-hedge {symbol}: {reason2}")
+                    continue
+
+                # Sizing
+                qty = risk.position_size(balance, sig)
+                if qty <= 0:
+                    log.warning(f"{symbol}: qty=0, omitiendo")
+                    continue
+
+                # Setup del símbolo (leverage + margin type)
+                setup(symbol)
+                time.sleep(0.3)  # pequeña pausa tras configurar
+
+                # Ejecutar orden
+                side   = "BUY" if sig.direction == "LONG" else "SELL"
+                result = client.market_order(symbol, side, qty)
+
+                if result.get("code", -1) != 0:
+                    log.error(f"Error orden {symbol}: {result}")
+                    tg.warn(f"❌ Error orden {symbol}: {result.get('msg', result)}")
+                    continue
+
+                # Guardar estado
+                _pos[symbol] = {
+                    "direction": sig.direction,
+                    "sl":        sig.sl,
+                    "tp":        sig.tp,
+                    "entry":     sig.entry,
+                    "qty":       qty,
+                    "atr":       sig.atr_val,
+                }
+
+                tg.entry(symbol, sig, qty, balance)
+                log.info(f"✅ {sig.direction} {qty:.6f} {symbol} @ {sig.entry:.5f}")
+
+                # Refrescar balance tras operar
+                balance = client.get_balance()
+
+            except Exception as e:
+                log.exception(f"Error procesando {symbol}: {e}")
+                hs.update(error=True)
 
     except Exception as e:
         log.exception(f"Error en ciclo: {e}")
-        tg.warn(f"Error ciclo: {e}")
+        tg.warn(f"⚠️ Error ciclo: {e}")
         hs.update(error=True)
 
 
-# ─────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────
+
 def main():
-    log.info("═══════════════════════════════════")
-    log.info("  CVD Bot — Score + Decay + CVD    ")
-    log.info("═══════════════════════════════════")
+    log.info("═══════════════════════════════════════════")
+    log.info("  CVD Bot Multi-Símbolo — BingX Scanner   ")
+    log.info("═══════════════════════════════════════════")
 
     hs.start()
 
@@ -202,10 +269,19 @@ def main():
 
     balance = client.get_balance()
     log.info(f"Balance: {balance:.2f} USDT")
+    log.info(f"Modo: {C.SYMBOL_MODE.upper()} | MAX_POSITIONS: {C.MAX_POSITIONS}")
 
-    setup(C.SYMBOL)
-    sync(C.SYMBOL)
-    tg.startup(C.SYMBOL, balance)
+    # Cargar lista inicial de símbolos
+    refresh_symbols()
+
+    # Sincronizar posiciones existentes
+    sync_all()
+
+    # Setup de símbolos con posición ya abierta
+    for sym in list(_pos.keys()):
+        setup(sym)
+
+    tg.startup_multi(balance, _symbols)
 
     # Ciclo inmediato al arrancar
     cycle()

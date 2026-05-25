@@ -1,5 +1,6 @@
 """
 bingx_client.py — Cliente BingX Perpetual Futures (One-Way mode)
+Añadido: get_all_symbols() + get_ticker_24h() para el escáner
 """
 import hmac, hashlib, time, logging, urllib.parse
 import requests
@@ -55,6 +56,64 @@ class BingXClient:
         except Exception as e:
             log.error(f"DELETE {path}: {e}")
             return {}
+
+    # ── Escáner de mercado ─────────────────────────────────────
+
+    def get_all_symbols(self) -> list[str]:
+        """Devuelve todos los símbolos de futuros perpetuos USDT activos en BingX."""
+        data = self._get("/openApi/swap/v2/quote/contracts")
+        symbols = []
+        for item in data.get("data", []):
+            sym = item.get("symbol", "")
+            # Solo pares USDT activos
+            if sym.endswith("-USDT") and item.get("status", 1) != 0:
+                symbols.append(sym)
+        log.info(f"BingX contratos activos: {len(symbols)}")
+        return symbols
+
+    def get_ticker_24h(self, symbol: str = None) -> list[dict]:
+        """
+        Devuelve tickers 24h. Si symbol es None devuelve todos.
+        Cada dict incluye: symbol, quoteVolume (vol USDT 24h), lastPrice, priceChangePercent
+        """
+        params = {}
+        if symbol:
+            params["symbol"] = symbol
+        data = self._get("/openApi/swap/v2/quote/ticker", params)
+        tickers = data.get("data", [])
+        if isinstance(tickers, dict):
+            tickers = [tickers]
+        return tickers or []
+
+    def scan_by_volume(self, min_volume: float, top_n: int, blacklist: list) -> list[str]:
+        """
+        Escanea todos los tickers de BingX y devuelve los `top_n` símbolos
+        con mayor volumen 24h USDT que superen `min_volume`.
+        Excluye los símbolos en `blacklist`.
+        """
+        tickers = self.get_ticker_24h()
+        if not tickers:
+            log.warning("scan_by_volume: no se recibieron tickers")
+            return []
+
+        results = []
+        for t in tickers:
+            sym = t.get("symbol", "")
+            if not sym.endswith("-USDT"):
+                continue
+            if sym in blacklist:
+                continue
+            try:
+                vol = float(t.get("quoteVolume", t.get("volume", 0)))
+            except Exception:
+                continue
+            if vol >= min_volume:
+                results.append((sym, vol))
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        selected = [s for s, _ in results[:top_n]]
+        log.info(f"Escáner: {len(results)} símbolos ≥ {min_volume/1e6:.1f}M → top {top_n}: {selected}")
+        return selected
 
     # ── Market data ────────────────────────────────────────────
 
