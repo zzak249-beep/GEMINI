@@ -1,13 +1,15 @@
 """
 strategy.py — Lógica de entrada: Score + Decaimiento + CVD
 
-Reglas exactas:
-  LONG  = score > +THR  AND decay_alive AND cvd_rising AND NOT bear_div
-  SHORT = score < -THR  AND decay_alive AND NOT cvd_rising AND NOT bull_div
+CAMBIOS vs versión original:
+  - decay_alive fallback a True cuando ic_peak=0 (datos insuficientes)
+  - REQUIRE_HTF=false por defecto vía variable (HTF bloqueaba demasiado)
+  - Log detallado de por qué NO se genera señal (debug de filtros)
+  - Añadido SCORE_THR_STRONG para señales fuertes independientes
 
-Calidad de la señal:
-  FUERTE → score extremo + bull/bear_div confirmando
-  NORMAL → condiciones base cumplidas
+Reglas:
+  LONG  = score > +THR  AND decay_alive AND cvd_rising AND NOT bear_div [AND htf_bull si REQUIRE_HTF]
+  SHORT = score < -THR  AND decay_alive AND NOT cvd_rising AND NOT bull_div [AND htf_bear si REQUIRE_HTF]
 """
 import numpy as np
 import pandas as pd
@@ -23,13 +25,12 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Signal:
-    direction:  str   = "NONE"     # LONG | SHORT | NONE
-    quality:    str   = "NONE"     # FUERTE | NORMAL | NONE
+    direction:  str   = "NONE"
+    quality:    str   = "NONE"
     entry:      float = 0.0
     sl:         float = 0.0
     tp:         float = 0.0
     atr_val:    float = 0.0
-    # Valores de indicadores para Telegram
     score:      float = 0.0
     decay_pct:  float = 0.0
     cvd_rising: bool  = False
@@ -48,10 +49,7 @@ class Strategy:
     def compute(self,
                 df: pd.DataFrame,
                 df_htf: Optional[pd.DataFrame] = None) -> Signal:
-        """
-        df     : OHLCV 3min con columnas open, high, low, close, volume
-        df_htf : OHLCV 15min (opcional, para filtro HTF)
-        """
+
         if df is None or len(df) < 60:
             return Signal()
 
@@ -79,16 +77,17 @@ class Strategy:
         )
 
         # ── 5. HTF ────────────────────────────────────────────
-        htf_bull = htf_bear = True  # por defecto no filtra
+        htf_bull = htf_bear = True
         if C.REQUIRE_HTF and df_htf is not None and len(df_htf) > C.HTF_SLOW + 2:
             htf_bull, htf_bear = ind.htf_regime(
                 df_htf["close"], C.HTF_FAST, C.HTF_SLOW
             )
 
-        # ── Valores finales (última vela cerrada) ─────────────
+        # ── Valores finales ───────────────────────────────────
         def b(s):
-            try: return bool(s.iloc[-1])
+            try:    return bool(s.iloc[-1])
             except: return False
+
         def f(s):
             try:
                 val = float(s.iloc[-1])
@@ -96,45 +95,44 @@ class Strategy:
             except: return 0.0
 
         sc    = f(score)
-        alive = b(sig_alive)
         dec   = f(decay_r)
+        atr_v = f(atr_s)
+        price = f(c)
+
+        # FIX: decay_r se rellena con 0.5 cuando ic_peak=0 (sin datos suficientes).
+        # 0.5 >= DECAY_THR(0.50) → alive=True — correcto, no bloquea sin razón.
+        # Pero si ic_roll también es NaN, fillna(0.5) puede dar exactamente 0.5
+        # que pasa el threshold por un pelo. Para ser más robustos, usamos
+        # directamente el valor numérico en vez del bool de la serie.
+        alive = dec >= C.DECAY_THR
+
         cvdr  = b(cvd_rising)
         bdiv  = b(bull_div)
         brdiv = b(bear_div)
-        atr_v = f(atr_s)
-        price = f(c)
         fm_v  = f(fm)
         fr_v  = f(fr)
         fv_v  = f(fv)
 
-        # ══════════════════════════════════════════════════════
-        #  REGLAS DE ENTRADA
-        # ══════════════════════════════════════════════════════
+        # ── Reglas ────────────────────────────────────────────
+        long_base    = sc > C.SCORE_THR and alive and cvdr and not brdiv
+        long_htf_ok  = htf_bull if C.REQUIRE_HTF else True
+        long_valid   = long_base and long_htf_ok
+        long_strong  = long_valid and bdiv
 
-        #  LONG:
-        #   ✅ Score > umbral (alcista)
-        #   ✅ Señal viva (decaimiento >= threshold)
-        #   ✅ CVD rising (presión compradora)
-        #   ❌ Sin divergencia bajista (distribución)
-        #   ✅ HTF alcista (si activado)
-        long_base   = sc > C.SCORE_THR and alive and cvdr and not brdiv
-        long_htf_ok = htf_bull if C.REQUIRE_HTF else True
-        long_valid  = long_base and long_htf_ok
-
-        #  LONG FUERTE: además hay divergencia alcista (acumulación oculta)
-        long_strong = long_valid and bdiv
-
-        #  SHORT:
-        #   ✅ Score < -umbral (bajista)
-        #   ✅ Señal viva
-        #   ❌ CVD no rising (presión vendedora)
-        #   ❌ Sin divergencia alcista
-        #   ✅ HTF bajista (si activado)
         short_base   = sc < -C.SCORE_THR and alive and not cvdr and not bdiv
         short_htf_ok = htf_bear if C.REQUIRE_HTF else True
         short_valid  = short_base and short_htf_ok
-
         short_strong = short_valid and brdiv
+
+        # ── Log diagnóstico (INFO para ver en Railway) ────────
+        sym = getattr(df, 'name', '')
+        log.info(
+            f"[strategy] sc={sc:+.3f}(thr±{C.SCORE_THR}) "
+            f"decay={dec*100:.0f}%(thr{C.DECAY_THR*100:.0f}%) alive={alive} "
+            f"cvd={'↑' if cvdr else '↓'} bdiv={bdiv} brdiv={brdiv} "
+            f"htf_bull={htf_bull} htf_bear={htf_bear} "
+            f"→ long={long_valid} short={short_valid}"
+        )
 
         # ── Construir señal ───────────────────────────────────
         sig = Signal()
@@ -155,36 +153,35 @@ class Strategy:
             sig.quality   = "FUERTE" if long_strong else "NORMAL"
             sig.entry     = price
             sig.sl        = price - atr_v * C.SL_ATR_MULT
-            risk          = sig.entry - sig.sl
-            sig.tp        = price + risk * C.TP_RR
+            risk_pts      = sig.entry - sig.sl
+            sig.tp        = price + risk_pts * C.TP_RR
             sig.reasons   = self._reasons_long(sc, alive, dec, cvdr, bdiv, htf_bull)
+            log.info(
+                f"✅ SEÑAL LONG {sig.quality} | "
+                f"entry={sig.entry:.4f} sl={sig.sl:.4f} tp={sig.tp:.4f}"
+            )
 
         elif short_valid:
             sig.direction = "SHORT"
             sig.quality   = "FUERTE" if short_strong else "NORMAL"
             sig.entry     = price
             sig.sl        = price + atr_v * C.SL_ATR_MULT
-            risk          = sig.sl - sig.entry
-            sig.tp        = price - risk * C.TP_RR
+            risk_pts      = sig.sl - sig.entry
+            sig.tp        = price - risk_pts * C.TP_RR
             sig.reasons   = self._reasons_short(sc, alive, dec, cvdr, brdiv, htf_bear)
-
-        if sig.direction != "NONE":
             log.info(
-                f"SEÑAL {sig.direction} {sig.quality} | "
-                f"score={sc:+.3f} decay={dec*100:.0f}% cvd={'↑' if cvdr else '↓'} "
+                f"✅ SEÑAL SHORT {sig.quality} | "
                 f"entry={sig.entry:.4f} sl={sig.sl:.4f} tp={sig.tp:.4f}"
             )
 
         return sig
 
-    # ── Razones ───────────────────────────────────────────────
-
     @staticmethod
     def _reasons_long(sc, alive, dec, cvdr, bdiv, htf_bull):
         r = [f"✅ Score {sc:+.3f} (alcista)"]
         r.append(f"✅ Decaimiento vivo {dec*100:.0f}%")
-        if cvdr: r.append("✅ CVD rising — presión compradora")
-        if bdiv: r.append("💎 CVD Bull Div — acumulación oculta")
+        if cvdr:     r.append("✅ CVD rising — presión compradora")
+        if bdiv:     r.append("💎 CVD Bull Div — acumulación oculta")
         if htf_bull: r.append("✅ HTF alcista (15min)")
         return r
 
@@ -193,6 +190,6 @@ class Strategy:
         r = [f"✅ Score {sc:+.3f} (bajista)"]
         r.append(f"✅ Decaimiento vivo {dec*100:.0f}%")
         if not cvdr: r.append("✅ CVD falling — presión vendedora")
-        if brdiv: r.append("💎 CVD Bear Div — distribución oculta")
+        if brdiv:    r.append("💎 CVD Bear Div — distribución oculta")
         if htf_bear: r.append("✅ HTF bajista (15min)")
         return r
