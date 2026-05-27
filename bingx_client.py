@@ -1,194 +1,276 @@
 """
-bingx_client.py — Cliente BingX Perpetual Futures (One-Way mode)
-Añadido: get_all_symbols() + get_ticker_24h() para el escáner
+Cliente BingX v5.2
+  • get_balance con caché 60s — evita rate limit 100410
+  • TCPConnector sin SSL warnings
 """
-import hmac, hashlib, time, logging, urllib.parse
-import requests
-import config as C
+import asyncio, hashlib, hmac, time, logging
+from urllib.parse import urlencode
+import aiohttp
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("BingX")
+BASE = "https://open-api.bingx.com"
 
 
 class BingXClient:
-    def __init__(self):
-        self.api_key = C.BINGX_API_KEY
-        self.secret  = C.BINGX_SECRET_KEY
-        self.session = requests.Session()
-        self.session.headers.update({"X-BX-APIKEY": self.api_key})
+    def __init__(self, api_key, secret):
+        self.api_key   = api_key
+        self.secret    = secret
+        self._session  = None
+        # ── Caché balance ────────────────────────────────────
+        self._bal_cache     : float = 0.0
+        self._bal_cache_ts  : float = 0.0
+        self._BAL_TTL       : int   = 60   # segundos entre llamadas reales
 
-    # ── Firma ──────────────────────────────────────────────────
+    async def _sess(self):
+        if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=True, limit=50)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                headers={"X-BX-APIKEY": self.api_key},
+                timeout=aiohttp.ClientTimeout(total=15))
+        return self._session
 
-    def _sign(self, params: dict) -> dict:
-        params["timestamp"]  = int(time.time() * 1000)
-        params["recvWindow"] = 5000
-        qs  = urllib.parse.urlencode(sorted(params.items()))
-        sig = hmac.new(self.secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = sig
-        return params
+    def _sign(self, params):
+        q = urlencode(sorted(params.items()))
+        return hmac.new(self.secret.encode(), q.encode(), hashlib.sha256).hexdigest()
 
-    def _get(self, path, params=None, auth=False):
-        p = self._sign(params or {}) if auth else (params or {})
-        try:
-            r = self.session.get(C.BINGX_BASE_URL + path, params=p, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.error(f"GET {path}: {e}")
-            return {}
+    async def _get(self, path, params=None, signed=False):
+        params = params or {}
+        if signed:
+            params["timestamp"] = int(time.time() * 1000)
+            params["signature"] = self._sign(params)
+        s = await self._sess()
+        async with s.get(BASE + path, params=params) as r:
+            data = await r.json(content_type=None)
+        if data.get("code") != 0:
+            raise RuntimeError(f"GET {path}: {data}")
+        return data.get("data", data)
 
-    def _post(self, path, params=None):
-        p   = self._sign(params or {})
-        url = C.BINGX_BASE_URL + path + "?" + urllib.parse.urlencode(sorted(p.items()))
-        try:
-            r = self.session.post(url, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.error(f"POST {path}: {e}")
-            return {}
+    async def _post(self, path, params=None):
+        params = params or {}
+        params["timestamp"] = int(time.time() * 1000)
+        params["signature"] = self._sign(params)
+        s = await self._sess()
+        async with s.post(BASE + path, params=params) as r:
+            data = await r.json(content_type=None)
+        if data.get("code") != 0:
+            raise RuntimeError(f"POST {path}: {data}")
+        return data.get("data", data)
 
-    def _delete(self, path, params=None):
-        p = self._sign(params or {})
-        try:
-            r = self.session.delete(C.BINGX_BASE_URL + path, params=p, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.error(f"DELETE {path}: {e}")
-            return {}
-
-    # ── Escáner de mercado ─────────────────────────────────────
-
-    def get_all_symbols(self) -> list[str]:
-        """Devuelve todos los símbolos de futuros perpetuos USDT activos en BingX."""
-        data = self._get("/openApi/swap/v2/quote/contracts")
-        symbols = []
-        for item in data.get("data", []):
-            sym = item.get("symbol", "")
-            # Solo pares USDT activos
-            if sym.endswith("-USDT") and item.get("status", 1) != 0:
-                symbols.append(sym)
-        log.info(f"BingX contratos activos: {len(symbols)}")
-        return symbols
-
-    def get_ticker_24h(self, symbol: str = None) -> list[dict]:
+    # ── Balance con caché 60s ────────────────────────────────
+    async def get_balance(self, force: bool = False) -> float:
         """
-        Devuelve tickers 24h. Si symbol es None devuelve todos.
-        Cada dict incluye: symbol, quoteVolume (vol USDT 24h), lastPrice, priceChangePercent
+        Devuelve el balance en USDT.
+        Usa caché de 60s para no disparar rate limit 100410.
+        Pasa force=True solo cuando necesitas valor actualizado (status loop).
         """
-        params = {}
-        if symbol:
-            params["symbol"] = symbol
-        data = self._get("/openApi/swap/v2/quote/ticker", params)
-        tickers = data.get("data", [])
-        if isinstance(tickers, dict):
-            tickers = [tickers]
-        return tickers or []
+        now = time.time()
+        if not force and (now - self._bal_cache_ts) < self._BAL_TTL:
+            return self._bal_cache
 
-    def scan_by_volume(self, min_volume: float, top_n: int, blacklist: list) -> list[str]:
-        """
-        Escanea todos los tickers de BingX y devuelve los `top_n` símbolos
-        con mayor volumen 24h USDT que superen `min_volume`.
-        Excluye los símbolos en `blacklist`.
-        """
-        tickers = self.get_ticker_24h()
-        if not tickers:
-            log.warning("scan_by_volume: no se recibieron tickers")
-            return []
-
-        results = []
-        for t in tickers:
-            sym = t.get("symbol", "")
-            if not sym.endswith("-USDT"):
-                continue
-            if sym in blacklist:
-                continue
-            try:
-                vol = float(t.get("quoteVolume", t.get("volume", 0)))
-            except Exception:
-                continue
-            if vol >= min_volume:
-                results.append((sym, vol))
-
-        results.sort(key=lambda x: x[1], reverse=True)
-        selected = [s for s, _ in results[:top_n]]
-        log.info(f"Escáner: {len(results)} símbolos ≥ {min_volume/1e6:.1f}M → top {top_n}: {selected}")
-        return selected
-
-    # ── Market data ────────────────────────────────────────────
-
-    def get_klines(self, symbol: str, interval: str, limit: int = 250) -> list:
-        data = self._get("/openApi/swap/v2/quote/klines", {
-            "symbol": symbol, "interval": interval, "limit": limit
-        })
-        return data.get("data", [])
-
-    def get_funding_rate(self, symbol: str) -> float:
-        data = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-        try: return float(data["data"]["lastFundingRate"])
-        except: return 0.0
-
-    def get_mark_price(self, symbol: str) -> float:
-        data = self._get("/openApi/swap/v2/quote/premiumIndex", {"symbol": symbol})
-        try: return float(data["data"]["markPrice"])
-        except: return 0.0
-
-    # ── Cuenta ─────────────────────────────────────────────────
-
-    def get_balance(self) -> float:
-        data = self._get("/openApi/swap/v2/user/balance", auth=True)
         try:
-            result = data.get("data", {})
-            if isinstance(result, dict):
-                bal = result.get("balance", result)
-                if isinstance(bal, dict):
-                    return float(bal.get("availableMargin", 0))
-                return float(result.get("availableMargin", 0))
-            if isinstance(result, list):
-                for item in result:
-                    if item.get("asset") in ("USDT", "USD"):
-                        return float(item.get("availableMargin", 0))
+            data = await self._get("/openApi/swap/v2/user/balance", signed=True)
+            bal  = self._parse_balance(data)
+            self._bal_cache    = bal
+            self._bal_cache_ts = now
+            log.debug(f"Balance actualizado: {bal:.2f} USDT")
+            return bal
         except Exception as e:
-            log.error(f"Balance parse error: {e} | raw={data}")
+            log.error(f"get_balance: {e}")
+            return self._bal_cache   # devuelve último valor conocido
+
+    def _parse_balance(self, data) -> float:
+        """Maneja los 3 formatos distintos que devuelve BingX."""
+        # Formato 1: {"balance": [...]}
+        if isinstance(data, dict) and "balance" in data:
+            items = data["balance"]
+            if isinstance(items, list):
+                for a in items:
+                    if a.get("asset") == "USDT":
+                        return float(a.get("availableMargin", a.get("available", 0)))
+            elif isinstance(items, dict):
+                return float(items.get("availableMargin", items.get("available", 0)))
+
+        # Formato 2: [{"asset":"USDT",...}]
+        if isinstance(data, list):
+            for a in data:
+                if isinstance(a, dict) and a.get("asset") == "USDT":
+                    return float(a.get("availableMargin", a.get("available", 0)))
+
+        # Formato 3: dict plano
+        if isinstance(data, dict):
+            if data.get("asset") == "USDT":
+                return float(data.get("availableMargin", data.get("available", 0)))
+            for val in data.values():
+                if isinstance(val, dict) and val.get("asset") == "USDT":
+                    return float(val.get("availableMargin", val.get("available", 0)))
+
+        log.warning(f"Balance: formato desconocido → {str(data)[:200]}")
         return 0.0
 
-    def get_positions(self, symbol: str = None) -> list:
-        params = {}
-        if symbol: params["symbol"] = symbol
-        data = self._get("/openApi/swap/v2/trade/openPositions", params, auth=True)
-        positions = data.get("data", []) or []
-        return [p for p in positions if float(p.get("positionAmt", 0)) != 0]
+    # ── Market Data ─────────────────────────────────────────
 
-    # ── Configuración ──────────────────────────────────────────
+    async def get_all_tickers(self) -> list:
+        data = await self._get("/openApi/swap/v2/quote/ticker")
+        return data if isinstance(data, list) else []
 
-    def set_leverage(self, symbol: str, leverage: int):
-        for side in ("LONG", "SHORT"):
-            self._post("/openApi/swap/v2/trade/leverage", {
-                "symbol": symbol, "side": side, "leverage": leverage
-            })
-        log.info(f"Leverage {leverage}x → {symbol}")
+    async def get_klines(self, symbol, interval, limit=200):
+        data = await self._get("/openApi/swap/v2/quote/klines",
+                               {"symbol": symbol, "interval": interval, "limit": limit})
+        result = []
+        for k in (data if isinstance(data, list) else []):
+            result.append([int(k["time"]), float(k["open"]), float(k["high"]),
+                           float(k["low"]), float(k["close"]), float(k["volume"])])
+        return sorted(result, key=lambda x: x[0])
 
-    def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED"):
-        self._post("/openApi/swap/v2/trade/marginType", {
-            "symbol": symbol, "marginType": margin_type
-        })
+    async def get_ticker(self, symbol):
+        data = await self._get("/openApi/swap/v2/quote/ticker", {"symbol": symbol})
+        t = data[0] if isinstance(data, list) else data
+        return {
+            "last"  : float(t["lastPrice"]),
+            "bid"   : float(t.get("bidPrice", 0)),
+            "ask"   : float(t.get("askPrice", 0)),
+            "volume": float(t.get("volume", 0)),
+        }
 
-    # ── Órdenes ────────────────────────────────────────────────
+    # ── L13 OFI ─────────────────────────────────────────────
+    async def get_ofi(self, symbol: str, levels: int = 5) -> float:
+        try:
+            data  = await self._get("/openApi/swap/v2/quote/depth",
+                                    {"symbol": symbol, "limit": levels * 2})
+            bids  = data.get("bids", [])
+            asks  = data.get("asks", [])
+            bid_q = sum(float(b[1]) for b in bids[:levels])
+            ask_q = sum(float(a[1]) for a in asks[:levels])
+            total = bid_q + ask_q
+            return (bid_q - ask_q) / total if total else 0.0
+        except Exception as e:
+            log.debug(f"get_ofi {symbol}: {e}")
+            return 0.0
 
-    def market_order(self, symbol: str, side: str, qty: float) -> dict:
-        """side: BUY | SELL — One-Way mode sin positionSide"""
-        data = self._post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side,
-            "type": "MARKET", "quantity": round(qty, 6),
-        })
-        log.info(f"Market {side} {qty} {symbol} → code={data.get('code')}")
-        return data
+    # ── L14 Funding Rate ─────────────────────────────────────
+    async def get_funding_rate(self, symbol: str) -> float:
+        try:
+            data = await self._get("/openApi/swap/v2/quote/premiumIndex",
+                                   {"symbol": symbol})
+            item = data[0] if isinstance(data, list) else data
+            return float(item.get("lastFundingRate", 0))
+        except Exception as e:
+            log.debug(f"get_funding_rate {symbol}: {e}")
+            return 0.0
 
-    def cancel_all(self, symbol: str):
-        self._delete("/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol})
+    # ── L15 Open Interest ────────────────────────────────────
+    async def get_open_interest(self, symbol: str) -> float:
+        try:
+            data = await self._get("/openApi/swap/v2/quote/openInterest",
+                                   {"symbol": symbol})
+            item = data[0] if isinstance(data, list) else data
+            return float(item.get("openInterest", 0))
+        except Exception as e:
+            log.debug(f"get_open_interest {symbol}: {e}")
+            return 0.0
 
-    def close_position(self, symbol: str, position: dict) -> dict:
-        amt  = float(position.get("positionAmt", 0))
-        if amt == 0: return {}
-        side = "SELL" if amt > 0 else "BUY"
-        return self.market_order(symbol, side, abs(amt))
+    async def get_market_context(self, symbol: str, ofi_levels: int = 5) -> dict:
+        ofi, fr, oi = await asyncio.gather(
+            self.get_ofi(symbol, ofi_levels),
+            self.get_funding_rate(symbol),
+            self.get_open_interest(symbol),
+            return_exceptions=True
+        )
+        return {
+            "ofi"          : ofi if isinstance(ofi, float) else 0.0,
+            "funding_rate" : fr  if isinstance(fr,  float) else 0.0,
+            "open_interest": oi  if isinstance(oi,  float) else 0.0,
+        }
+
+    # ── Positions / Orders ───────────────────────────────────
+    async def get_positions(self, symbol=""):
+        p = {"symbol": symbol} if symbol else {}
+        data = await self._get("/openApi/swap/v2/user/positions", p, signed=True)
+        return data if isinstance(data, list) else []
+
+    async def set_leverage(self, symbol, leverage, side="LONG"):
+        try:
+            await self._post("/openApi/swap/v2/trade/leverage",
+                             {"symbol": symbol, "leverage": leverage, "side": side})
+        except Exception as e:
+            log.warning(f"set_leverage {symbol}: {e}")
+
+    async def place_order(self, symbol, side, size, leverage, sl_price, tp_price=None,
+                          use_maker=True, maker_timeout=30, maker_offset_pct=0.02):
+        await self.set_leverage(symbol, leverage, side)
+        await asyncio.sleep(0.2)
+        bingx_side = "BUY" if side == "LONG" else "SELL"
+        if use_maker:
+            order = await self._place_maker(symbol, bingx_side, side, size,
+                                            sl_price, tp_price, maker_timeout, maker_offset_pct)
+            if order: return order
+            log.info(f"[{symbol}] Maker no llenó — fallback MARKET")
+        return await self._place_market(symbol, bingx_side, side, size, sl_price, tp_price)
+
+    async def _place_maker(self, symbol, bingx_side, pos_side, size,
+                           sl_price, tp_price, timeout, offset_pct):
+        try:
+            ticker = await self.get_ticker(symbol)
+            lp = round(ticker["ask"] * (1 - offset_pct/100), 6) if bingx_side == "BUY" \
+                 else round(ticker["bid"] * (1 + offset_pct/100), 6)
+            params = {"symbol": symbol, "side": bingx_side, "positionSide": pos_side,
+                      "type": "LIMIT", "price": f"{lp:.6f}",
+                      "quantity": f"{size:.4f}", "timeInForce": "PostOnly"}
+            if sl_price: params["stopLossPrice"]   = f"{sl_price:.6f}"
+            if tp_price: params["takeProfitPrice"] = f"{tp_price:.6f}"
+            data     = await self._post("/openApi/swap/v2/trade/order", params)
+            order_id = data.get("order", {}).get("orderId") or data.get("orderId")
+            if not order_id: return None
+            for _ in range(timeout):
+                await asyncio.sleep(1)
+                st = await self._get_order_status(symbol, order_id)
+                if st == "FILLED": return data
+                if st in ("CANCELLED","EXPIRED","REJECTED"): return None
+            await self._cancel_order(symbol, order_id)
+            return None
+        except Exception as e:
+            log.warning(f"[{symbol}] maker: {e}")
+            return None
+
+    async def _place_market(self, symbol, bingx_side, pos_side, size, sl_price, tp_price):
+        params = {"symbol": symbol, "side": bingx_side, "positionSide": pos_side,
+                  "type": "MARKET", "quantity": f"{size:.4f}"}
+        if sl_price: params["stopLossPrice"]   = f"{sl_price:.4f}"
+        if tp_price: params["takeProfitPrice"] = f"{tp_price:.4f}"
+        try:
+            data = await self._post("/openApi/swap/v2/trade/order", params)
+            log.info(f"Market: {symbol} {pos_side} {size} → {data}")
+            return data
+        except Exception as e:
+            log.error(f"place_market {symbol}: {e}"); return None
+
+    async def _get_order_status(self, symbol, order_id):
+        try:
+            data  = await self._get("/openApi/swap/v2/trade/order",
+                                    {"symbol": symbol, "orderId": order_id}, signed=True)
+            order = data[0] if isinstance(data, list) else data
+            return order.get("status", "UNKNOWN")
+        except Exception: return "UNKNOWN"
+
+    async def _cancel_order(self, symbol, order_id):
+        try:
+            await self._post("/openApi/swap/v2/trade/cancelOrder",
+                             {"symbol": symbol, "orderId": order_id})
+        except Exception as e:
+            log.warning(f"cancel_order {symbol}: {e}")
+
+    async def close_position(self, symbol, side):
+        positions = await self.get_positions(symbol)
+        size = 0.0
+        for p in positions:
+            if p.get("positionSide") == side and float(p.get("positionAmt", 0)) != 0:
+                size = abs(float(p["positionAmt"])); break
+        if size == 0: return None
+        params = {"symbol": symbol, "side": "SELL" if side=="LONG" else "BUY",
+                  "positionSide": side, "type": "MARKET",
+                  "quantity": f"{size:.4f}", "reduceOnly": "true"}
+        try:
+            return await self._post("/openApi/swap/v2/trade/order", params)
+        except Exception as e:
+            log.error(f"close_position {symbol}: {e}"); return None
