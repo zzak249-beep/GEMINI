@@ -1,6 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[deploy]
-startCommand = "python scanner_v3.py loop"
-restartPolicyType = "always"
