@@ -174,7 +174,26 @@ def get_all_tickers() -> list:
 def get_klines(symbol: str, interval: str = "1h", limit: int = 80) -> list:
     d = _get("/openApi/swap/v3/quote/klines",
              {"symbol": symbol, "interval": interval, "limit": limit})
-    return d.get("data", []) if d else []
+    raw = d.get("data", []) if d else []
+    if not raw:
+        return []
+    # BingX v3 puede devolver dicts {"open","high","low","close","volume","time"}
+    # o listas [time, open, high, low, close, volume].
+    # Normalizamos todo a lista [time, open, high, low, close, volume]
+    normalized = []
+    for k in raw:
+        if isinstance(k, dict):
+            normalized.append([
+                k.get("time", 0),
+                k.get("open",  k.get("o", 0)),
+                k.get("high",  k.get("h", 0)),
+                k.get("low",   k.get("l", 0)),
+                k.get("close", k.get("c", 0)),
+                k.get("volume",k.get("v", 0)),
+            ])
+        else:
+            normalized.append(k)
+    return normalized
 
 
 def get_funding(symbol: str) -> float:
@@ -320,7 +339,13 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
 
     # ── Extraer OHLCV ────────────────────────────────────────────────
     def _col(kl, idx):
-        return np.array([float(k[idx]) for k in kl])
+        out = []
+        for k in kl:
+            try:
+                out.append(float(k[idx]))
+            except (KeyError, IndexError, TypeError, ValueError):
+                out.append(out[-1] if out else 0.0)
+        return np.array(out)
 
     o  = _col(klines_3m, 1)
     h  = _col(klines_3m, 2)
