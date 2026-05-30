@@ -1,17 +1,21 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║   CRYPTO SCANNER v3.2 — QF×JP ENGINE  (FIXED)                      ║
+║   CRYPTO SCANNER v3.3 — QF×JP ENGINE  (CORREGIDO + MEJORADO)       ║
 ║                                                                      ║
-║   FIXES aplicados:                                                   ║
-║   ✅ HTTP healthcheck integrado (Railway no mata el proceso)         ║
-║   ✅ startCommand: python scanner_v3.py (sin argumento 'loop')       ║
-║   ✅ AUTO_TRADE=true por defecto vía variable Railway                ║
-║   ✅ positionSide eliminado (One-Way mode BingX)                     ║
-║   ✅ SL/TP como órdenes separadas correctas para One-Way             ║
-║   ✅ Endpoint openPositions corregido                                ║
-║   ✅ recvWindow añadido en todas las firmas                          ║
-║   ✅ Umbrales de señal ajustados (STD=50, FUEL=62, SUP=75)           ║
-║   ✅ sell_exhausted removido de long_std (era demasiado restrictivo) ║
+║   FIXES v3.3 aplicados:                                             ║
+║   ✅ FIX #1  AUTO_TRADE — ahora también activo si hay credenciales  ║
+║   ✅ FIX #2  get_balance() — parsing correcto multi-estructura API  ║
+║   ✅ FIX #3  _sign() — recvWindow añadido ANTES de firmar           ║
+║   ✅ FIX #4  set_leverage_margin — One-Way mode sin side            ║
+║   ✅ FIX #5  get_open_positions() — maneja respuesta vacía/None     ║
+║   ✅ FIX #6  Cantidad mínima redondeada a step size BingX           ║
+║   ✅ FIX #7  Retry automático en ordenes fallidas (3 intentos)      ║
+║   ✅ FIX #8  Limpieza de trades_abiertos al detectar cierre         ║
+║   ✅ FIX #9  Log detallado de errores API con raw response          ║
+║   ✅ MEJORA  Trailing stop opcional por variable de entorno         ║
+║   ✅ MEJORA  Resumen de P&L en Telegram cada hora                   ║
+║   ✅ MEJORA  Blacklist de pares problemáticos                       ║
+║   ✅ MEJORA  Circuit breaker — pausa si 3 trades perdedores seguidos║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
@@ -25,13 +29,16 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────
 #  HTTP HEALTHCHECK — arranca ANTES que todo para pasar Railway
 # ─────────────────────────────────────────────────────────────────────
-_PORT   = int(os.environ.get("PORT", "8080"))
-_hstatus = {"scan": 0, "signals": 0, "trades": 0, "last": "starting"}
+_PORT    = int(os.environ.get("PORT", "8080"))
+_hstatus = {"scan": 0, "signals": 0, "trades": 0, "wins": 0, "losses": 0, "last": "starting"}
 
 class _HH(BaseHTTPRequestHandler):
     def do_GET(self):
-        body = (f"OK scans={_hstatus['scan']} signals={_hstatus['signals']} "
-                f"trades={_hstatus['trades']} last={_hstatus['last']}").encode()
+        body = (
+            f"OK scans={_hstatus['scan']} signals={_hstatus['signals']} "
+            f"trades={_hstatus['trades']} wins={_hstatus['wins']} "
+            f"losses={_hstatus['losses']} last={_hstatus['last']}"
+        ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
@@ -53,8 +60,9 @@ threading.Thread(target=_run_http, daemon=True, name="http").start()
 _http_ready.wait(timeout=5)
 print(f"[health] HTTP listo en 0.0.0.0:{_PORT}", flush=True)
 
+
 # ─────────────────────────────────────────────────────────────────────
-#  CONFIG
+#  CONFIG — todas configurables desde Railway Variables
 # ─────────────────────────────────────────────────────────────────────
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
 BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "")
@@ -65,9 +73,22 @@ TRADE_USDT      = float(os.getenv("TRADE_USDT",      "20"))
 LEVERAGE        = int(os.getenv("LEVERAGE",           "5"))
 SL_PCT          = float(os.getenv("SL_PCT",           "2.5"))
 TP_PCT          = float(os.getenv("TP_PCT",           "5.0"))
-# FIX #2: AUTO_TRADE debe setearse explícitamente en Railway Variables
-AUTO_TRADE      = os.getenv("AUTO_TRADE", "false").lower() == "true"
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "3"))
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES",    "3"))
+
+# FIX #1: AUTO_TRADE activo si la variable existe O si hay credenciales válidas
+_auto_env = os.getenv("AUTO_TRADE", "").lower()
+AUTO_TRADE = (_auto_env == "true") or (
+    _auto_env == "" and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+)
+
+# MEJORA: Trailing stop — si TRAILING_PCT > 0 activa trailing en vez de TP fijo
+TRAILING_PCT    = float(os.getenv("TRAILING_PCT",     "0"))    # ej: 1.5 para 1.5%
+# MEJORA: Pares a ignorar siempre (separados por coma)
+BLACKLIST_RAW   = os.getenv("BLACKLIST", "ANIME-USDT,WCT-USDT,TAO-USDT,AAPLX-USDT,NCSKGOOGL2USD-USDT")
+BLACKLIST       = set(s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip())
+# MEJORA: Circuit breaker — pausa N minutos tras X pérdidas consecutivas
+CB_MAX_LOSSES   = int(os.getenv("CB_MAX_LOSSES",      "3"))
+CB_PAUSE_MIN    = int(os.getenv("CB_PAUSE_MIN",       "30"))
 
 BASE_URL = "https://open-api.bingx.com"
 
@@ -85,12 +106,11 @@ I_FVG_MIN=0.3; I_FVG_BARS=40; I_OB_IMP=1.5; I_OB_BARS=50
 I_CVD_LEN=20; I_CVD_DIV=5; I_CVD_ROLL=100
 I_SQ_LEN=20; I_SQ_BBM=2.0; I_SQ_KCM=1.5
 
-# FIX #5: Umbrales más alcanzables
-SC_THR_STD  = 50   # era 55
-SC_THR_FUEL = 62   # era 68
-SC_THR_SUP  = 75   # era 80
+SC_THR_STD  = 50
+SC_THR_FUEL = 62
+SC_THR_SUP  = 75
 SC_W_SCORE=0.30; SC_W_CVD=0.25; SC_W_MOM=0.20; SC_W_DECAY=0.15; SC_W_HTF=0.10
-VOL_ATR_THR = 0.60  # era 0.70
+VOL_ATR_THR = 0.60
 
 MIN_VOLUME_USDT = 5_000_000
 TOP_N           = 10
@@ -98,30 +118,33 @@ INTERVAL_NORMAL = 900
 INTERVAL_ACTIVO = 300
 INTERVAL_ALERTA = 60
 
-trades_abiertos:  dict = {}
-alertas_enviadas: dict = {}
+# ── Estado global ─────────────────────────────────────────────────────
+trades_abiertos:  dict = {}   # symbol → trade_info
+alertas_enviadas: dict = {}   # symbol → timestamp
+consecutive_losses: int = 0
+circuit_breaker_until: float = 0.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ScannerV3")
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  API BingX — FIX #9: recvWindow en firma
+#  API BingX — FIX #3: recvWindow añadido ANTES de firmar
 # ─────────────────────────────────────────────────────────────────────
 
 def _sign(params: dict) -> str:
-    # FIX: recvWindow asegura que la firma no expire
-    params["recvWindow"] = 5000
+    """Firma HMAC-SHA256. recvWindow debe estar en params ANTES de llamar."""
     query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
     return hmac.new(BINGX_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
 
 
 def _get(path: str, params: dict = None, auth: bool = False) -> Optional[dict]:
-    p = params or {}
+    p = dict(params or {})
     headers = {}
     if auth:
-        p["timestamp"] = int(time.time() * 1000)
-        p["signature"] = _sign(p)
+        p["timestamp"]  = int(time.time() * 1000)
+        p["recvWindow"] = 5000              # FIX #3: antes de firmar
+        p["signature"]  = _sign(p)
         headers["X-BX-APIKEY"] = BINGX_API_KEY
     try:
         r = requests.get(BASE_URL + path, params=p, headers=headers, timeout=10)
@@ -132,18 +155,30 @@ def _get(path: str, params: dict = None, auth: bool = False) -> Optional[dict]:
         return None
 
 
-def _post(path: str, params: dict) -> Optional[dict]:
-    params["timestamp"] = int(time.time() * 1000)
-    params["signature"] = _sign(params)
-    url = BASE_URL + path + "?" + urllib.parse.urlencode(sorted(params.items()))
-    headers = {"X-BX-APIKEY": BINGX_API_KEY}
-    try:
-        r = requests.post(url, headers=headers, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.error(f"POST {path}: {e}")
-        return None
+def _post(path: str, params: dict, retries: int = 3) -> Optional[dict]:
+    """POST con retry automático (FIX #7)."""
+    for attempt in range(retries):
+        p = dict(params)
+        p["timestamp"]  = int(time.time() * 1000)
+        p["recvWindow"] = 5000              # FIX #3: antes de firmar
+        p["signature"]  = _sign(p)
+        url = BASE_URL + path + "?" + urllib.parse.urlencode(sorted(p.items()))
+        headers = {"X-BX-APIKEY": BINGX_API_KEY}
+        try:
+            r = requests.post(url, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("code") == 0:
+                return data
+            # FIX #9: log del raw response en errores
+            log.error(f"POST {path} (intento {attempt+1}/{retries}) code={data.get('code')} msg={data.get('msg','?')} | raw: {data}")
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            log.error(f"POST {path} excepción (intento {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+    return None
 
 
 def get_all_tickers() -> list:
@@ -171,33 +206,88 @@ def get_klines(symbol: str, interval: str = "3m", limit: int = 80) -> list:
     return normalized
 
 
-# FIX #8: endpoint correcto para posiciones abiertas
 def get_open_positions() -> list:
+    """FIX #5: maneja correctamente respuesta vacía o None."""
     d = _get("/openApi/swap/v2/trade/openPositions", auth=True)
     if not d:
+        log.warning("get_open_positions: respuesta None de la API")
         return []
-    data = d.get("data", [])
-    return [p for p in (data or []) if float(p.get("positionAmt", 0)) != 0]
+    data = d.get("data")
+    if data is None:
+        return []
+    if isinstance(data, list):
+        return [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
+    # Algunos endpoints devuelven {"data": {"positions": [...]}}
+    if isinstance(data, dict):
+        positions = data.get("positions", [])
+        return [p for p in positions if abs(float(p.get("positionAmt", 0))) > 0]
+    return []
 
 
 def get_balance() -> float:
+    """FIX #2: parsing robusto de la estructura anidada de BingX."""
     d = _get("/openApi/swap/v2/user/balance", auth=True)
     if not d:
+        log.warning("get_balance: respuesta None de la API")
         return 0.0
     try:
-        result = d.get("data", {})
-        if isinstance(result, dict):
-            bal = result.get("balance", result)
+        # FIX #9: log del raw para debug inicial
+        log.debug(f"Balance raw: {d}")
+        data = d.get("data", {})
+
+        # Estructura 1: data.balance.availableMargin (más común)
+        if isinstance(data, dict):
+            bal = data.get("balance", {})
             if isinstance(bal, dict):
-                return float(bal.get("availableMargin", 0))
-            return float(result.get("availableMargin", 0))
+                v = bal.get("availableMargin", bal.get("available", bal.get("crossUnPnl")))
+                if v is not None:
+                    return float(v)
+            # Estructura 2: data.availableMargin directamente
+            v = data.get("availableMargin", data.get("available"))
+            if v is not None:
+                return float(v)
+
+        # Estructura 3: lista de assets
+        if isinstance(data, list):
+            for asset in data:
+                if asset.get("asset", "").upper() in ("USDT", ""):
+                    v = asset.get("availableMargin", asset.get("available"))
+                    if v is not None:
+                        return float(v)
+
+        log.error(f"Balance: estructura no reconocida. Raw: {d}")
     except Exception as e:
-        log.error(f"Balance error: {e}")
+        log.error(f"Balance error: {e} | raw: {d}")
     return 0.0
 
 
+def get_instrument_info(symbol: str) -> dict:
+    """Obtiene stepSize y minQty para calcular cantidad correcta."""
+    try:
+        d = _get("/openApi/swap/v2/quote/contracts")
+        if d and d.get("data"):
+            for c in d["data"]:
+                if c.get("symbol") == symbol:
+                    return {
+                        "step_size": float(c.get("tradeMinQuantity", 0.001)),
+                        "min_qty":   float(c.get("tradeMinQuantity", 0.001)),
+                        "price_precision": int(c.get("pricePrecision", 6)),
+                    }
+    except Exception as e:
+        log.warning(f"instrument_info {symbol}: {e}")
+    return {"step_size": 0.001, "min_qty": 0.001, "price_precision": 6}
+
+
+def round_qty(qty: float, step: float) -> float:
+    """FIX #6: redondea cantidad al step size del instrumento."""
+    if step <= 0:
+        return round(qty, 4)
+    decimals = max(0, -int(math.floor(math.log10(step))))
+    return round(math.floor(qty / step) * step, decimals)
+
+
 # ─────────────────────────────────────────────────────────────────────
-#  INDICADORES
+#  INDICADORES (sin cambios — el motor funciona bien)
 # ─────────────────────────────────────────────────────────────────────
 
 def f_tanh(x: float) -> float:
@@ -270,7 +360,7 @@ def linreg(arr, length):
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  MOTOR QF×JP v3.2 — ANÁLISIS
+#  MOTOR QF×JP v3.3 — ANÁLISIS
 # ─────────────────────────────────────────────────────────────────────
 
 def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
@@ -322,14 +412,13 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     sc_std = float(stdev(np.array([raw_v]*n), I_DLEN)[-1]) or 1e-10
     norm_score = f_tanh(raw_v / sc_std)
 
-    # L3 Decaimiento — FIX #6: usar rolling window correcta
+    # L3 Decaimiento
     ic_num = 0.3
     window = min(I_DLEN, n-5)
     if window >= 8:
         try:
             roc_s  = np.array([(c[i]-c[max(0,i-I_MOM)])/max(c[max(0,i-I_MOM)],1e-10) for i in range(n)])
             fwd    = np.diff(c)/np.maximum(c[:-1],1e-10)
-            # Rolling: últimas window barras
             seg_s  = roc_s[max(0,n-window-1):n-1]
             seg_f  = fwd[max(0,n-window-1):n-1]
             if len(seg_s) > 4 and seg_s.std() > 1e-10 and seg_f.std() > 1e-10:
@@ -458,11 +547,9 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     comp_long  = min(100, cl + round(lconv*0.5))
     comp_short = min(100, cs + round(sconv*0.5))
 
-    # ── SEÑALES — FIX #5: sell_exhausted eliminado de long_std ───────
     long_base  = comp_long  >= SC_THR_STD and exec_ok and sig_alive and vol_ok
     short_base = comp_short >= SC_THR_STD and exec_ok and sig_alive and vol_ok
 
-    # FIX: sell_exhausted era demasiado restrictivo, ahora es bonus no requisito
     long_std  = long_base  and htf_bull
     short_std = short_base and htf_bear
 
@@ -510,7 +597,7 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────────
 
 def scan_mercado():
-    log.info("=== Scan QF×JP v3.2 ===")
+    log.info("=== Scan QF×JP v3.3 ===")
     _hstatus["scan"] += 1
 
     tickers = get_all_tickers()
@@ -528,6 +615,7 @@ def scan_mercado():
     for ticker in tickers:
         sym = ticker.get("symbol","")
         if not sym.endswith("-USDT"): continue
+        if sym in BLACKLIST: continue                           # MEJORA: blacklist
         if any(x in sym for x in ["USDC","BUSD","TUSD","DAI","FDUSD"]): continue
         try:
             vol24  = float(ticker.get("quoteVolume", 0))
@@ -565,115 +653,174 @@ def scan_mercado():
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  AUTO-TRADE — FIX #3 y #4: sin positionSide (One-Way mode)
+#  AUTO-TRADE — FIX completo One-Way mode
 # ─────────────────────────────────────────────────────────────────────
 
 def set_leverage_margin(symbol: str):
-    _post("/openApi/swap/v2/trade/leverage", {"symbol":symbol,"side":"LONG","leverage":str(LEVERAGE)})
-    _post("/openApi/swap/v2/trade/leverage", {"symbol":symbol,"side":"SHORT","leverage":str(LEVERAGE)})
-    _post("/openApi/swap/v2/trade/marginType", {"symbol":symbol,"marginType":"ISOLATED"})
+    """FIX #4: One-Way mode — sin side en leverage."""
+    # Intentar sin side primero (One-Way)
+    r = _post("/openApi/swap/v2/trade/leverage",
+              {"symbol": symbol, "leverage": str(LEVERAGE)})
+    if not r:
+        # Fallback: con side por si el endpoint lo requiere
+        _post("/openApi/swap/v2/trade/leverage",
+              {"symbol": symbol, "side": "LONG",  "leverage": str(LEVERAGE)})
+        _post("/openApi/swap/v2/trade/leverage",
+              {"symbol": symbol, "side": "SHORT", "leverage": str(LEVERAGE)})
+    _post("/openApi/swap/v2/trade/marginType",
+          {"symbol": symbol, "marginType": "ISOLATED"})
 
 
-def abrir_trade_long(symbol: str, precio: float) -> Optional[dict]:
+def _circuit_breaker_check() -> bool:
+    """MEJORA: devuelve True si el circuit breaker está activo."""
+    global circuit_breaker_until
+    if time.time() < circuit_breaker_until:
+        rem = int(circuit_breaker_until - time.time())
+        log.warning(f"⚡ Circuit breaker activo — pausa {rem}s más")
+        return True
+    return False
+
+
+def abrir_trade(symbol: str, precio: float, direccion: str) -> Optional[dict]:
+    """Abre trade LONG o SHORT con todos los fixes aplicados."""
+    global consecutive_losses, circuit_breaker_until
+
     if not BINGX_API_KEY or not AUTO_TRADE:
+        log.info(f"Trade omitido — AUTO_TRADE={AUTO_TRADE} API={'OK' if BINGX_API_KEY else 'NO'}")
         return None
     if symbol in trades_abiertos:
         return None
+    if _circuit_breaker_check():                               # MEJORA: circuit breaker
+        return None
+    if symbol in BLACKLIST:                                    # MEJORA: blacklist
+        return None
 
+    # FIX #5: open positions con manejo robusto
     posiciones = get_open_positions()
-    activos = len(posiciones)
-    if activos >= MAX_OPEN_TRADES:
+    if len(posiciones) >= MAX_OPEN_TRADES:
         log.warning(f"Máx trades ({MAX_OPEN_TRADES}) — skip {symbol}")
         return None
 
+    # FIX #2: balance corregido
     balance = get_balance()
-    if balance <= 0:
-        log.warning(f"Balance cero — skip {symbol}")
+    log.info(f"Balance disponible: ${balance:.2f} USDT")
+    if balance < TRADE_USDT:
+        log.warning(f"Balance insuficiente (${balance:.2f} < ${TRADE_USDT}) — skip {symbol}")
         return None
 
     set_leverage_margin(symbol)
     time.sleep(0.3)
 
-    qty  = round((TRADE_USDT * LEVERAGE) / precio, 4)
-    sl_p = round(precio * (1 - SL_PCT/100), 6)
-    tp_p = round(precio * (1 + TP_PCT/100), 6)
+    # FIX #6: cantidad redondeada al step size
+    info = get_instrument_info(symbol)
+    qty_raw = (TRADE_USDT * LEVERAGE) / precio
+    qty = round_qty(qty_raw, info["step_size"])
+    if qty < info["min_qty"]:
+        log.warning(f"Qty {qty} < minQty {info['min_qty']} — skip {symbol}")
+        return None
 
-    # FIX #3: ONE-WAY mode — sin positionSide
+    is_long = (direccion == "LONG")
+    side_open  = "BUY"  if is_long else "SELL"
+    side_close = "SELL" if is_long else "BUY"
+    sl_p = round(precio * (1 - SL_PCT/100 if is_long else 1 + SL_PCT/100), info["price_precision"])
+    tp_p = round(precio * (1 + TP_PCT/100 if is_long else 1 - TP_PCT/100), info["price_precision"])
+
     orden = _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "BUY",
+        "symbol": symbol, "side": side_open,
         "type": "MARKET", "quantity": str(qty),
     })
-    if not orden or orden.get("code") != 0:
-        log.error(f"Error orden {symbol}: {orden}")
+    if not orden:
+        log.error(f"❌ Orden {direccion} {symbol} fallida tras reintentos")
         return None
 
     time.sleep(0.5)
 
-    # FIX #4: SL/TP sin positionSide
+    # SL
     _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "SELL",
+        "symbol": symbol, "side": side_close,
         "type": "STOP_MARKET", "stopPrice": str(sl_p),
         "closePosition": "true",
     })
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "SELL",
-        "type": "TAKE_PROFIT_MARKET", "stopPrice": str(tp_p),
-        "closePosition": "true",
-    })
 
-    trade = {"symbol":symbol,"entry":precio,"sl":sl_p,"tp":tp_p,
-             "qty":qty,"opened_at":datetime.now(timezone.utc).isoformat()}
+    # TP o Trailing stop
+    if TRAILING_PCT > 0:                                       # MEJORA: trailing stop
+        callback = str(round(TRAILING_PCT, 2))
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": side_close,
+            "type": "TRAILING_STOP_MARKET",
+            "callbackRate": callback,
+            "closePosition": "true",
+        })
+        tp_desc = f"Trailing {TRAILING_PCT}%"
+    else:
+        _post("/openApi/swap/v2/trade/order", {
+            "symbol": symbol, "side": side_close,
+            "type": "TAKE_PROFIT_MARKET", "stopPrice": str(tp_p),
+            "closePosition": "true",
+        })
+        tp_desc = str(tp_p)
+
+    trade = {
+        "symbol": symbol, "direction": direccion,
+        "entry": precio, "sl": sl_p, "tp": tp_p, "tp_desc": tp_desc,
+        "qty": qty, "usdt": TRADE_USDT, "leverage": LEVERAGE,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
     trades_abiertos[symbol] = trade
     _hstatus["trades"] = len(trades_abiertos)
-    log.info(f"✅ TRADE ABIERTO {symbol} LONG @ {precio} SL={sl_p} TP={tp_p}")
+    log.info(f"✅ TRADE {direccion} {symbol} @ {precio} | SL={sl_p} TP={tp_desc} Qty={qty}")
     return trade
 
+
+def abrir_trade_long(symbol: str, precio: float) -> Optional[dict]:
+    return abrir_trade(symbol, precio, "LONG")
 
 def abrir_trade_short(symbol: str, precio: float) -> Optional[dict]:
-    if not BINGX_API_KEY or not AUTO_TRADE:
-        return None
-    if symbol in trades_abiertos:
-        return None
+    return abrir_trade(symbol, precio, "SHORT")
 
-    posiciones = get_open_positions()
-    if len(posiciones) >= MAX_OPEN_TRADES:
-        return None
 
-    balance = get_balance()
-    if balance <= 0:
-        return None
-
-    set_leverage_margin(symbol)
-    time.sleep(0.3)
-
-    qty  = round((TRADE_USDT * LEVERAGE) / precio, 4)
-    sl_p = round(precio * (1 + SL_PCT/100), 6)
-    tp_p = round(precio * (1 - TP_PCT/100), 6)
-
-    orden = _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "SELL",
-        "type": "MARKET", "quantity": str(qty),
-    })
-    if not orden or orden.get("code") != 0:
-        log.error(f"Error orden SHORT {symbol}: {orden}")
-        return None
-
-    time.sleep(0.5)
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "BUY",
-        "type": "STOP_MARKET", "stopPrice": str(sl_p), "closePosition": "true",
-    })
-    _post("/openApi/swap/v2/trade/order", {
-        "symbol": symbol, "side": "BUY",
-        "type": "TAKE_PROFIT_MARKET", "stopPrice": str(tp_p), "closePosition": "true",
-    })
-
-    trade = {"symbol":symbol,"entry":precio,"sl":sl_p,"tp":tp_p,
-             "qty":qty,"direction":"SHORT","opened_at":datetime.now(timezone.utc).isoformat()}
-    trades_abiertos[symbol] = trade
+def actualizar_trades_abiertos():
+    """FIX #8: limpia trades_abiertos cuando ya no hay posición en BingX."""
+    global consecutive_losses, circuit_breaker_until
+    if not trades_abiertos:
+        return
+    try:
+        posiciones = get_open_positions()
+        syms_activos = {p.get("symbol") for p in posiciones}
+        cerrados = [sym for sym in list(trades_abiertos.keys()) if sym not in syms_activos]
+        for sym in cerrados:
+            trade = trades_abiertos.pop(sym)
+            # Estimar resultado (aproximado — sin P&L exacto de la API)
+            k = get_klines(sym, "3m", 3)
+            if k:
+                precio_actual = float(k[-1][4])
+                entry = trade["entry"]
+                is_long = trade["direction"] == "LONG"
+                pnl_pct = (precio_actual - entry) / entry * 100 * (1 if is_long else -1)
+                ganado = pnl_pct > 0
+                if ganado:
+                    _hstatus["wins"] += 1
+                    consecutive_losses = 0
+                    resultado = f"✅ WIN +{pnl_pct:.2f}%"
+                else:
+                    _hstatus["losses"] += 1
+                    consecutive_losses += 1
+                    resultado = f"❌ LOSS {pnl_pct:.2f}%"
+                    # MEJORA: circuit breaker
+                    if consecutive_losses >= CB_MAX_LOSSES:
+                        circuit_breaker_until = time.time() + CB_PAUSE_MIN * 60
+                        log.warning(f"⚡ Circuit breaker: {CB_MAX_LOSSES} pérdidas seguidas → pausa {CB_PAUSE_MIN}min")
+                        send_telegram(f"⚡ *Circuit breaker activado*\n{consecutive_losses} pérdidas consecutivas → pausa {CB_PAUSE_MIN} min")
+                log.info(f"Trade cerrado: {sym} {trade['direction']} | {resultado}")
+                send_telegram(
+                    f"📊 *Trade cerrado*: {sym.replace('-USDT','')}\n"
+                    f"Dirección: {trade['direction']} | Entrada: `{entry}`\n"
+                    f"Precio actual: `{precio_actual:.6f}`\n"
+                    f"{resultado}"
+                )
+    except Exception as e:
+        log.error(f"actualizar_trades_abiertos: {e}")
     _hstatus["trades"] = len(trades_abiertos)
-    log.info(f"✅ TRADE SHORT {symbol} @ {precio} SL={sl_p} TP={tp_p}")
-    return trade
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -686,7 +833,7 @@ def send_telegram(msg: str) -> bool:
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"Markdown"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"},
             timeout=10)
         r.raise_for_status()
         log.info("Telegram OK"); return True
@@ -704,6 +851,7 @@ def build_alerta(par: dict) -> str:
     dir_e="🟢" if is_long else "🔴"
     db_fill=max(0,min(8,round(par["decay_r"]/100*8)))
     decay_bar="█"*db_fill+"░"*(8-db_fill)
+    trailing_txt = f"  Trailing SL: `{TRAILING_PCT}%`\n" if TRAILING_PCT > 0 else ""
     lines=[
         f"{emoji} *{sig}: {sym}*",f"{'─'*30}",
         f"{dir_e} SC LONG: `{sc_l}/100` | SC SHORT: `{sc_s}/100`",
@@ -712,7 +860,7 @@ def build_alerta(par: dict) -> str:
         f"💲 `{precio}` | 24h: {par['change_24h']:+.1f}% | Vol: ${par['volume_usdt']/1e6:.1f}M",
         f"🛑 SL: `{sl_p}` (-{SL_PCT}%)",
         f"🎯 TP1: `{tp1}` (+{TP_PCT}%) · TP2: `{tp2}` (+{TP_PCT*1.5:.1f}%)",
-        f"{'─'*30}",f"*Dashboard QF×JP v3.2:*",
+        f"{trailing_txt}{'─'*30}",f"*Dashboard QF×JP v3.3:*",
         f"  DECAY  `{decay_bar} {par['decay_r']}%` {'✓' if par['sig_alive'] else '✗'}",
         f"  HTF    `{'BULL' if par['htf_bull'] else 'BEAR' if par['htf_bear'] else '—'}` | ADX `{par['adx']} {'▲' if par['trend_up'] else '▼' if par['trend_dn'] else '~'}`",
         f"  ASIM.  `{'▲' if par['asym_bull'] else '▼' if par['asym_bear'] else '—'}` | VOL ATR `{par['vol_pct']}%` {'✓' if par['vol_ok'] else '✗'}",
@@ -741,8 +889,20 @@ def build_resumen(res: list, btc_change: float, intervalo: int) -> str:
     fs=[r for r in res if r["short_fuel"] and not r["short_sup"]]
     sl=[r for r in res if r["long_std"]  and not r["long_fuel"]]
     ss=[r for r in res if r["short_std"] and not r["short_fuel"]]
-    lines=[f"📡 *QF×JP v3.2 — {now}*",
-           f"BTC {btce} {btc_change:+.2f}% · próx. {intervalo//60}min",f"{'─'*26}"]
+    wins   = _hstatus["wins"]
+    losses = _hstatus["losses"]
+    total  = wins + losses
+    wr_str = f"{wins}/{total} ({round(wins/total*100)}%)" if total > 0 else "—"
+    cb_str = ""
+    if time.time() < circuit_breaker_until:
+        rem = int((circuit_breaker_until - time.time()) / 60)
+        cb_str = f"\n⚡ Circuit breaker: {rem}min restantes"
+    lines=[
+        f"📡 *QF×JP v3.3 — {now}*",
+        f"BTC {btce} {btc_change:+.2f}% · próx. {intervalo//60}min",
+        f"W/L: `{wr_str}` | Racha perdedora: `{consecutive_losses}`{cb_str}",
+        f"{'─'*26}",
+    ]
     if not res: lines.append("💤 Sin señales"); return "\n".join(lines)
     for lst,lbl in [(sup_l,"🔵 LONG SUP"),(sup_s,"🔵 SHORT SUP"),
                     (fl,"🟡 LONG FUEL"),(fs,"🟡 SHORT FUEL")]:
@@ -760,7 +920,7 @@ def build_resumen(res: list, btc_change: float, intervalo: int) -> str:
         lines+=[f"{'─'*26}",f"💼 Trades ({len(trades_abiertos)}):"]
         for sym,t in trades_abiertos.items():
             d=t.get('direction','LONG')
-            lines.append(f"  📌 {sym.replace('-USDT','')} {d} SL:{t['sl']} TP:{t['tp']}")
+            lines.append(f"  📌 {sym.replace('-USDT','')} {d} SL:{t['sl']} TP:{t.get('tp_desc', t['tp'])}")
     return "\n".join(lines)
 
 
@@ -769,17 +929,27 @@ def build_resumen(res: list, btc_change: float, intervalo: int) -> str:
 # ─────────────────────────────────────────────────────────────────────
 
 def run_loop():
-    log.info(f"🚀 QF×JP Scanner v3.2 — AUTO_TRADE={'ON ✅' if AUTO_TRADE else 'OFF ❌'}")
+    log.info(f"🚀 QF×JP Scanner v3.3 — AUTO_TRADE={'ON ✅' if AUTO_TRADE else 'OFF ❌'}")
     log.info(f"   ${TRADE_USDT}×{LEVERAGE}x | SL {SL_PCT}% | TP {TP_PCT}% | Max {MAX_OPEN_TRADES} trades")
+    log.info(f"   Trailing: {'ON ' + str(TRAILING_PCT) + '%' if TRAILING_PCT > 0 else 'OFF (TP fijo)'}")
+    log.info(f"   Blacklist: {BLACKLIST if BLACKLIST else 'vacía'}")
+    log.info(f"   Circuit breaker: {CB_MAX_LOSSES} pérdidas → pausa {CB_PAUSE_MIN}min")
+
     if not AUTO_TRADE:
-        log.warning("⚠️  AUTO_TRADE=false — el bot solo envía alertas, no abre trades.")
+        log.warning("⚠️  AUTO_TRADE=false — el bot solo envía alertas.")
         log.warning("   Añade AUTO_TRADE=true en Railway Variables para activar trades.")
 
+    # Verificar balance al arrancar
+    if BINGX_API_KEY:
+        bal = get_balance()
+        log.info(f"Balance inicial: ${bal:.2f} USDT")
+
     send_telegram(
-        f"🚀 *QF×JP Scanner v3.2 iniciado*\n"
+        f"🚀 *QF×JP Scanner v3.3 iniciado*\n"
         f"AUTO\\_TRADE: {'✅ ON' if AUTO_TRADE else '❌ OFF'}\n"
         f"Config: ${TRADE_USDT} × {LEVERAGE}x | SL {SL_PCT}% | TP {TP_PCT}%\n"
-        f"Max trades simultáneos: {MAX_OPEN_TRADES}"
+        f"Trailing SL: {'✅ ' + str(TRAILING_PCT) + '%' if TRAILING_PCT > 0 else '❌ OFF'}\n"
+        f"Max trades: {MAX_OPEN_TRADES} | CB: {CB_MAX_LOSSES} pérdidas → {CB_PAUSE_MIN}min"
     )
 
     ultima_hora = -1
@@ -787,27 +957,29 @@ def run_loop():
 
     while True:
         try:
+            # FIX #8: limpiar trades cerrados antes de cada scan
+            actualizar_trades_abiertos()
+
             resultados, intervalo, btc_change = scan_mercado()
 
-            # Alertas SUP y FUEL
             for par in resultados:
                 sym = par["symbol"]
-                is_actionable = par["long_sup"] or par["short_sup"] or par["long_fuel"] or par["short_fuel"]
+                is_actionable = (par["long_sup"] or par["short_sup"] or
+                                 par["long_fuel"] or par["short_fuel"])
                 if not is_actionable: continue
-                if time.time() - alertas_enviadas.get(sym,0) < 1800: continue
+                if time.time() - alertas_enviadas.get(sym, 0) < 1800: continue
 
                 msg = build_alerta(par)
                 if send_telegram(msg):
                     alertas_enviadas[sym] = time.time()
 
-                # Auto-trade SUP y FUEL (no solo SUP)
                 if AUTO_TRADE:
                     if (par["long_sup"] or par["long_fuel"]) and sym not in trades_abiertos:
                         trade = abrir_trade_long(sym, par["precio"])
                         if trade:
                             send_telegram(
                                 f"✅ *LONG ABIERTO*: {sym.replace('-USDT','')}\n"
-                                f"Entrada: `{trade['entry']}` · SL: `{trade['sl']}` · TP: `{trade['tp']}`\n"
+                                f"Entrada: `{trade['entry']}` · SL: `{trade['sl']}` · TP: `{trade.get('tp_desc', trade['tp'])}`\n"
                                 f"Qty: `{trade['qty']}` · ${TRADE_USDT}×{LEVERAGE}x"
                             )
                     elif (par["short_sup"] or par["short_fuel"]) and sym not in trades_abiertos:
@@ -815,11 +987,10 @@ def run_loop():
                         if trade:
                             send_telegram(
                                 f"✅ *SHORT ABIERTO*: {sym.replace('-USDT','')}\n"
-                                f"Entrada: `{trade['entry']}` · SL: `{trade['sl']}` · TP: `{trade['tp']}`\n"
+                                f"Entrada: `{trade['entry']}` · SL: `{trade['sl']}` · TP: `{trade.get('tp_desc', trade['tp'])}`\n"
                                 f"Qty: `{trade['qty']}` · ${TRADE_USDT}×{LEVERAGE}x"
                             )
 
-            # Resumen horario
             hora = datetime.now(timezone.utc).hour
             if hora != ultima_hora:
                 send_telegram(build_resumen(resultados, btc_change, intervalo))
@@ -834,7 +1005,7 @@ def run_loop():
 
 
 # ─────────────────────────────────────────────────────────────────────
-#  ENTRY POINT — FIX #1: sin argumento requerido
+#  ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
