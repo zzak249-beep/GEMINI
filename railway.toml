@@ -1,6 +1,9 @@
 [build]
-builder = "nixpacks"
+builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python scanner_v3.py loop"
-restartPolicyType = "always"
+startCommand = "python scanner_v3.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/"
+healthcheckTimeout = 120
