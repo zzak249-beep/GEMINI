@@ -1,26 +1,24 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         CRYPTO SCANNER v4.1 — MOTOR QF×JP MEJORADO             ║
+║         CRYPTO SCANNER v4.2 — MOTOR QF×JP MEJORADO             ║
 ║                                                                  ║
-║  MEJORAS v4.0:                                                   ║
-║  ✅ FIX CRÍTICO: Firma HMAC corregida (signature mismatch)      ║
-║  ✅ FIX: _post firma sin ordenar params                          ║
-║  ✅ FIX: get_balance() maneja todas las estructuras BingX        ║
-║  ✅ NUEVO: Gestión de riesgo dinámica (% del balance)            ║
-║  ✅ NUEVO: Cooldown por símbolo después de pérdida               ║
-║  ✅ NUEVO: Reintentos con backoff exponencial                    ║
-║  ✅ NUEVO: Health endpoint enriquecido (JSON)                    ║
-║  ✅ NUEVO: Resumen diario de P&L                                 ║
-║  ✅ NUEVO: Log de trades a archivo CSV                           ║
-║  ✅ NUEVO: Score mínimo configurable por tipo de señal           ║
-║  ✅ NUEVO: Modo DRY-RUN (simula sin operar)                      ║
-║  ✅ NUEVO: Alertas de errores críticos por Telegram              ║
+║  FIXES v4.2:                                                     ║
+║  ✅ FIX DEFINITIVO rate limit 100410: lee el timestamp exacto   ║
+║     de desbloqueo del mensaje de BingX y espera hasta él        ║
+║  ✅ FIX: delay 1s entre orden MARKET → SL → TP                 ║
 ║                                                                  ║
 ║  FIXES v4.1:                                                     ║
 ║  ✅ FIX: Rate limit 100410 — espera inteligente entre reintentos ║
 ║  ✅ FIX: Delays entre llamadas POST a /trade/* (0.5s)           ║
 ║  ✅ FIX: Blacklist ampliada con NCSKRCL2USD y todos los NCSK*   ║
 ║  ✅ FIX: Filtro de patrones sintéticos (NCSK*, *2USD*)          ║
+║                                                                  ║
+║  MEJORAS v4.0:                                                   ║
+║  ✅ FIX CRÍTICO: Firma HMAC corregida (signature mismatch)      ║
+║  ✅ FIX: get_balance() maneja todas las estructuras BingX        ║
+║  ✅ NUEVO: Gestión de riesgo dinámica (% del balance)            ║
+║  ✅ NUEVO: Cooldown por símbolo, circuit breaker, DRY-RUN       ║
+║  ✅ NUEVO: Health JSON, CSV de trades, resumen diario P&L        ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -228,12 +226,30 @@ def _get(ruta: str, params: dict = None, auth: bool = False) -> Optional[dict]:
         log.warning(f"GET {ruta}: {e}")
     return None
 
+def _esperar_rate_limit(msg: str, ruta: str) -> None:
+    """
+    BingX incluye el timestamp exacto de desbloqueo en el msg del error 100410.
+    Ejemplo: "...will be unblocked after 1780261227213"
+    Lo extraemos y esperamos exactamente hasta ese momento (+500ms de margen).
+    Fallback: 30s si no lo encontramos.
+    """
+    import re
+    match = re.search(r'after\s+(\d{13})', msg)
+    if match:
+        ts_desbloqueo_ms = int(match.group(1))
+        ts_ahora_ms      = int(time.time() * 1000)
+        espera_ms        = ts_desbloqueo_ms - ts_ahora_ms + 500
+        espera_s         = max(1.0, espera_ms / 1000.0)
+    else:
+        espera_s = 30.0
+    log.warning(f"⏱ Rate limit en {ruta} — esperando {espera_s:.1f}s hasta desbloqueo")
+    time.sleep(espera_s)
+
 def _post(ruta: str, params: dict, reintentos: int = 3) -> Optional[dict]:
     for intento in range(reintentos):
         p = dict(params)
         p["timestamp"]  = int(time.time() * 1000)
         p["recvWindow"] = 5000
-        # ✅ FIX: firmar sin ordenar
         p["signature"]  = _firmar(p)
         url = URL_BASE + ruta + "?" + urllib.parse.urlencode(p)
         headers = {"X-BX-APIKEY": BINGX_API_KEY}
@@ -246,23 +262,20 @@ def _post(ruta: str, params: dict, reintentos: int = 3) -> Optional[dict]:
             codigo = data.get("code")
             msg    = data.get("msg", "?")
             log.error(f"POST {ruta} ({intento+1}/{reintentos}) code={codigo} msg={msg}")
-            # Error de autenticación — no reintentar
+            # Error de autenticación — no reintentar nunca
             if codigo in (100001, 100004, 100419):
-                log.error("❌ Error de autenticación — verifica BINGX_API_KEY y BINGX_API_SECRET")
+                log.error("❌ Autenticación fallida — verifica BINGX_API_KEY y BINGX_API_SECRET")
                 return None
-            # Rate limit (100410) — esperar más tiempo antes de reintentar
+            # Rate limit — esperar exactamente hasta el timestamp de desbloqueo
             if codigo == 100410:
-                espera_rl = 3.0 * (intento + 1)
-                log.warning(f"⏱ Rate limit en {ruta} — esperando {espera_rl:.0f}s")
-                time.sleep(espera_rl)
+                _esperar_rate_limit(msg, ruta)
                 continue
         except requests.exceptions.Timeout:
             log.error(f"POST {ruta} ({intento+1}/{reintentos}): timeout")
         except Exception as e:
             log.error(f"POST {ruta} ({intento+1}/{reintentos}): {e}")
         if intento < reintentos - 1:
-            espera = 1.0 * (2 ** intento)   # backoff exponencial: 1s, 2s, 4s
-            time.sleep(espera)
+            time.sleep(1.0 * (2 ** intento))
     return None
 
 # ══════════════════════════════════════════════════════════════════════
@@ -887,12 +900,14 @@ def abrir_trade(simbolo: str, precio: float, direccion: str) -> Optional[dict]:
         log.error(f"❌ Orden {direccion} {simbolo} fallida")
         return None
 
-    time.sleep(0.5)
+    time.sleep(1.0)   # pausa obligatoria entre órdenes del mismo símbolo
 
     # SL
     _post("/openApi/swap/v2/trade/order",
           {"symbol": simbolo, "side": lado_cerrar, "type": "STOP_MARKET",
            "stopPrice": str(sl_p), "closePosition": "true"})
+
+    time.sleep(1.0)
 
     # TP / Trailing
     if TRAILING_PCT > 0:
