@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         CRYPTO SCANNER v4.0 — MOTOR QF×JP MEJORADO             ║
+║         CRYPTO SCANNER v4.1 — MOTOR QF×JP MEJORADO             ║
 ║                                                                  ║
 ║  MEJORAS v4.0:                                                   ║
 ║  ✅ FIX CRÍTICO: Firma HMAC corregida (signature mismatch)      ║
@@ -12,10 +12,15 @@
 ║  ✅ NUEVO: Health endpoint enriquecido (JSON)                    ║
 ║  ✅ NUEVO: Resumen diario de P&L                                 ║
 ║  ✅ NUEVO: Log de trades a archivo CSV                           ║
-║  ✅ NUEVO: Filtro de momentum multi-timeframe                    ║
 ║  ✅ NUEVO: Score mínimo configurable por tipo de señal           ║
 ║  ✅ NUEVO: Modo DRY-RUN (simula sin operar)                      ║
 ║  ✅ NUEVO: Alertas de errores críticos por Telegram              ║
+║                                                                  ║
+║  FIXES v4.1:                                                     ║
+║  ✅ FIX: Rate limit 100410 — espera inteligente entre reintentos ║
+║  ✅ FIX: Delays entre llamadas POST a /trade/* (0.5s)           ║
+║  ✅ FIX: Blacklist ampliada con NCSKRCL2USD y todos los NCSK*   ║
+║  ✅ FIX: Filtro de patrones sintéticos (NCSK*, *2USD*)          ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -120,9 +125,19 @@ COOLDOWN_LOSS_M  = int(os.getenv("COOLDOWN_LOSS_MIN", "60"))  # pausa por símbo
 # Filtros
 BLACKLIST_RAW = os.getenv(
     "BLACKLIST",
-    "ANIME-USDT,WCT-USDT,TAO-USDT,AAPLX-USDT,NCSKGOOGL2USD-USDT,VINE-USDT"
+    "ANIME-USDT,WCT-USDT,TAO-USDT,AAPLX-USDT,NCSKGOOGL2USD-USDT,VINE-USDT,"
+    "NCSKRCL2USD-USDT,NCSKTSLA2USD-USDT,NCSKAMZN2USD-USDT,NCSKNVDA2USD-USDT,"
+    "NCSKMSFT2USD-USDT,NCSKAAPL2USD-USDT,NCSKSPY2USD-USDT"
 )
-BLACKLIST         = set(s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip())
+BLACKLIST = set(s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip())
+
+# Patrones adicionales que se filtran aunque no estén en blacklist explícita
+# (pares sintéticos de acciones, índices, stablecoins adicionales)
+_PATRONES_EXCLUIR = (
+    "USDC", "BUSD", "TUSD", "DAI", "FDUSD",   # stablecoins
+    "NCSK",                                      # acciones sintéticas BingX
+    "2USD",                                      # otro patrón de sintéticos
+)
 VOL_MIN_USDT      = float(os.getenv("MIN_VOLUME_USDT", "5000000"))
 TOP_N             = int(os.getenv("TOP_N", "10"))
 
@@ -231,16 +246,22 @@ def _post(ruta: str, params: dict, reintentos: int = 3) -> Optional[dict]:
             codigo = data.get("code")
             msg    = data.get("msg", "?")
             log.error(f"POST {ruta} ({intento+1}/{reintentos}) code={codigo} msg={msg}")
-            # Si es error de autenticación no reintentamos
+            # Error de autenticación — no reintentar
             if codigo in (100001, 100004, 100419):
                 log.error("❌ Error de autenticación — verifica BINGX_API_KEY y BINGX_API_SECRET")
                 return None
+            # Rate limit (100410) — esperar más tiempo antes de reintentar
+            if codigo == 100410:
+                espera_rl = 3.0 * (intento + 1)
+                log.warning(f"⏱ Rate limit en {ruta} — esperando {espera_rl:.0f}s")
+                time.sleep(espera_rl)
+                continue
         except requests.exceptions.Timeout:
             log.error(f"POST {ruta} ({intento+1}/{reintentos}): timeout")
         except Exception as e:
             log.error(f"POST {ruta} ({intento+1}/{reintentos}): {e}")
         if intento < reintentos - 1:
-            espera = 0.5 * (2 ** intento)   # backoff exponencial
+            espera = 1.0 * (2 ** intento)   # backoff exponencial: 1s, 2s, 4s
             time.sleep(espera)
     return None
 
@@ -714,7 +735,7 @@ def escanear_mercado():
             continue
         if sym in BLACKLIST:
             continue
-        if any(x in sym for x in ("USDC", "BUSD", "TUSD", "DAI", "FDUSD")):
+        if any(x in sym for x in _PATRONES_EXCLUIR):
             continue
         # Cooldown por símbolo tras pérdida
         if time.time() < cooldown_sym.get(sym, 0):
@@ -773,15 +794,25 @@ def escanear_mercado():
 # AUTO-TRADE
 # ══════════════════════════════════════════════════════════════════════
 def configurar_apalancamiento(simbolo: str):
+    """
+    Configura apalancamiento e margen ISOLATED.
+    Incluye delays para evitar rate limit 100410 de BingX.
+    """
+    # Intento 1: endpoint unificado (algunas cuentas lo soportan)
     r = _post("/openApi/swap/v2/trade/leverage",
               {"symbol": simbolo, "leverage": str(LEVERAGE)})
+    time.sleep(0.5)   # pausa entre llamadas de trade
     if not r:
+        # Intento 2: separado por LONG y SHORT
         _post("/openApi/swap/v2/trade/leverage",
               {"symbol": simbolo, "side": "LONG",  "leverage": str(LEVERAGE)})
+        time.sleep(0.5)
         _post("/openApi/swap/v2/trade/leverage",
               {"symbol": simbolo, "side": "SHORT", "leverage": str(LEVERAGE)})
+        time.sleep(0.5)
     _post("/openApi/swap/v2/trade/marginType",
           {"symbol": simbolo, "marginType": "ISOLATED"})
+    time.sleep(0.5)
 
 def circuit_breaker_activo() -> bool:
     if time.time() < circuit_breaker_hasta:
