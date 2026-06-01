@@ -1,10 +1,14 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         CRYPTO SCANNER v4.2 — MOTOR QF×JP MEJORADO             ║
+║         CRYPTO SCANNER v4.3 — MOTOR QF×JP MEJORADO             ║
+║                                                                  ║
+║  FIXES v4.3:                                                     ║
+║  ✅ FIX: Cache de símbolos ya configurados — leverage no repite ║
+║  ✅ FIX: get_balance() silencia rate-limit sin spam de logs     ║
+║  ✅ FIX: configurar_apalancamiento retorna bool y tiene sleeps  ║
 ║                                                                  ║
 ║  FIXES v4.2:                                                     ║
-║  ✅ FIX DEFINITIVO rate limit 100410: lee el timestamp exacto   ║
-║     de desbloqueo del mensaje de BingX y espera hasta él        ║
+║  ✅ FIX DEFINITIVO rate limit 100410: lee timestamp desbloqueo  ║
 ║  ✅ FIX: delay 1s entre orden MARKET → SL → TP                 ║
 ║                                                                  ║
 ║  FIXES v4.1:                                                     ║
@@ -323,10 +327,16 @@ def get_posiciones_abiertas() -> list:
 
 def get_balance() -> float:
     """
-    ✅ MEJORADO: prueba múltiples rutas de la respuesta de BingX.
+    Lee el balance disponible en futuros USDT.
+    Maneja todas las estructuras conocidas de BingX.
+    Si hay rate-limit en este endpoint retorna 0 silenciosamente.
     """
     d = _get("/openApi/swap/v2/user/balance", auth=True)
     if not d:
+        return 0.0
+    # Rate-limit o error API — no spamear logs
+    if d.get("code") and d.get("code") != 0:
+        log.debug(f"get_balance() code={d.get('code')} — retornando 0")
         return 0.0
     try:
         data = d.get("data", {})
@@ -351,7 +361,7 @@ def get_balance() -> float:
                         v = activo.get(k)
                         if v is not None:
                             return float(v)
-        log.warning(f"Balance: estructura no reconocida → {json.dumps(d)[:200]}")
+        log.debug(f"Balance: estructura no reconocida → {json.dumps(d)[:150]}")
     except Exception as e:
         log.error(f"get_balance() error: {e}")
     return 0.0
@@ -806,26 +816,55 @@ def escanear_mercado():
 # ══════════════════════════════════════════════════════════════════════
 # AUTO-TRADE
 # ══════════════════════════════════════════════════════════════════════
-def configurar_apalancamiento(simbolo: str):
+
+# Cache de símbolos ya configurados — evita llamar /trade/leverage
+# repetidamente y disparar el rate limit 100410
+_simbolos_configurados: set = set()
+
+def configurar_apalancamiento(simbolo: str) -> bool:
     """
-    Configura apalancamiento e margen ISOLATED.
-    Incluye delays para evitar rate limit 100410 de BingX.
+    Configura leverage e ISOLATED margin UNA sola vez por símbolo por sesión.
+    Retorna True si éxito (o ya estaba configurado), False si fallo crítico.
+
+    El rate limit 100410 en /trade/leverage es la causa principal de órdenes
+    fallidas. Al cachear los símbolos ya configurados lo evitamos por completo.
     """
-    # Intento 1: endpoint unificado (algunas cuentas lo soportan)
+    if simbolo in _simbolos_configurados:
+        return True  # ya configurado en esta sesión, no repetir
+
+    exito = False
+
+    # Intento 1: endpoint unificado
     r = _post("/openApi/swap/v2/trade/leverage",
               {"symbol": simbolo, "leverage": str(LEVERAGE)})
-    time.sleep(0.5)   # pausa entre llamadas de trade
-    if not r:
-        # Intento 2: separado por LONG y SHORT
-        _post("/openApi/swap/v2/trade/leverage",
-              {"symbol": simbolo, "side": "LONG",  "leverage": str(LEVERAGE)})
-        time.sleep(0.5)
-        _post("/openApi/swap/v2/trade/leverage",
-              {"symbol": simbolo, "side": "SHORT", "leverage": str(LEVERAGE)})
-        time.sleep(0.5)
+    time.sleep(0.8)
+
+    if r:
+        exito = True
+    else:
+        # Intento 2: separado LONG / SHORT (cuentas Hedge Mode)
+        rl = _post("/openApi/swap/v2/trade/leverage",
+                   {"symbol": simbolo, "side": "LONG", "leverage": str(LEVERAGE)})
+        time.sleep(0.8)
+        rs = _post("/openApi/swap/v2/trade/leverage",
+                   {"symbol": simbolo, "side": "SHORT", "leverage": str(LEVERAGE)})
+        time.sleep(0.8)
+        exito = bool(rl or rs)
+
+    # Margen ISOLATED (no crítico si falla — algunos tipos de cuenta no lo soportan)
     _post("/openApi/swap/v2/trade/marginType",
           {"symbol": simbolo, "marginType": "ISOLATED"})
     time.sleep(0.5)
+
+    if exito:
+        _simbolos_configurados.add(simbolo)
+        log.info(f"⚙️  Leverage {LEVERAGE}x ISOLATED configurado: {simbolo}")
+    else:
+        log.warning(f"⚠️  No se pudo configurar leverage para {simbolo} — se intenta igualmente")
+        # Añadir al cache para no reintentar en cada señal (evita rate limit en cascada)
+        _simbolos_configurados.add(simbolo)
+
+    return exito
 
 def circuit_breaker_activo() -> bool:
     if time.time() < circuit_breaker_hasta:
@@ -834,7 +873,11 @@ def circuit_breaker_activo() -> bool:
         return True
     return False
 
-def abrir_trade(simbolo: str, precio: float, direccion: str) -> Optional[dict]:
+def abrir_trade(simbolo: str, precio: float, direccion: str,
+                balance_cache: float = -1.0) -> Optional[dict]:
+    """
+    balance_cache: balance ya leido en el ciclo actual (-1 = leer aqui).
+    """
     global racha_perdidas, circuit_breaker_hasta
 
     if not BINGX_API_KEY:
@@ -850,17 +893,18 @@ def abrir_trade(simbolo: str, precio: float, direccion: str) -> Optional[dict]:
 
     posiciones = get_posiciones_abiertas()
     if len(posiciones) >= MAX_TRADES:
-        log.warning(f"Máx. trades ({MAX_TRADES}) alcanzado — skip {simbolo}")
+        log.warning(f"Max trades ({MAX_TRADES}) — skip {simbolo}")
         return None
 
-    balance = get_balance()
-    _estado["balance"] = balance
-    log.info(f"Balance disponible: ${balance:.2f} USDT")
+    # Reusar balance del ciclo para no llamar la API N veces por escaneo
+    balance = get_balance() if balance_cache < 0 else balance_cache
+    if balance_cache < 0:
+        _estado["balance"] = balance
 
     usdt_trade = calcular_usdt_trade(balance)
 
     if balance < usdt_trade:
-        log.warning(f"Balance insuficiente (${balance:.2f} < ${usdt_trade:.2f}) — skip {simbolo}")
+        log.warning(f"Balance insuf. ${balance:.2f} < ${usdt_trade:.2f} — skip {simbolo}")
         return None
 
     if DRY_RUN:
@@ -878,8 +922,7 @@ def abrir_trade(simbolo: str, precio: float, direccion: str) -> Optional[dict]:
         _estado["trades"] = len(trades_abiertos)
         return trade
 
-    configurar_apalancamiento(simbolo)
-    time.sleep(0.3)
+    configurar_apalancamiento(simbolo)  # no-op si ya está en cache
 
     info    = get_info_instrumento(simbolo)
     qty     = redondear_qty((usdt_trade * LEVERAGE) / precio, info["step_size"])
@@ -1221,9 +1264,26 @@ def ejecutar():
                 _estado["wins"] = _estado["losses"] = 0
             ultimo_dia = ahora.day
 
+
         try:
             actualizar_trades()
             resultados, intervalo, btc_cambio = escanear_mercado()
+
+            # Leer balance UNA sola vez por ciclo — evita N llamadas API y spam de logs
+            balance_ciclo = -1.0
+            if (AUTO_TRADE or DRY_RUN) and BINGX_API_KEY:
+                hay_accionables = any(
+                    r["long_sup"] or r["short_sup"] or r["long_fuel"] or r["short_fuel"]
+                    for r in resultados
+                )
+                if hay_accionables:
+                    balance_ciclo = get_balance()
+                    _estado["balance"] = balance_ciclo
+                    usdt_need = calcular_usdt_trade(balance_ciclo)
+                    if balance_ciclo < usdt_need:
+                        log.warning(f"Balance ${balance_ciclo:.2f} < ${usdt_need:.2f} — auto-trade pausado")
+                    else:
+                        log.info(f"Balance: ${balance_ciclo:.2f} USDT (trade: ${usdt_need:.2f})")
 
             for par in resultados:
                 sym = par["simbolo"]
@@ -1240,24 +1300,24 @@ def ejecutar():
 
                 if AUTO_TRADE or DRY_RUN:
                     if (par["long_sup"] or par["long_fuel"]) and sym not in trades_abiertos:
-                        trade = abrir_trade(sym, par["precio"], "LONG")
+                        trade = abrir_trade(sym, par["precio"], "LONG", balance_ciclo)
                         if trade:
                             enviar_telegram(
                                 f"{'[DRY] ' if DRY_RUN else ''}LONG ABIERTO: "
                                 f"{sym.replace('-USDT','')}\n"
                                 f"Entrada: {trade['entrada']} "
                                 f"SL: {trade['sl']} TP: {trade.get('tp_desc', trade['tp'])}\n"
-                                f"Qty: {trade['qty']} ${trade['usdt']}×{LEVERAGE}x"
+                                f"Qty: {trade['qty']} ${trade['usdt']}x{LEVERAGE}x"
                             )
                     elif (par["short_sup"] or par["short_fuel"]) and sym not in trades_abiertos:
-                        trade = abrir_trade(sym, par["precio"], "SHORT")
+                        trade = abrir_trade(sym, par["precio"], "SHORT", balance_ciclo)
                         if trade:
                             enviar_telegram(
                                 f"{'[DRY] ' if DRY_RUN else ''}SHORT ABIERTO: "
                                 f"{sym.replace('-USDT','')}\n"
                                 f"Entrada: {trade['entrada']} "
                                 f"SL: {trade['sl']} TP: {trade.get('tp_desc', trade['tp'])}\n"
-                                f"Qty: {trade['qty']} ${trade['usdt']}×{LEVERAGE}x"
+                                f"Qty: {trade['qty']} ${trade['usdt']}x{LEVERAGE}x"
                             )
 
             # Resumen horario
