@@ -2,5 +2,5 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python scanner_v4.py"
+startCommand = "python scanner_elite.py"
 restartPolicyType = "always"
