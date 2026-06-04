@@ -958,25 +958,29 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
         log.warning(f"Qty {qty} < minQty {info['min_qty']} — skip {simbolo}")
         return None
 
-    es_long    = (direccion == "LONG")
-    lado_abrir = "BUY"  if es_long else "SELL"
-    lado_cerrar= "SELL" if es_long else "BUY"
+    es_long     = (direccion == "LONG")
+    lado_abrir  = "BUY"  if es_long else "SELL"
+    lado_cerrar = "SELL" if es_long else "BUY"
+    # BingX Hedge Mode: positionSide obligatorio en todas las ordenes (code=109400 sin el)
+    pos_side    = "LONG" if es_long else "SHORT"
     sl_p = round(precio * (1 - SL_PCT/100 if es_long else 1 + SL_PCT/100), info["price_precision"])
     tp_p = round(precio * (1 + TP_PCT/100 if es_long else 1 - TP_PCT/100), info["price_precision"])
 
     orden = _post("/openApi/swap/v2/trade/order",
                   {"symbol": simbolo, "side": lado_abrir,
-                   "type": "MARKET", "quantity": str(qty)})
+                   "type": "MARKET", "quantity": str(qty),
+                   "positionSide": pos_side})
     if not orden:
-        log.error(f"❌ Orden {direccion} {simbolo} fallida")
+        log.error(f"Orden {direccion} {simbolo} fallida")
         return None
 
-    time.sleep(1.0)   # pausa obligatoria entre órdenes del mismo símbolo
+    time.sleep(1.0)
 
     # SL
     _post("/openApi/swap/v2/trade/order",
           {"symbol": simbolo, "side": lado_cerrar, "type": "STOP_MARKET",
-           "stopPrice": str(sl_p), "closePosition": "true"})
+           "stopPrice": str(sl_p), "closePosition": "true",
+           "positionSide": pos_side})
 
     time.sleep(1.0)
 
@@ -986,13 +990,15 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
               {"symbol": simbolo, "side": lado_cerrar,
                "type": "TRAILING_STOP_MARKET",
                "callbackRate": str(round(TRAILING_PCT, 2)),
-               "closePosition": "true"})
+               "closePosition": "true",
+               "positionSide": pos_side})
         tp_desc = f"Trailing {TRAILING_PCT}%"
     else:
         _post("/openApi/swap/v2/trade/order",
               {"symbol": simbolo, "side": lado_cerrar,
                "type": "TAKE_PROFIT_MARKET",
-               "stopPrice": str(tp_p), "closePosition": "true"})
+               "stopPrice": str(tp_p), "closePosition": "true",
+               "positionSide": pos_side})
         tp_desc = str(tp_p)
 
     trade = {
