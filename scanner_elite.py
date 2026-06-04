@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         CRYPTO SCANNER v4.4 — MOTOR QF×JP MEJORADO             ║
+║         CRYPTO SCANNER v4.5 — MOTOR QF×JP MEJORADO             ║
 ║                                                                  ║
 ║  FIXES v4.4:                                                     ║
 ║  ✅ FIX CRÍTICO: _get auth construye URL manualmente (firma OK) ║
@@ -139,11 +139,13 @@ BLACKLIST = set(s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip()
 # Patrones adicionales que se filtran aunque no estén en blacklist explícita
 _PATRONES_EXCLUIR = (
     "USDC", "BUSD", "TUSD", "DAI", "FDUSD",   # stablecoins
-    "NCSK",                                      # acciones sintéticas BingX (NCSKTSLA, etc.)
-    "2USD",                                      # sintéticos en USD
-    "2GBP", "2EUR", "2JPY", "2AUD", "2CAD",    # forex sintético
-    "NCFX",                                      # forex sintético BingX (NCFXEUR2GBP, etc.)
-    "AAPLX", "TESLAX", "GOOGLX", "AMZNX",       # acciones con sufijo X
+    "NCSK",                                     # acciones sintéticas BingX (NCSKTSLA, etc.)
+    "2USD",                                     # sintéticos en USD
+    "2GBP", "2EUR", "2JPY", "2AUD", "2CAD",   # forex sintético
+    "NCFX",                                     # forex sintético BingX (NCFXEUR2GBP, etc.)
+    "AAPLX", "TESLAX", "GOOGLX", "AMZNX",      # acciones con sufijo X
+    "PAXG", "XAUT",                             # tokens de oro (~$3000, qty mínima imposible con $5)
+    "BVOL", "DVOL",                             # índices de volatilidad BingX
 )
 VOL_MIN_USDT      = float(os.getenv("MIN_VOLUME_USDT", "5000000"))
 TOP_N             = int(os.getenv("TOP_N", "10"))
@@ -644,8 +646,9 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
 
     # — CVD (Cumulative Volume Delta) —
     hlr  = h - l
-    bv   = np.where(hlr > 0, (c - l) / hlr * v, v * 0.5)
-    sv   = np.where(hlr > 0, (h - c) / hlr * v, v * 0.5)
+    hlr_safe = np.where(hlr > 0, hlr, 1.0)   # evitar division por cero
+    bv   = np.where(hlr > 0, (c - l) / hlr_safe * v, v * 0.5)
+    sv   = np.where(hlr > 0, (h - c) / hlr_safe * v, v * 0.5)
     db   = bv - sv
     roll = min(I_CVD_ROLL, n)
     cvd  = float(sma(db, roll)[-1]) * roll
@@ -915,6 +918,10 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
     posiciones = get_posiciones_abiertas()
     if len(posiciones) >= MAX_TRADES:
         log.warning(f"Max trades ({MAX_TRADES}) — skip {simbolo}")
+        return None
+
+    # -2.0 = señal del loop: fondos insuficientes confirmados este ciclo
+    if balance_cache == -2.0:
         return None
 
     # Reusar balance del ciclo para no llamar la API N veces por escaneo
@@ -1302,7 +1309,8 @@ def ejecutar():
                     _estado["balance"] = balance_ciclo
                     usdt_need = calcular_usdt_trade(balance_ciclo)
                     if balance_ciclo < usdt_need:
-                        log.warning(f"Balance ${balance_ciclo:.2f} < ${usdt_need:.2f} — auto-trade pausado")
+                        log.warning(f"Balance ${balance_ciclo:.2f} < ${usdt_need:.2f} — auto-trade pausado este ciclo")
+                        balance_ciclo = -2.0   # señal especial: sin fondos, no intentar trades
                     else:
                         log.info(f"Balance: ${balance_ciclo:.2f} USDT (trade: ${usdt_need:.2f})")
 
