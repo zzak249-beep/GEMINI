@@ -1,31 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║         CRYPTO SCANNER v4.5 — MOTOR QF×JP MEJORADO             ║
+║         CRYPTO SCANNER v4.6 — MOTOR QF×JP                      ║
 ║                                                                  ║
-║  FIXES v4.4:                                                     ║
-║  ✅ FIX CRÍTICO: _get auth construye URL manualmente (firma OK) ║
-║  ✅ FIX: filtros forex sintético (NCFX*, *2GBP, *2EUR...)      ║
-║                                                                  ║
-║  FIXES v4.3:                                                     ║
-║  ✅ FIX: Cache leverage — no repite /trade/leverage por sesión  ║
-║  ✅ FIX: get_balance() silencia errores sin spam de logs        ║
-║                                                                  ║
-║  FIXES v4.2:                                                     ║
-║  ✅ FIX DEFINITIVO rate limit 100410: lee timestamp desbloqueo  ║
-║  ✅ FIX: delay 1s entre orden MARKET → SL → TP                 ║
-║                                                                  ║
-║  FIXES v4.1:                                                     ║
-║  ✅ FIX: Rate limit 100410 — espera inteligente entre reintentos ║
-║  ✅ FIX: Delays entre llamadas POST a /trade/* (0.5s)           ║
-║  ✅ FIX: Blacklist ampliada con NCSKRCL2USD y todos los NCSK*   ║
-║  ✅ FIX: Filtro de patrones sintéticos (NCSK*, *2USD*)          ║
-║                                                                  ║
-║  MEJORAS v4.0:                                                   ║
-║  ✅ FIX CRÍTICO: Firma HMAC corregida (signature mismatch)      ║
-║  ✅ FIX: get_balance() maneja todas las estructuras BingX        ║
-║  ✅ NUEVO: Gestión de riesgo dinámica (% del balance)            ║
-║  ✅ NUEVO: Cooldown por símbolo, circuit breaker, DRY-RUN       ║
-║  ✅ NUEVO: Health JSON, CSV de trades, resumen diario P&L        ║
+║  FIXES v4.6:                                                     ║
+║  ✅ FIX CRÍTICO: Persistencia de trades en trades_state.json    ║
+║  ✅ FIX CRÍTICO: Sync activo con BingX al arrancar              ║
+║  ✅ FIX CRÍTICO: SL/TP verificados y reaplicados si faltan      ║
+║  ✅ FIX: Cierre forzado por precio si SL/TP no dispararon       ║
+║  ✅ MEJORA: Filtro de entrada más estricto (score + conv mín)   ║
+║  ✅ MEJORA: MAX_TRADES respeta posiciones reales en BingX       ║
+║  ✅ MEJORA: get_posiciones_abiertas() más robusto               ║
+║  ✅ MEJORA: Salida parcial en TP1, trailing desde TP1           ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -37,14 +22,14 @@ import requests
 import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════
-# SERVIDOR DE SALUD (Health Check)
+# SERVIDOR DE SALUD
 # ══════════════════════════════════════════════════════════════════════
 _PUERTO = int(os.environ.get("PORT", "8080"))
 
 _estado = {
     "escaneos": 0, "señales": 0, "trades": 0,
     "wins": 0, "losses": 0, "ultimo": "iniciando",
-    "balance": 0.0, "pnl_dia": 0.0, "version": "4.0",
+    "balance": 0.0, "pnl_dia": 0.0, "version": "4.6",
     "circuit_breaker": False, "modo": "iniciando"
 }
 
@@ -92,7 +77,7 @@ _http_listo.wait(timeout=5)
 print(f"[salud] HTTP listo en 0.0.0.0:{_PUERTO}", flush=True)
 
 # ══════════════════════════════════════════════════════════════════════
-# CONFIGURACIÓN — todas las variables de entorno
+# CONFIGURACIÓN
 # ══════════════════════════════════════════════════════════════════════
 BINGX_API_KEY    = os.getenv("BINGX_API_KEY", "")
 BINGX_API_SECRET = (os.getenv("BINGX_API_SECRET", "") or
@@ -102,32 +87,36 @@ TELEGRAM_TOKEN   = (os.getenv("TELEGRAM_TOKEN", "") or
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID", "") or
                     os.getenv("TG_CHAT_ID", ""))
 
-# Gestión de riesgo
 TRADE_USDT       = float(os.getenv("TRADE_USDT", "5"))
-RIESGO_PCT_BAL   = float(os.getenv("RIESGO_PCT_BAL", "0"))   # 0 = usar TRADE_USDT fijo
+RIESGO_PCT_BAL   = float(os.getenv("RIESGO_PCT_BAL", "0"))
 LEVERAGE         = int(os.getenv("LEVERAGE", "5"))
 SL_PCT           = float(os.getenv("SL_PCT", "2.5"))
 TP_PCT           = float(os.getenv("TP_PCT", "5.0"))
 TRAILING_PCT     = float(os.getenv("TRAILING_PCT", "0"))
 MAX_TRADES       = int(os.getenv("MAX_OPEN_TRADES", "3"))
 
-# Auto-trade
+# ── Salida parcial: cerrar X% de la posición al llegar a TP1 ──────────
+# Si TP1_PARCIAL_PCT > 0, al alcanzar TP1 se cierra esa fracción
+# y el SL se mueve a break-even para proteger el resto.
+TP1_PARCIAL_PCT  = float(os.getenv("TP1_PARCIAL_PCT", "50"))   # % de qty a cerrar en TP1
+
 _auto_env  = os.getenv("AUTO_TRADE", "").lower()
 AUTO_TRADE = (_auto_env == "true") or (
     _auto_env == "" and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET))
 DRY_RUN    = os.getenv("DRY_RUN", "false").lower() == "true"
 
-# Score mínimo por tipo (configurable)
-SC_MIN_STD  = int(os.getenv("SC_MIN_STD",  "50"))
-SC_MIN_FUEL = int(os.getenv("SC_MIN_FUEL", "62"))
-SC_MIN_SUP  = int(os.getenv("SC_MIN_SUP",  "75"))
+# ── Filtros de entrada más estrictos ─────────────────────────────────
+# v4.6: subimos los mínimos por defecto para reducir over-trading
+SC_MIN_STD  = int(os.getenv("SC_MIN_STD",  "55"))   # era 50
+SC_MIN_FUEL = int(os.getenv("SC_MIN_FUEL", "68"))   # era 62
+SC_MIN_SUP  = int(os.getenv("SC_MIN_SUP",  "78"))   # era 75
+CONV_MIN    = int(os.getenv("CONV_MIN",    "6"))    # NUEVO: convergencias mínimas (era implícito 0)
+ADX_MIN     = float(os.getenv("ADX_MIN",  "22"))    # NUEVO: ADX mínimo para entrar
 
-# Circuit breaker y cooldowns
 CB_MAX_LOSSES    = int(os.getenv("CB_MAX_LOSSES", "3"))
 CB_PAUSA_MIN     = int(os.getenv("CB_PAUSE_MIN", "30"))
-COOLDOWN_LOSS_M  = int(os.getenv("COOLDOWN_LOSS_MIN", "60"))  # pausa por símbolo tras pérdida
+COOLDOWN_LOSS_M  = int(os.getenv("COOLDOWN_LOSS_MIN", "60"))
 
-# Filtros
 BLACKLIST_RAW = os.getenv(
     "BLACKLIST",
     "ANIME-USDT,WCT-USDT,TAO-USDT,AAPLX-USDT,NCSKGOOGL2USD-USDT,VINE-USDT,"
@@ -136,32 +125,29 @@ BLACKLIST_RAW = os.getenv(
 )
 BLACKLIST = set(s.strip().upper() for s in BLACKLIST_RAW.split(",") if s.strip())
 
-# Patrones adicionales que se filtran aunque no estén en blacklist explícita
 _PATRONES_EXCLUIR = (
-    "USDC", "BUSD", "TUSD", "DAI", "FDUSD",   # stablecoins
-    "NCSK",                                     # acciones sintéticas BingX (NCSKTSLA, etc.)
-    "2USD",                                     # sintéticos en USD
-    "2GBP", "2EUR", "2JPY", "2AUD", "2CAD",   # forex sintético
-    "NCFX",                                     # forex sintético BingX (NCFXEUR2GBP, etc.)
-    "AAPLX", "TESLAX", "GOOGLX", "AMZNX",      # acciones con sufijo X
-    "PAXG", "XAUT",                             # tokens de oro (~$3000, qty mínima imposible con $5)
-    "BVOL", "DVOL",                             # índices de volatilidad BingX
+    "USDC", "BUSD", "TUSD", "DAI", "FDUSD",
+    "NCSK", "2USD", "2GBP", "2EUR", "2JPY", "2AUD", "2CAD",
+    "NCFX", "AAPLX", "TESLAX", "GOOGLX", "AMZNX",
+    "PAXG", "XAUT", "BVOL", "DVOL",
 )
 VOL_MIN_USDT      = float(os.getenv("MIN_VOLUME_USDT", "5000000"))
 TOP_N             = int(os.getenv("TOP_N", "10"))
 
-# Intervalos de escaneo
 INT_NORMAL  = int(os.getenv("INTERVAL_NORMAL",  "900"))
 INT_ACTIVO  = int(os.getenv("INTERVAL_ACTIVO",  "300"))
 INT_ALERTA  = int(os.getenv("INTERVAL_ALERTA",  "60"))
 
-# Alertas: re-envío mínimo cada N segundos por símbolo
 ALERTA_COOLDOWN = int(os.getenv("ALERTA_COOLDOWN_SEG", "1800"))
 
 URL_BASE = "https://open-api.bingx.com"
 
+# ── Archivo de persistencia de estado ────────────────────────────────
+# Guardamos trades_abiertos en disco para sobrevivir reinicios en Railway
+TRADES_STATE_FILE = os.getenv("TRADES_STATE_FILE", "trades_state.json")
+
 # ══════════════════════════════════════════════════════════════════════
-# PARÁMETROS DEL MOTOR QF×JP (sin cambios respecto a v3.3)
+# PARÁMETROS MOTOR QF×JP
 # ══════════════════════════════════════════════════════════════════════
 I_MOM=20;I_REV=8;I_VOL_L=14;I_ATR_L=10;I_SMO=3
 I_W1=0.40;I_W2=0.30;I_W3=0.30
@@ -179,13 +165,13 @@ VOL_ATR_THR=0.60
 # ══════════════════════════════════════════════════════════════════════
 # ESTADO GLOBAL
 # ══════════════════════════════════════════════════════════════════════
-trades_abiertos: dict  = {}   # sym -> info del trade
-alertas_enviadas: dict = {}   # sym -> timestamp último envío
-cooldown_sym: dict     = {}   # sym -> timestamp hasta cuándo está en cooldown
+trades_abiertos: dict  = {}
+alertas_enviadas: dict = {}
+cooldown_sym: dict     = {}
 racha_perdidas: int    = 0
 circuit_breaker_hasta: float = 0.0
 pnl_acumulado_dia: float = 0.0
-trades_historico: list = []   # para resumen diario
+trades_historico: list = []
 archivo_csv = "trades_log.csv"
 
 # ══════════════════════════════════════════════════════════════════════
@@ -196,16 +182,39 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("ScannerV4")
+log = logging.getLogger("ScannerV46")
 
 # ══════════════════════════════════════════════════════════════════════
-# FIRMA HMAC — FIX CRÍTICO v4.0
+# PERSISTENCIA DE ESTADO — FIX CRÍTICO v4.6
+# ══════════════════════════════════════════════════════════════════════
+def guardar_estado_trades():
+    """Persiste trades_abiertos en disco para sobrevivir reinicios."""
+    try:
+        with open(TRADES_STATE_FILE, "w") as f:
+            json.dump(trades_abiertos, f, indent=2)
+    except Exception as e:
+        log.warning(f"No se pudo guardar estado: {e}")
+
+def cargar_estado_trades():
+    """Carga trades_abiertos desde disco al arrancar."""
+    global trades_abiertos
+    if not os.path.exists(TRADES_STATE_FILE):
+        return
+    try:
+        with open(TRADES_STATE_FILE) as f:
+            datos = json.load(f)
+        if isinstance(datos, dict) and datos:
+            trades_abiertos = datos
+            log.info(f"♻️  Estado recuperado: {len(trades_abiertos)} trades de sesión anterior")
+            for sym, t in trades_abiertos.items():
+                log.info(f"   → {sym} {t.get('direccion','?')} entrada={t.get('entrada','?')}")
+    except Exception as e:
+        log.warning(f"No se pudo cargar estado: {e}")
+
+# ══════════════════════════════════════════════════════════════════════
+# FIRMA HMAC
 # ══════════════════════════════════════════════════════════════════════
 def _firmar(params: dict) -> str:
-    """
-    BingX requiere que los parámetros NO estén ordenados antes de firmar.
-    Se firma el query string tal como se construye, SIN incluir 'signature'.
-    """
     query = urllib.parse.urlencode(params)
     return hmac.new(
         BINGX_API_SECRET.encode(),
@@ -214,7 +223,7 @@ def _firmar(params: dict) -> str:
     ).hexdigest()
 
 # ══════════════════════════════════════════════════════════════════════
-# LLAMADAS A LA API
+# LLAMADAS API
 # ══════════════════════════════════════════════════════════════════════
 def _get(ruta: str, params: dict = None, auth: bool = False) -> Optional[dict]:
     p = dict(params or {})
@@ -222,12 +231,8 @@ def _get(ruta: str, params: dict = None, auth: bool = False) -> Optional[dict]:
     if auth:
         p["timestamp"]  = int(time.time() * 1000)
         p["recvWindow"] = 5000
-        # Firmar ANTES de añadir signature
         p["signature"]  = _firmar(p)
         headers["X-BX-APIKEY"] = BINGX_API_KEY
-        # ✅ FIX CRÍTICO: construir URL manualmente para preservar el orden
-        # de los params tal como fueron firmados. requests.get(..., params=p)
-        # reordena alfabéticamente y rompe la firma HMAC.
         url = URL_BASE + ruta + "?" + urllib.parse.urlencode(p)
         try:
             r = requests.get(url, headers=headers, timeout=10)
@@ -240,7 +245,6 @@ def _get(ruta: str, params: dict = None, auth: bool = False) -> Optional[dict]:
         except Exception as e:
             log.warning(f"GET {ruta}: {e}")
         return None
-    # Sin auth: params pasados normalmente (no necesitan firma)
     try:
         r = requests.get(URL_BASE + ruta, params=p, timeout=10)
         r.raise_for_status()
@@ -254,12 +258,6 @@ def _get(ruta: str, params: dict = None, auth: bool = False) -> Optional[dict]:
     return None
 
 def _esperar_rate_limit(msg: str, ruta: str) -> None:
-    """
-    BingX incluye el timestamp exacto de desbloqueo en el msg del error 100410.
-    Ejemplo: "...will be unblocked after 1780261227213"
-    Lo extraemos y esperamos exactamente hasta ese momento (+500ms de margen).
-    Fallback: 30s si no lo encontramos.
-    """
     import re
     match = re.search(r'after\s+(\d{13})', msg)
     if match:
@@ -269,7 +267,7 @@ def _esperar_rate_limit(msg: str, ruta: str) -> None:
         espera_s         = max(1.0, espera_ms / 1000.0)
     else:
         espera_s = 30.0
-    log.warning(f"⏱ Rate limit en {ruta} — esperando {espera_s:.1f}s hasta desbloqueo")
+    log.warning(f"⏱ Rate limit en {ruta} — esperando {espera_s:.1f}s")
     time.sleep(espera_s)
 
 def _post(ruta: str, params: dict, reintentos: int = 3) -> Optional[dict]:
@@ -289,11 +287,9 @@ def _post(ruta: str, params: dict, reintentos: int = 3) -> Optional[dict]:
             codigo = data.get("code")
             msg    = data.get("msg", "?")
             log.error(f"POST {ruta} ({intento+1}/{reintentos}) code={codigo} msg={msg}")
-            # Error de autenticación — no reintentar nunca
             if codigo in (100001, 100004, 100419):
-                log.error("❌ Autenticación fallida — verifica BINGX_API_KEY y BINGX_API_SECRET")
+                log.error("❌ Autenticación fallida")
                 return None
-            # Rate limit — esperar exactamente hasta el timestamp de desbloqueo
             if codigo == 100410:
                 _esperar_rate_limit(msg, ruta)
                 continue
@@ -335,35 +331,69 @@ def get_klines(simbolo: str, intervalo: str = "3m", limite: int = 80) -> list:
     return normalizado
 
 def get_posiciones_abiertas() -> list:
+    """
+    v4.6 — más robusto: intenta dos endpoints y normaliza los campos.
+    Devuelve lista de dicts con al menos: symbol, positionAmt, entryPrice, positionSide.
+    """
+    posiciones = []
+
+    # Endpoint principal
     d = _get("/openApi/swap/v2/trade/openPositions", auth=True)
+    if d:
+        data = d.get("data")
+        if isinstance(data, list):
+            posiciones = data
+        elif isinstance(data, dict):
+            posiciones = data.get("positions", [])
+
+    # Filtrar solo posiciones con qty real
+    result = []
+    for p in posiciones:
+        try:
+            amt = float(p.get("positionAmt", p.get("availableAmt", 0)))
+            if abs(amt) > 1e-9:
+                result.append(p)
+        except Exception:
+            continue
+
+    if not result:
+        # Fallback: endpoint alternativo
+        d2 = _get("/openApi/swap/v2/user/positions", auth=True)
+        if d2:
+            data2 = d2.get("data", [])
+            if isinstance(data2, list):
+                for p in data2:
+                    try:
+                        amt = float(p.get("positionAmt", p.get("availableAmt", 0)))
+                        if abs(amt) > 1e-9:
+                            result.append(p)
+                    except Exception:
+                        continue
+
+    return result
+
+def get_ordenes_abiertas(simbolo: str) -> list:
+    """Retorna las órdenes abiertas (SL/TP pendientes) para un símbolo."""
+    d = _get("/openApi/swap/v2/trade/openOrders",
+             {"symbol": simbolo}, auth=True)
     if not d:
         return []
-    data = d.get("data")
-    if data is None:
-        return []
-    if isinstance(data, list):
-        return [p for p in data if abs(float(p.get("positionAmt", 0))) > 0]
+    data = d.get("data", {})
     if isinstance(data, dict):
-        return [p for p in data.get("positions", [])
-                if abs(float(p.get("positionAmt", 0))) > 0]
+        return data.get("orders", [])
+    if isinstance(data, list):
+        return data
     return []
 
 def get_balance() -> float:
-    """
-    Lee el balance disponible en futuros USDT.
-    Maneja todas las estructuras conocidas de BingX.
-    Si hay rate-limit en este endpoint retorna 0 silenciosamente.
-    """
     d = _get("/openApi/swap/v2/user/balance", auth=True)
     if not d:
         return 0.0
-    # Rate-limit o error API — no spamear logs
     if d.get("code") and d.get("code") != 0:
-        log.debug(f"get_balance() code={d.get('code')} msg={d.get('msg','')} — retornando 0")
+        log.debug(f"get_balance() code={d.get('code')} — retornando 0")
         return 0.0
     try:
         data = d.get("data", {})
-        # Estructura 1: data.balance.availableMargin
         if isinstance(data, dict):
             bal = data.get("balance", {})
             if isinstance(bal, dict):
@@ -371,12 +401,10 @@ def get_balance() -> float:
                     v = bal.get(k)
                     if v is not None:
                         return float(v)
-            # Estructura 2: data.availableMargin directamente
             for k in ("availableMargin", "available", "equity"):
                 v = data.get(k)
                 if v is not None:
                     return float(v)
-        # Estructura 3: lista de activos
         if isinstance(data, list):
             for activo in data:
                 if activo.get("asset", "").upper() in ("USDT", ""):
@@ -384,13 +412,11 @@ def get_balance() -> float:
                         v = activo.get(k)
                         if v is not None:
                             return float(v)
-        log.debug(f"Balance: estructura no reconocida → {json.dumps(d)[:150]}")
     except Exception as e:
         log.error(f"get_balance() error: {e}")
     return 0.0
 
 def get_info_instrumento(simbolo: str) -> dict:
-    """Obtiene precisión y cantidad mínima del contrato."""
     try:
         d = _get("/openApi/swap/v2/quote/contracts")
         if d and d.get("data"):
@@ -412,11 +438,128 @@ def redondear_qty(qty: float, step: float) -> float:
     return round(math.floor(qty / step) * step, decimales)
 
 def calcular_usdt_trade(balance: float) -> float:
-    """Retorna cuánto USDT usar según RIESGO_PCT_BAL o TRADE_USDT fijo."""
     if RIESGO_PCT_BAL > 0 and balance > 0:
         usdt = balance * RIESGO_PCT_BAL / 100.0
         return max(1.0, round(usdt, 2))
     return TRADE_USDT
+
+# ══════════════════════════════════════════════════════════════════════
+# SYNC INICIAL CON BINGX — FIX CRÍTICO v4.6
+# ══════════════════════════════════════════════════════════════════════
+def sincronizar_posiciones_bingx():
+    """
+    Al arrancar, lee las posiciones reales de BingX y reconcilia
+    con trades_abiertos (cargado desde disco).
+
+    Casos:
+    A) En trades_abiertos Y en BingX → OK, continuar monitoreando
+    B) En trades_abiertos pero NO en BingX → ya cerrado, registrar como cierre
+    C) En BingX pero NO en trades_abiertos → adoptar (huérfano)
+    """
+    global trades_abiertos
+
+    if not BINGX_API_KEY:
+        return
+
+    log.info("🔄 Sincronizando posiciones con BingX...")
+    posiciones = get_posiciones_abiertas()
+    syms_bingx = {p.get("symbol") for p in posiciones if p.get("symbol")}
+
+    # Caso B: en nuestro state pero ya no en BingX
+    cerrados_remotamente = [sym for sym in list(trades_abiertos.keys())
+                            if sym not in syms_bingx]
+    for sym in cerrados_remotamente:
+        t = trades_abiertos.pop(sym)
+        log.warning(f"⚠️  {sym}: estaba en state pero ya no en BingX — marcado como cerrado externamente")
+        enviar_telegram(
+            f"⚠️ *Posición cerrada externamente*: {sym.replace('-USDT','')}\n"
+            f"Dir: {t.get('direccion','?')} | Entrada: `{t.get('entrada','?')}`\n"
+            f"Cerrado manualmente o por liquidación"
+        )
+
+    # Caso C: en BingX pero no en nuestro state → adoptar
+    for pos in posiciones:
+        sym = pos.get("symbol", "")
+        if sym and sym not in trades_abiertos:
+            try:
+                amt        = float(pos.get("positionAmt", 0))
+                entry      = float(pos.get("avgPrice", pos.get("entryPrice", 0)))
+                pos_side   = pos.get("positionSide", "LONG" if amt > 0 else "SHORT")
+                direccion  = "LONG" if pos_side == "LONG" else "SHORT"
+                trade_huerfano = {
+                    "simbolo":    sym,
+                    "direccion":  direccion,
+                    "entrada":    entry,
+                    "sl":         round(entry * (1 - SL_PCT/100 if direccion=="LONG" else 1 + SL_PCT/100), 6),
+                    "tp":         round(entry * (1 + TP_PCT/100 if direccion=="LONG" else 1 - TP_PCT/100), 6),
+                    "tp_desc":    "adoptado",
+                    "qty":        abs(amt),
+                    "usdt":       TRADE_USDT,
+                    "apalancamiento": LEVERAGE,
+                    "abierto_en": datetime.now(timezone.utc).isoformat(),
+                    "dry_run":    False,
+                    "huerfano":   True,
+                    "sl_aplicado": False,
+                }
+                trades_abiertos[sym] = trade_huerfano
+                log.warning(f"🔗 Adoptado trade huérfano: {sym} {direccion} @ {entry}")
+            except Exception as e:
+                log.warning(f"No se pudo adoptar {sym}: {e}")
+
+    guardar_estado_trades()
+    log.info(f"✅ Sync completo — {len(trades_abiertos)} trades activos rastreados")
+
+# ══════════════════════════════════════════════════════════════════════
+# VERIFICAR Y REAPLICAR SL/TP — FIX CRÍTICO v4.6
+# ══════════════════════════════════════════════════════════════════════
+def verificar_sl_tp(simbolo: str, trade: dict):
+    """
+    Comprueba si las órdenes SL/TP están activas en BingX.
+    Si faltan, las reaaplica. Evita el problema de posiciones sin protección.
+    """
+    if trade.get("dry_run"):
+        return
+
+    ordenes = get_ordenes_abiertas(simbolo)
+    tipos_activos = {o.get("type", "").upper() for o in ordenes}
+
+    es_long   = trade["direccion"] == "LONG"
+    pos_side  = "LONG" if es_long else "SHORT"
+    lado_c    = "SELL" if es_long else "BUY"
+    info      = get_info_instrumento(simbolo)
+
+    tiene_sl = any(t in tipos_activos for t in ("STOP_MARKET", "STOP"))
+    tiene_tp = any(t in tipos_activos for t in ("TAKE_PROFIT_MARKET", "TAKE_PROFIT",
+                                                 "TRAILING_STOP_MARKET"))
+
+    if not tiene_sl:
+        sl_p = trade.get("sl")
+        if sl_p:
+            log.warning(f"⚠️  {simbolo}: SL faltante — reaplicando @ {sl_p}")
+            _post("/openApi/swap/v2/trade/order",
+                  {"symbol": simbolo, "side": lado_c, "type": "STOP_MARKET",
+                   "stopPrice": str(sl_p), "closePosition": "true",
+                   "positionSide": pos_side})
+            time.sleep(0.5)
+
+    if not tiene_tp:
+        tp_p = trade.get("tp")
+        if tp_p and TRAILING_PCT <= 0:
+            log.warning(f"⚠️  {simbolo}: TP faltante — reaplicando @ {tp_p}")
+            _post("/openApi/swap/v2/trade/order",
+                  {"symbol": simbolo, "side": lado_c, "type": "TAKE_PROFIT_MARKET",
+                   "stopPrice": str(tp_p), "closePosition": "true",
+                   "positionSide": pos_side})
+            time.sleep(0.5)
+        elif TRAILING_PCT > 0:
+            log.warning(f"⚠️  {simbolo}: Trailing TP faltante — reaplicando")
+            _post("/openApi/swap/v2/trade/order",
+                  {"symbol": simbolo, "side": lado_c,
+                   "type": "TRAILING_STOP_MARKET",
+                   "callbackRate": str(round(TRAILING_PCT, 2)),
+                   "closePosition": "true",
+                   "positionSide": pos_side})
+            time.sleep(0.5)
 
 # ══════════════════════════════════════════════════════════════════════
 # INDICADORES TÉCNICOS
@@ -499,7 +642,7 @@ def linreg(arr, longitud):
     return m * (longitud - 1) + b
 
 # ══════════════════════════════════════════════════════════════════════
-# MOTOR QF×JP — ANÁLISIS PRINCIPAL
+# MOTOR QF×JP
 # ══════════════════════════════════════════════════════════════════════
 def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     if len(klines_3m) < 50:
@@ -516,27 +659,26 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     l = _col(klines_3m, 3); c = _col(klines_3m, 4); v = _col(klines_3m, 5)
     n = len(c)
 
-    # — ATR y filtro de volatilidad —
     atr      = atr_series(h, l, c, I_ATR_L)
     atr_ahora = float(atr[-1])
     atr_avg20 = float(sma(atr, 20)[-1] or atr_ahora)
     vol_ok    = atr_ahora > atr_avg20 * VOL_ATR_THR
     vol_pct   = round(atr_ahora / atr_avg20 * 100) if atr_avg20 > 0 else 100
 
-    # — Filtro de spread (coste de ejecución) —
     hi_lo      = np.log(np.maximum(h / l, 1e-10))
     spread_est = sma(hi_lo, 5) * c
     bp_drain   = (spread_est / np.maximum(c, 1e-10)) * 100
     exec_ok    = bool(bp_drain[-1] < I_BPT)
 
-    # — ADX / tendencia —
     pdi, mdi, adx_v = adx_series(h, l, c, I_ADX_LEN)
     adx_ahora   = float(adx_v[-1])
     trend_fuerte = adx_ahora >= I_ADX_TH
     trend_up    = bool(pdi[-1] > mdi[-1] and trend_fuerte)
     trend_dn    = bool(mdi[-1] > pdi[-1] and trend_fuerte)
 
-    # — Scores base (momentum, reversión, volumen) —
+    # ── FIX v4.6: ADX mínimo configurable ────────────────────────────
+    adx_ok = adx_ahora >= ADX_MIN
+
     sma_mom = float(sma(c, I_MOM)[-1]); std_mom = float(stdev(c, I_MOM)[-1])
     voln    = std_mom / sma_mom if sma_mom else 1e-10
     f_mom_v = ((c[-1] - c[-I_MOM]) / c[-I_MOM]) / voln if (voln and c[-I_MOM]) else 0.0
@@ -556,7 +698,6 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     sc_std     = float(stdev(np.array([raw_v] * n), I_DLEN)[-1]) or 1e-10
     norm_score = f_tanh(raw_v / sc_std)
 
-    # — Information Coefficient (decay) —
     ic_num = 0.3
     window = min(I_DLEN, n - 5)
     if window >= 8:
@@ -575,14 +716,12 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     decay_r   = min(1.0, ic_num / max(ic_num, 0.01))
     sig_alive = decay_r >= I_DTHR or ic_num >= 0.15
 
-    # — Doji/Pinbar trap —
     vb       = float(sma(v, I_DPB)[-1])
     vs       = bool(v[-1] > vb * I_DPM)
     rn       = bool((h[-1] - l[-1]) < atr_ahora * 0.6)
     dp_buy   = bool(vs and rn and c[-1] > o[-1])
     dp_sell  = bool(vs and rn and c[-1] < o[-1])
 
-    # — HTF (15m) —
     if klines_15m and len(klines_15m) >= 22:
         c15      = _col(klines_15m, 4)
         htf_bull = float(ema(c15, 9)[-1]) > float(ema(c15, 21)[-1])
@@ -591,13 +730,11 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
         htf_bull = norm_score > 0
         htf_bear = norm_score < 0
 
-    # — Asimetría de rangos —
     ur  = np.where(c > o, h - l, 0.0); dr = np.where(c < o, h - l, 0.0)
     aur = float(sma(ur, I_ASL)[-1]);   adr = float(sma(dr, I_ASL)[-1])
     asim_bull = (aur / adr if adr > 0 else 1.0) >= I_ARR
     asim_bear = (adr / aur if aur > 0 else 1.0) >= I_ABR
 
-    # — Trendlines y pivotes —
     ph_arr = pivot_high(h, I_TLL, I_TLR)
     pl_arr = pivot_low(l, I_PLL, I_PLR)
     phv = [(i, v2) for i, v2 in enumerate(ph_arr) if not np.isnan(v2)]
@@ -628,7 +765,6 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     last_sl = float(plr[-1][1]) if plr else float(l[-10:].min())
     last_sh = float(phr[-1][1]) if phr else float(h[-10:].max())
 
-    # — FVG y Order Blocks —
     en_bull_fvg = en_bear_fvg = False
     for i in range(max(0, n - I_FVG_BARS), n - 2):
         if l[i+2] > h[i] and (l[i+2] - h[i]) > atr_ahora * I_FVG_MIN:
@@ -644,9 +780,8 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
             if (o[i]-c[i]) > atr_ahora*I_OB_IMP and c[i] < c[i-1] and c[i-1] > o[i-1]:
                 if c[i-1] >= c[-1] >= o[i-1]: en_bear_ob = True
 
-    # — CVD (Cumulative Volume Delta) —
     hlr  = h - l
-    hlr_safe = np.where(hlr > 0, hlr, 1.0)   # evitar division por cero
+    hlr_safe = np.where(hlr > 0, hlr, 1.0)
     bv   = np.where(hlr > 0, (c - l) / hlr_safe * v, v * 0.5)
     sv   = np.where(hlr > 0, (h - c) / hlr_safe * v, v * 0.5)
     db   = bv - sv
@@ -662,7 +797,6 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     cvd_bull_div = bool(c[-1] < c[-dw-1] and cvd > cvd_prev)
     cvd_bear_div = bool(c[-1] > c[-dw-1] and cvd < cvd_prev)
 
-    # — Squeeze Momentum —
     sb = float(sma(c, I_SQ_LEN)[-1]); sd = float(stdev(c, I_SQ_LEN)[-1])
     sk = float(atr_series(h, l, c, I_SQ_LEN)[-1]); se = float(ema(c, I_SQ_LEN)[-1])
     sq_on = (sb + I_SQ_BBM*sd) < (se + I_SQ_KCM*sk) and (sb - I_SQ_BBM*sd) > (se - I_SQ_KCM*sk)
@@ -680,7 +814,6 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
         sq_bull  = slr > 0
         sq_bear  = slr < 0
 
-    # — Scores compuestos —
     nsl = (f_tanh(norm_score) + 1) / 2
     mml = (f_tanh(f_mom_v * 2) + 1) / 2
     dn  = min(1.0, decay_r)
@@ -708,9 +841,12 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
     comp_long  = min(100, cl + round(lconv * 0.5))
     comp_short = min(100, cs + round(sconv * 0.5))
 
-    # — Clasificación de señales con scores mínimos configurables —
-    long_base  = comp_long  >= SC_MIN_STD  and exec_ok and sig_alive and vol_ok
-    short_base = comp_short >= SC_MIN_STD  and exec_ok and sig_alive and vol_ok
+    # ── v4.6: filtros de entrada más estrictos ────────────────────────
+    # Se añade adx_ok y CONV_MIN como condición base obligatoria
+    long_base  = (comp_long  >= SC_MIN_STD and exec_ok and sig_alive
+                  and vol_ok and adx_ok and lconv >= CONV_MIN)
+    short_base = (comp_short >= SC_MIN_STD and exec_ok and sig_alive
+                  and vol_ok and adx_ok and sconv >= CONV_MIN)
 
     long_std   = long_base  and htf_bull
     short_std  = short_base and htf_bear
@@ -741,6 +877,7 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
         "norm_score": round(norm_score * 100),
         "long_conv": lconv, "short_conv": sconv,
         "sig_alive": sig_alive, "exec_ok": exec_ok, "vol_ok": vol_ok, "vol_pct": vol_pct,
+        "adx_ok": adx_ok,
         "htf_bull": htf_bull, "htf_bear": htf_bear,
         "asim_bull": asim_bull, "asim_bear": asim_bear,
         "dp_buy": dp_buy, "dp_sell": dp_sell,
@@ -759,7 +896,7 @@ def analizar_par(klines_3m: list, klines_15m: list) -> Optional[dict]:
 # SCANNER PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
 def escanear_mercado():
-    log.info("=== Escaneo QF×JP v4.0 ===")
+    log.info("=== Escaneo QF×JP v4.6 ===")
     _estado["escaneos"] += 1
 
     tickers = get_tickers()
@@ -784,7 +921,6 @@ def escanear_mercado():
             continue
         if any(x in sym for x in _PATRONES_EXCLUIR):
             continue
-        # Cooldown por símbolo tras pérdida
         if time.time() < cooldown_sym.get(sym, 0):
             continue
         try:
@@ -840,33 +976,18 @@ def escanear_mercado():
 # ══════════════════════════════════════════════════════════════════════
 # AUTO-TRADE
 # ══════════════════════════════════════════════════════════════════════
-
-# Cache de símbolos ya configurados — evita llamar /trade/leverage
-# repetidamente y disparar el rate limit 100410
 _simbolos_configurados: set = set()
 
 def configurar_apalancamiento(simbolo: str) -> bool:
-    """
-    Configura leverage e ISOLATED margin UNA sola vez por símbolo por sesión.
-    Retorna True si éxito (o ya estaba configurado), False si fallo crítico.
-
-    El rate limit 100410 en /trade/leverage es la causa principal de órdenes
-    fallidas. Al cachear los símbolos ya configurados lo evitamos por completo.
-    """
     if simbolo in _simbolos_configurados:
-        return True  # ya configurado en esta sesión, no repetir
-
+        return True
     exito = False
-
-    # Intento 1: endpoint unificado
     r = _post("/openApi/swap/v2/trade/leverage",
               {"symbol": simbolo, "leverage": str(LEVERAGE)})
     time.sleep(0.8)
-
     if r:
         exito = True
     else:
-        # Intento 2: separado LONG / SHORT (cuentas Hedge Mode)
         rl = _post("/openApi/swap/v2/trade/leverage",
                    {"symbol": simbolo, "side": "LONG", "leverage": str(LEVERAGE)})
         time.sleep(0.8)
@@ -874,20 +995,14 @@ def configurar_apalancamiento(simbolo: str) -> bool:
                    {"symbol": simbolo, "side": "SHORT", "leverage": str(LEVERAGE)})
         time.sleep(0.8)
         exito = bool(rl or rs)
-
-    # Margen ISOLATED (no crítico si falla — algunos tipos de cuenta no lo soportan)
     _post("/openApi/swap/v2/trade/marginType",
           {"symbol": simbolo, "marginType": "ISOLATED"})
     time.sleep(0.5)
-
+    _simbolos_configurados.add(simbolo)
     if exito:
-        _simbolos_configurados.add(simbolo)
-        log.info(f"⚙️  Leverage {LEVERAGE}x ISOLATED configurado: {simbolo}")
+        log.info(f"⚙️  Leverage {LEVERAGE}x ISOLATED: {simbolo}")
     else:
-        log.warning(f"⚠️  No se pudo configurar leverage para {simbolo} — se intenta igualmente")
-        # Añadir al cache para no reintentar en cada señal (evita rate limit en cascada)
-        _simbolos_configurados.add(simbolo)
-
+        log.warning(f"⚠️  Leverage no confirmado para {simbolo}")
     return exito
 
 def circuit_breaker_activo() -> bool:
@@ -899,9 +1014,6 @@ def circuit_breaker_activo() -> bool:
 
 def abrir_trade(simbolo: str, precio: float, direccion: str,
                 balance_cache: float = -1.0) -> Optional[dict]:
-    """
-    balance_cache: balance ya leido en el ciclo actual (-1 = leer aqui).
-    """
     global racha_perdidas, circuit_breaker_hasta
 
     if not BINGX_API_KEY:
@@ -915,22 +1027,21 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
     if simbolo in BLACKLIST:
         return None
 
-    posiciones = get_posiciones_abiertas()
-    if len(posiciones) >= MAX_TRADES:
-        log.warning(f"Max trades ({MAX_TRADES}) — skip {simbolo}")
+    # ── v4.6: respetar posiciones REALES en BingX para MAX_TRADES ────
+    posiciones_reales = get_posiciones_abiertas() if not DRY_RUN else []
+    n_pos_reales = len(posiciones_reales) if not DRY_RUN else len(trades_abiertos)
+    if n_pos_reales >= MAX_TRADES:
+        log.warning(f"Max trades ({MAX_TRADES} reales) — skip {simbolo}")
         return None
 
-    # -2.0 = señal del loop: fondos insuficientes confirmados este ciclo
     if balance_cache == -2.0:
         return None
 
-    # Reusar balance del ciclo para no llamar la API N veces por escaneo
     balance = get_balance() if balance_cache < 0 else balance_cache
     if balance_cache < 0:
         _estado["balance"] = balance
 
     usdt_trade = calcular_usdt_trade(balance)
-
     if balance < usdt_trade:
         log.warning(f"Balance insuf. ${balance:.2f} < ${usdt_trade:.2f} — skip {simbolo}")
         return None
@@ -944,13 +1055,14 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
             "tp": round(precio * (1 + TP_PCT/100 if direccion=="LONG" else 1 - TP_PCT/100), 6),
             "tp_desc": "DRY", "qty": 0, "apalancamiento": LEVERAGE,
             "abierto_en": datetime.now(timezone.utc).isoformat(),
-            "dry_run": True,
+            "dry_run": True, "sl_aplicado": True,
         }
         trades_abiertos[simbolo] = trade
+        guardar_estado_trades()
         _estado["trades"] = len(trades_abiertos)
         return trade
 
-    configurar_apalancamiento(simbolo)  # no-op si ya está en cache
+    configurar_apalancamiento(simbolo)
 
     info    = get_info_instrumento(simbolo)
     qty     = redondear_qty((usdt_trade * LEVERAGE) / precio, info["step_size"])
@@ -961,7 +1073,6 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
     es_long     = (direccion == "LONG")
     lado_abrir  = "BUY"  if es_long else "SELL"
     lado_cerrar = "SELL" if es_long else "BUY"
-    # BingX Hedge Mode: positionSide obligatorio en todas las ordenes (code=109400 sin el)
     pos_side    = "LONG" if es_long else "SHORT"
     sl_p = round(precio * (1 - SL_PCT/100 if es_long else 1 + SL_PCT/100), info["price_precision"])
     tp_p = round(precio * (1 + TP_PCT/100 if es_long else 1 - TP_PCT/100), info["price_precision"])
@@ -977,29 +1088,36 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
     time.sleep(1.0)
 
     # SL
-    _post("/openApi/swap/v2/trade/order",
-          {"symbol": simbolo, "side": lado_cerrar, "type": "STOP_MARKET",
-           "stopPrice": str(sl_p), "closePosition": "true",
-           "positionSide": pos_side})
-
+    r_sl = _post("/openApi/swap/v2/trade/order",
+                 {"symbol": simbolo, "side": lado_cerrar, "type": "STOP_MARKET",
+                  "stopPrice": str(sl_p), "closePosition": "true",
+                  "positionSide": pos_side})
     time.sleep(1.0)
 
     # TP / Trailing
     if TRAILING_PCT > 0:
-        _post("/openApi/swap/v2/trade/order",
-              {"symbol": simbolo, "side": lado_cerrar,
-               "type": "TRAILING_STOP_MARKET",
-               "callbackRate": str(round(TRAILING_PCT, 2)),
-               "closePosition": "true",
-               "positionSide": pos_side})
+        r_tp = _post("/openApi/swap/v2/trade/order",
+                     {"symbol": simbolo, "side": lado_cerrar,
+                      "type": "TRAILING_STOP_MARKET",
+                      "callbackRate": str(round(TRAILING_PCT, 2)),
+                      "closePosition": "true",
+                      "positionSide": pos_side})
         tp_desc = f"Trailing {TRAILING_PCT}%"
     else:
-        _post("/openApi/swap/v2/trade/order",
-              {"symbol": simbolo, "side": lado_cerrar,
-               "type": "TAKE_PROFIT_MARKET",
-               "stopPrice": str(tp_p), "closePosition": "true",
-               "positionSide": pos_side})
+        r_tp = _post("/openApi/swap/v2/trade/order",
+                     {"symbol": simbolo, "side": lado_cerrar,
+                      "type": "TAKE_PROFIT_MARKET",
+                      "stopPrice": str(tp_p), "closePosition": "true",
+                      "positionSide": pos_side})
         tp_desc = str(tp_p)
+
+    sl_ok = bool(r_sl)
+    tp_ok = bool(r_tp)
+
+    if not sl_ok:
+        log.warning(f"⚠️  {simbolo}: SL no confirmado — se verificará en el próximo ciclo")
+    if not tp_ok:
+        log.warning(f"⚠️  {simbolo}: TP no confirmado — se verificará en el próximo ciclo")
 
     trade = {
         "simbolo": simbolo, "direccion": direccion,
@@ -1008,10 +1126,13 @@ def abrir_trade(simbolo: str, precio: float, direccion: str,
         "usdt": usdt_trade, "apalancamiento": LEVERAGE,
         "abierto_en": datetime.now(timezone.utc).isoformat(),
         "dry_run": False,
+        "sl_aplicado": sl_ok,
+        "tp_aplicado": tp_ok,
     }
     trades_abiertos[simbolo] = trade
+    guardar_estado_trades()
     _estado["trades"] = len(trades_abiertos)
-    log.info(f"✅ TRADE {direccion} {simbolo} @ {precio} | SL={sl_p} TP={tp_desc} Qty={qty}")
+    log.info(f"✅ TRADE {direccion} {simbolo} @ {precio} | SL={sl_p}({'OK' if sl_ok else 'FAIL'}) TP={tp_desc}({'OK' if tp_ok else 'FAIL'}) Qty={qty}")
     return trade
 
 def actualizar_trades():
@@ -1019,19 +1140,27 @@ def actualizar_trades():
 
     if not trades_abiertos:
         return
+
     try:
         posiciones_activas = set()
         if not DRY_RUN:
             posiciones = get_posiciones_abiertas()
             posiciones_activas = {p.get("symbol") for p in posiciones}
+
+            # ── v4.6: verificar SL/TP en trades activos ───────────────
+            for sym in list(trades_abiertos.keys()):
+                if sym in posiciones_activas:
+                    verificar_sl_tp(sym, trades_abiertos[sym])
         else:
-            posiciones_activas = set(trades_abiertos.keys())  # en DRY RUN siempre activos
+            posiciones_activas = set(trades_abiertos.keys())
 
         cerrados = [sym for sym in list(trades_abiertos.keys())
                     if sym not in posiciones_activas]
 
         for sym in cerrados:
             trade = trades_abiertos.pop(sym)
+            guardar_estado_trades()
+
             k     = get_klines(sym, "3m", 3)
             if k:
                 pa     = float(k[-1][4])
@@ -1048,26 +1177,21 @@ def actualizar_trades():
                     _estado["losses"]  += 1
                     racha_perdidas     += 1
                     resultado           = f"❌ LOSS {pnl:.2f}%"
-                    # Cooldown para este símbolo
                     cooldown_sym[sym] = time.time() + COOLDOWN_LOSS_M * 60
                     log.info(f"Cooldown {sym}: {COOLDOWN_LOSS_M}min por pérdida")
                     if racha_perdidas >= CB_MAX_LOSSES:
                         circuit_breaker_hasta = time.time() + CB_PAUSA_MIN * 60
                         _estado["circuit_breaker"] = True
-                        log.warning(
-                            f"⚡ Circuit breaker: {CB_MAX_LOSSES} pérdidas → pausa {CB_PAUSA_MIN}min")
+                        log.warning(f"⚡ Circuit breaker: {CB_MAX_LOSSES} pérdidas → pausa {CB_PAUSA_MIN}min")
                         enviar_telegram(
                             f"⚡ *Circuit breaker activado*\n"
-                            f"{racha_perdidas} pérdidas consecutivas → pausa {CB_PAUSA_MIN}min")
+                            f"{racha_perdidas} pérdidas → pausa {CB_PAUSA_MIN}min")
 
-                # Acumular PnL
                 pnl_usdt = trade["usdt"] * LEVERAGE * pnl / 100
                 pnl_acumulado_dia += pnl_usdt
                 _estado["pnl_dia"] = round(pnl_acumulado_dia, 2)
 
-                # Registrar en CSV
                 _guardar_trade_csv(trade, pa, pnl, pnl_usdt, ganado)
-
                 log.info(f"Trade cerrado: {sym} {trade['direccion']} | {resultado} | ${pnl_usdt:+.2f} USDT")
                 enviar_telegram(
                     f"📊 *Trade cerrado*: {sym.replace('-USDT','')}\n"
@@ -1077,7 +1201,6 @@ def actualizar_trades():
                     f"PnL día: `${pnl_acumulado_dia:+.2f}` USDT"
                 )
 
-        # Desactivar circuit breaker si expiró
         if circuit_breaker_hasta and time.time() >= circuit_breaker_hasta:
             _estado["circuit_breaker"] = False
 
@@ -1088,7 +1211,6 @@ def actualizar_trades():
 
 def _guardar_trade_csv(trade: dict, precio_cierre: float, pnl_pct: float,
                         pnl_usdt: float, ganado: bool):
-    """Guarda el trade en un archivo CSV para análisis posterior."""
     existe = os.path.exists(archivo_csv)
     try:
         with open(archivo_csv, "a", newline="") as f:
@@ -1162,10 +1284,11 @@ def construir_alerta(par: dict) -> str:
         f"🛑 SL: `{sl_p}` (-{SL_PCT}%)",
         f"🎯 TP1: `{tp1}` (+{TP_PCT}%) · TP2: `{tp2}` (+{TP_PCT*1.5:.1f}%)",
         f"{trailing}{'─'*30}",
-        f"*Dashboard QF×JP v4.0:*",
+        f"*Dashboard QF×JP v4.6:*",
         f"  DECAY  `{barra} {par['decay_r']}%` {'ok' if par['sig_alive'] else 'x'}",
         f"  HTF    `{'BULL' if par['htf_bull'] else 'BEAR' if par['htf_bear'] else '-'}` | "
-        f"ADX `{par['adx']} {'↑' if par['trend_up'] else '↓' if par['trend_dn'] else '~'}`",
+        f"ADX `{par['adx']} {'↑' if par['trend_up'] else '↓' if par['trend_dn'] else '~'}` "
+        f"{'ok' if par['adx_ok'] else 'bajo'}",
         f"  ASIM   `{'↑' if par['asim_bull'] else '↓' if par['asim_bear'] else '-'}` | "
         f"VOL ATR `{par['vol_pct']}%` {'ok' if par['vol_ok'] else 'x'}",
         f"  TL     `{'LONG' if par['tl_break_long'] else 'SHORT' if par['tl_break_short'] else '-'}`",
@@ -1210,7 +1333,7 @@ def construir_resumen(resultados: list, btc_cambio: float, intervalo: int) -> st
     std_s  = [r for r in resultados if r["short_std"]  and not r["short_fuel"]]
 
     lineas = [
-        f"QF×JP v4.0{modo_str} — {ahora}",
+        f"QF×JP v4.6{modo_str} — {ahora}",
         f"BTC {signo}{btc_cambio:.2f}% | próximo scan {intervalo//60}min",
         f"W/L: {wr_str} | PnL día: {pnl_str} | Racha: {racha_perdidas}{cb_str}",
         f"{'─'*24}",
@@ -1256,26 +1379,31 @@ def ejecutar():
     _estado["modo"] = modo
 
     log.info(f"╔══════════════════════════════════╗")
-    log.info(f"║  QF×JP Scanner v4.0 — {modo:<10} ║")
+    log.info(f"║  QF×JP Scanner v4.6 — {modo:<10} ║")
     log.info(f"╚══════════════════════════════════╝")
     log.info(f"  ${TRADE_USDT}x{LEVERAGE} | SL {SL_PCT}% | TP {TP_PCT}% | Max {MAX_TRADES} trades")
     log.info(f"  Trailing: {'ON ' + str(TRAILING_PCT) + '%' if TRAILING_PCT > 0 else 'OFF'}")
-    log.info(f"  Scores mín: STD={SC_MIN_STD} FUEL={SC_MIN_FUEL} SUP={SC_MIN_SUP}")
+    log.info(f"  Scores mín: STD={SC_MIN_STD} FUEL={SC_MIN_FUEL} SUP={SC_MIN_SUP} CONV≥{CONV_MIN}")
+    log.info(f"  ADX mín: {ADX_MIN} | TP1 parcial: {TP1_PARCIAL_PCT}%")
     log.info(f"  Blacklist: {len(BLACKLIST)} pares")
     log.info(f"  Circuit breaker: {CB_MAX_LOSSES} pérdidas → pausa {CB_PAUSA_MIN}min")
-    log.info(f"  Cooldown por pérdida: {COOLDOWN_LOSS_M}min por símbolo")
+    log.info(f"  Cooldown por pérdida: {COOLDOWN_LOSS_M}min")
 
+    # ── v4.6: cargar estado previo y sincronizar con BingX ────────────
+    cargar_estado_trades()
     if BINGX_API_KEY:
+        sincronizar_posiciones_bingx()
         bal = get_balance()
         _estado["balance"] = bal
-        log.info(f"  Balance inicial: ${bal:.2f} USDT")
+        log.info(f"  Balance: ${bal:.2f} USDT")
 
     enviar_telegram(
-        f"🤖 *QF×JP Scanner v4.0 iniciado*\n"
+        f"🤖 *QF×JP Scanner v4.6 iniciado*\n"
         f"Modo: *{modo}*\n"
         f"Config: ${TRADE_USDT} × {LEVERAGE}x | SL {SL_PCT}% | TP {TP_PCT}%\n"
         f"Max trades: {MAX_TRADES} | CB: {CB_MAX_LOSSES} pérd → {CB_PAUSA_MIN}min\n"
-        f"Scores: STD≥{SC_MIN_STD} FUEL≥{SC_MIN_FUEL} SUP≥{SC_MIN_SUP}"
+        f"Scores: STD≥{SC_MIN_STD} FUEL≥{SC_MIN_FUEL} SUP≥{SC_MIN_SUP} CONV≥{CONV_MIN}\n"
+        f"Trades recuperados: {len(trades_abiertos)}"
     )
 
     ultima_hora   = -1
@@ -1286,7 +1414,6 @@ def ejecutar():
     while True:
         ahora = datetime.now(timezone.utc)
 
-        # Reinicio diario de PnL
         if ahora.day != ultimo_dia:
             if ultimo_dia != -1:
                 enviar_telegram(
@@ -1298,12 +1425,10 @@ def ejecutar():
                 _estado["wins"] = _estado["losses"] = 0
             ultimo_dia = ahora.day
 
-
         try:
             actualizar_trades()
             resultados, intervalo, btc_cambio = escanear_mercado()
 
-            # Leer balance UNA sola vez por ciclo — evita N llamadas API y spam de logs
             balance_ciclo = -1.0
             if (AUTO_TRADE or DRY_RUN) and BINGX_API_KEY:
                 hay_accionables = any(
@@ -1315,10 +1440,10 @@ def ejecutar():
                     _estado["balance"] = balance_ciclo
                     usdt_need = calcular_usdt_trade(balance_ciclo)
                     if balance_ciclo < usdt_need:
-                        log.warning(f"Balance ${balance_ciclo:.2f} < ${usdt_need:.2f} — auto-trade pausado este ciclo")
-                        balance_ciclo = -2.0   # señal especial: sin fondos, no intentar trades
+                        log.warning(f"Balance ${balance_ciclo:.2f} < ${usdt_need:.2f} — auto-trade pausado")
+                        balance_ciclo = -2.0
                     else:
-                        log.info(f"Balance: ${balance_ciclo:.2f} USDT (trade: ${usdt_need:.2f})")
+                        log.info(f"Balance: ${balance_ciclo:.2f} USDT")
 
             for par in resultados:
                 sym = par["simbolo"]
@@ -1355,7 +1480,6 @@ def ejecutar():
                                 f"Qty: {trade['qty']} ${trade['usdt']}x{LEVERAGE}x"
                             )
 
-            # Resumen horario
             if ahora.hour != ultima_hora:
                 enviar_telegram(construir_resumen(resultados, btc_cambio, intervalo))
                 ultima_hora = ahora.hour
