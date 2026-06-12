@@ -1,9 +1,10 @@
 """
-QF×JP Bot v6.7 — BingX Client
+QF×JP Bot v6.7.1 — BingX Client
 FIX v6.7:
   + place_market_order acepta reduce_only=False (kwarg opcional)
-  + place_reduce_only_market — cierre parcial correcto para TP2 parcial
-    BingX: reduceOnly="true" (string), NO bool, NO positionSide en one-way mode
+FIX v6.7.1:
+  + place_reduce_only_market — Hedge mode compatible (sin reduceOnly)
+    BingX Hedge mode: positionSide=LONG/SHORT, sin reduceOnly
 """
 import hmac
 import hashlib
@@ -348,34 +349,27 @@ class BingXClient:
         position_side: str = "LONG",
     ) -> dict:
         """
-        v6.7 NEW — Cierre parcial seguro para TP2 parcial y reversal exits.
-        Usa reduceOnly="true" (string) como requiere BingX one-way mode.
-        No envía positionSide en one-way — evita error de parámetro inválido.
+        v6.7.1 FIX — Hedge mode compatible partial close.
+        BingX Hedge mode NO acepta reduceOnly.
+        Cierre correcto: positionSide = la posicion ABIERTA.
+          LONG abierta → side=SELL, positionSide=LONG
+          SHORT abierta → side=BUY,  positionSide=SHORT
         """
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
-            log.warning("[%s] place_reduce_only qty %.6f < min — skip", symbol, qty)
+            log.warning("[%s] place_reduce_only qty %.6f < min -- skip", symbol, qty)
             return {"code": -1, "msg": "qty_below_minimum"}
 
         params = {
-            "symbol":      symbol,
-            "side":        side,
-            "type":        "MARKET",
-            "quantity":    str(qty),
-            "reduceOnly":  "true",
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
-        log.info("[%s] REDUCE_ONLY MARKET qty=%.6f side=%s", symbol, qty, side)
-        resp = await self._post("/openApi/swap/v2/trade/order", params)
-
-        # Si one-way rechaza sin positionSide, reintentar con positionSide
-        if resp.get("code", -1) not in (0, 109420):
-            log.warning("[%s] reduce_only sin positionSide falló (%s) → reintentando con positionSide",
-                        symbol, resp.get("code"))
-            params_with_side = dict(params)
-            params_with_side["positionSide"] = position_side
-            resp = await self._post("/openApi/swap/v2/trade/order", params_with_side)
-
-        return resp
+        log.info("[%s] PARTIAL CLOSE MARKET qty=%.6f side=%s positionSide=%s",
+                 symbol, qty, side, position_side)
+        return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def place_stop_market_order(
         self,
