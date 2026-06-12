@@ -226,13 +226,19 @@ class PositionManager:
             await self._manage_sl(trade, mark, cfg)
 
             # ── TP2 parcial anticipado ────────────────────────────────────────
-            if not trade.tp2_partial_done and trade.tp1_hit:
+            # FIX 101205: verificar que la posicion sigue abierta en BingX
+            if not trade.tp2_partial_done and trade.tp1_hit and symbol in real_map:
+                real_qty = abs(float(real_map[symbol].get("positionAmt", 0) or 0))
                 tp2_reached = (
                     (trade.direction == "LONG"  and mark >= trade.tp2) or
                     (trade.direction == "SHORT" and mark <= trade.tp2)
                 )
-                if tp2_reached:
-                    await self._partial_close_tp2(trade, mark, cfg)
+                if tp2_reached and real_qty > 0:
+                    await self._partial_close_tp2(trade, mark, cfg, real_qty)
+                elif tp2_reached and real_qty == 0:
+                    # Posicion ya cerrada por BingX — marcar y limpiar
+                    trade.tp2_partial_done = True
+                    log.debug("[%s] TP2 parcial skip — qty=0 en BingX", symbol)
 
             # ── NUEVO v6.7: Early exit por reversal desde best_price ──────────
             if trade.be_moved and trade.atr > 0:
@@ -333,31 +339,39 @@ class PositionManager:
 
     # ── TP2 parcial ───────────────────────────────────────────────────────────
 
-    async def _partial_close_tp2(self, trade: OpenTrade, mark: float, cfg: TradeConfig):
-        close_qty = round(trade.qty * cfg.tp2_partial_pct, 6)
+    async def _partial_close_tp2(self, trade: OpenTrade, mark: float,
+                                cfg: TradeConfig, real_qty: float = 0.0):
+        """
+        FIX 101205: usa real_qty de BingX para calcular close_qty.
+        Silencia 101205 (no position) y 109420 (already closed).
+        """
+        # Usar qty real de BingX si disponible, sino la local
+        base_qty = real_qty if real_qty > 0 else trade.qty
+        close_qty = round(base_qty * cfg.tp2_partial_pct, 6)
         if close_qty <= 0:
             return
 
         try:
             side = "SELL" if trade.direction == "LONG" else "BUY"
-            # v6.7 FIX: usar place_reduce_only_market — evita kwarg error
             resp = await self.client.place_reduce_only_market(
                 trade.symbol, side, close_qty, trade.direction,
             )
             code = resp.get("code", -1)
             if code == 0:
                 trade.tp2_partial_done = True
-                trade.partial_qty = max(trade.qty - close_qty, 0)
+                trade.partial_qty = max(base_qty - close_qty, 0)
                 partial_pnl = self._calc_pnl_qty(trade, mark, close_qty)
-                log.info("[%s] TP2 parcial: cerrado %.4f (50%%) PnL≈%.2f USDT",
+                log.info("[%s] TP2 parcial: cerrado %.4f (50%%) PnL=%.2f USDT",
                          trade.symbol, close_qty, partial_pnl)
                 await tg.notify_partial_close(
                     trade.symbol, trade.direction, mark,
                     close_qty, partial_pnl, "tp2_partial"
                 )
-            elif code == 109420:
+            elif code in (101205, 109420):
+                # 101205 = no position to close, 109420 = already closed
                 trade.tp2_partial_done = True
-                log.debug("[%s] TP2 parcial skip — posición ya cerrada", trade.symbol)
+                log.debug("[%s] TP2 parcial skip — posicion ya cerrada (code=%d)",
+                          trade.symbol, code)
             else:
                 log.warning("[%s] TP2 parcial fallo: %s", trade.symbol, resp)
         except Exception as e:
