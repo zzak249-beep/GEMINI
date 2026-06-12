@@ -1,18 +1,20 @@
 """
-QF×JP Bot v6.5 — Indicators PREDATOR EDITION
-Mejoras de velocidad y anticipación basadas en investigación:
-  1. Funding Rate como filtro de sesgo SHORT/LONG
-  2. StochRSI (señal más rápida que RSI clásico)
-  3. VWAP Deviation — entrada en la media real del día
-  4. Order Book Imbalance — presión compradora/vendedora
-  5. Trailing exit dinámico con ATR
-  6. Score ajustado a historial SHORT ganador
+QF×JP Bot v6.6 — Indicators PREDATOR EDITION
+FIXES v6.6:
+  FIX 1: _div() reescrito con broadcast manual — elimina non-broadcastable error
+  FIX 2: calc_stoch_rsi longitud array alineada con c (evita off-by-one)
+MEJORAS v6.6 (anticipación):
+  + EMA Crossover anticipado (9/21) — entrada antes del cruce confirmado
+  + Volume Surge detector — volumen 2x sobre media → señal de impulso
+  + Divergencia precio/CVD — detección de reversión anticipada
+  + Squeeze Momentum (BB dentro de KC) — explosión inminente
+  + Score rebalanceado: más peso a señales de anticipación
 """
 import warnings
 import math
 import numpy as np
 warnings.filterwarnings("ignore", category=RuntimeWarning)
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -35,9 +37,14 @@ class Signal:
     structure: str
     tl_break: str
     stoch_rsi: float = 0.0
-    funding_bias: str = "NEUTRAL"   # LONG_CROWDED | SHORT_CROWDED | NEUTRAL
+    funding_bias: str = "NEUTRAL"
     tl_break_active: bool = False
     circuit_breaker: bool = False
+    # Nuevos campos v6.6
+    ema_cross_pct: float = 0.0      # % separación EMA9 vs EMA21 (anticipación)
+    volume_surge: bool = False       # True si volumen > 1.8x media
+    divergence: str = "NONE"        # BULL_DIV | BEAR_DIV | NONE
+    squeeze: bool = False            # True si BB dentro de KC (explosión inminente)
     reason: str = ""
 
 
@@ -72,12 +79,23 @@ def _sma(arr, period):
         out[i] = arr[i-period+1:i+1].mean()
     return out
 
+def _std(arr, period):
+    out = np.full(len(arr), np.nan, dtype=float)
+    for i in range(period-1, len(arr)):
+        out[i] = arr[i-period+1:i+1].std()
+    return out
+
+# ── FIX 1: _div sin parámetro out= — broadcast manual ─────────────────────────
+
 def _div(a, b, out=None):
-    """División segura sin RuntimeWarning."""
-    b_arr = np.asarray(b, dtype=float)
+    """División segura. Usa broadcast manual — elimina non-broadcastable error."""
     a_arr = np.asarray(a, dtype=float)
-    default = np.zeros_like(a_arr) if out is None else out
-    return np.divide(a_arr, b_arr, out=default.copy(), where=b_arr != 0)
+    b_arr = np.asarray(b, dtype=float)
+    a_arr, b_arr = np.broadcast_arrays(a_arr, b_arr)
+    result = np.zeros(a_arr.shape, dtype=float)
+    mask = b_arr != 0
+    result[mask] = a_arr[mask] / b_arr[mask]
+    return result
 
 # ── ATR ───────────────────────────────────────────────────────────────────────
 
@@ -151,55 +169,131 @@ def calc_vdi(c, v, period=20):
     std = np.nanstd(delta[-period:])
     return np.nan_to_num(_div(delta, std+1e-9), nan=0.0, posinf=0.0, neginf=0.0)
 
-# ── StochRSI — MÁS RÁPIDO QUE RSI CLÁSICO ────────────────────────────────────
+# ── FIX 2: StochRSI — longitud alineada con c, RMA iterativo ─────────────────
 
 def calc_stoch_rsi(c, rsi_period=14, stoch_period=14, smooth_k=3, smooth_d=3):
-    """
-    StochRSI: aplica Stochastic al RSI.
-    Más sensible que RSI puro → señales más tempranas.
-    Retorna (k, d) — valores 0-100.
-    """
     c = np.asarray(c, float)
-    # RSI
-    delta = np.diff(c)
-    gain  = np.where(delta>0, delta, 0.0)
-    loss  = np.where(delta<0, -delta, 0.0)
-    avg_gain = _rma(np.concatenate([[gain[:rsi_period].mean()], gain]), rsi_period)
-    avg_loss = _rma(np.concatenate([[loss[:rsi_period].mean()], loss]), rsi_period)
-    rs  = _div(avg_gain, np.where(avg_loss>0, avg_loss, 1e-9))
-    rsi = 100 - _div(100, 1+rs)
+    n = len(c)
+    rsi = np.full(n, 50.0)
 
-    # Stochastic del RSI
-    stoch_k = np.full_like(rsi, 50.0)
-    for i in range(stoch_period, len(rsi)):
+    if n < rsi_period + 2:
+        return rsi, rsi.copy()
+
+    delta = np.diff(c)
+    gain  = np.where(delta > 0, delta, 0.0)
+    loss  = np.where(delta < 0, -delta, 0.0)
+
+    avg_g = gain[:rsi_period].mean()
+    avg_l = loss[:rsi_period].mean()
+    rsi[rsi_period] = 100 - 100 / (1 + avg_g / (avg_l + 1e-9))
+
+    for i in range(rsi_period + 1, n):
+        avg_g = (avg_g * (rsi_period - 1) + gain[i-1]) / rsi_period
+        avg_l = (avg_l * (rsi_period - 1) + loss[i-1]) / rsi_period
+        rsi[i] = 100 - 100 / (1 + avg_g / (avg_l + 1e-9))
+
+    stoch_k = np.full(n, 50.0)
+    for i in range(stoch_period + rsi_period, n):
         window = rsi[i-stoch_period:i+1]
         mn, mx = window.min(), window.max()
         stoch_k[i] = 100*(rsi[i]-mn)/(mx-mn+1e-9) if mx > mn else 50.0
 
     k = _ema(stoch_k, smooth_k)
-    d = _ema(k,       smooth_d)
+    d = _ema(k, smooth_d)
     return k, d
 
-# ── VWAP Deviation — ENTRADA ÓPTIMA RESPECTO A MEDIA REAL ────────────────────
+# ── VWAP Deviation ────────────────────────────────────────────────────────────
 
 def calc_vwap_dev(h, l, c, v, period=20):
-    """
-    Desviación del precio respecto al VWAP del período.
-    > 0 → precio por encima (caro) → SHORT bias
-    < 0 → precio por debajo (barato) → LONG bias
-    Retorna desviación normalizada en ATR.
-    """
     h,l,c,v = (np.asarray(x,float) for x in (h,l,c,v))
     tp = (h+l+c)/3
-    vwap = _div(
-        np.array([np.sum(tp[max(0,i-period):i+1]*v[max(0,i-period):i+1])
-                  for i in range(len(tp))]),
-        np.array([np.sum(v[max(0,i-period):i+1])
-                  for i in range(len(v))]) + 1e-9
-    )
+    vwap_arr = np.array([
+        np.sum(tp[max(0,i-period):i+1]*v[max(0,i-period):i+1]) /
+        (np.sum(v[max(0,i-period):i+1]) + 1e-9)
+        for i in range(len(tp))
+    ])
     atr = calc_atr(h, l, c, period)
-    dev = _div(c - vwap, atr + 1e-9)
+    dev = _div(c - vwap_arr, atr + 1e-9)
     return np.nan_to_num(dev, nan=0.0, posinf=0.0, neginf=0.0)
+
+# ── NUEVO v6.6: EMA Crossover anticipado ──────────────────────────────────────
+
+def calc_ema_cross(c, fast=9, slow=21):
+    """
+    cross_pct: % separación EMA fast vs slow (+ = alcista, - = bajista)
+    pre_cross : True si están convergiendo y a <0.15% de cruzarse
+    """
+    c = np.asarray(c, float)
+    if len(c) < slow + 2:
+        return 0.0, False
+    ema_f = _ema(c, fast)
+    ema_s = _ema(c, slow)
+    diff_now  = ema_f[-1] - ema_s[-1]
+    diff_prev = ema_f[-2] - ema_s[-2]
+    mid = (ema_f[-1] + ema_s[-1]) / 2 + 1e-9
+    cross_pct = diff_now / mid
+    converging = abs(diff_now) < abs(diff_prev)
+    pre_cross  = converging and abs(cross_pct) < 0.0015
+    return float(cross_pct), pre_cross
+
+# ── NUEVO v6.6: Volume Surge ───────────────────────────────────────────────────
+
+def detect_volume_surge(v, period=20, mult=1.8):
+    """True si el volumen reciente supera mult × media del período."""
+    v = np.asarray(v, float)
+    if len(v) < period + 2:
+        return False
+    avg = v[-period-2:-2].mean()
+    recent = v[-2:].mean()
+    return bool(avg > 0 and recent > avg * mult)
+
+# ── NUEVO v6.6: Divergencia precio/CVD ────────────────────────────────────────
+
+def detect_divergence(c, cvd_arr, lookback=20):
+    """
+    BEAR_DIV: precio HH pero CVD LH → distribución oculta → SHORT anticipado
+    BULL_DIV: precio LL pero CVD HL → acumulación oculta → LONG anticipado
+    """
+    c   = np.asarray(c,       float)
+    cvd = np.asarray(cvd_arr, float)
+    if len(c) < lookback + 2:
+        return "NONE"
+
+    c_win   = c[-lookback:]
+    cvd_win = cvd[-lookback:]
+    c_hi,   c_lo   = c_win.max(),   c_win.min()
+    cvd_mid = cvd[-lookback//2]
+    c_now   = c[-1]
+    cvd_now = cvd[-1]
+
+    if c_now >= c_hi * 0.98 and cvd_now < cvd_mid:
+        return "BEAR_DIV"
+    if c_now <= c_lo * 1.02 and cvd_now > cvd_mid:
+        return "BULL_DIV"
+    return "NONE"
+
+# ── NUEVO v6.6: Squeeze Momentum ──────────────────────────────────────────────
+
+def detect_squeeze(h, l, c, v, bb_period=20, kc_period=20, bb_mult=2.0, kc_mult=1.5):
+    """
+    True si BB está completamente dentro del KC → compresión → explosión inminente.
+    """
+    h,l,c,v = (np.asarray(x,float) for x in (h,l,c,v))
+    if len(c) < bb_period + 5:
+        return False
+    sma  = _sma(c, bb_period)
+    std  = _std(c, bb_period)
+    bb_u = sma + bb_mult * std
+    bb_l = sma - bb_mult * std
+    atr  = calc_atr(h, l, c, kc_period)
+    kc_u = sma + kc_mult * atr
+    kc_l = sma - kc_mult * atr
+    in_squeeze = all(
+        (not np.isnan(bb_u[i])) and (not np.isnan(kc_u[i]))
+        and bb_u[i] < kc_u[i] and bb_l[i] > kc_l[i]
+        for i in range(-3, 0)
+    )
+    return bool(in_squeeze)
 
 # ── Estructura ────────────────────────────────────────────────────────────────
 
@@ -263,85 +357,99 @@ def htf_score(k15m, k1h, k4h):
         weights.append(w)
     return sum(scores)/sum(weights) if weights else 0.5
 
-# ── Score compuesto v6.5 ──────────────────────────────────────────────────────
-# Nuevas fuentes: StochRSI + VWAP + funding bias
+# ── Score compuesto v6.6 ──────────────────────────────────────────────────────
 
 def composite_score(direction, adx, cvd, momentum, mfi, vdi,
                     structure, tl_break, htf_s, fvg,
                     stoch_k=50.0, vwap_dev=0.0, funding_bias="NEUTRAL",
-                    obi=0.0):
+                    obi=0.0, ema_cross_pct=0.0, volume_surge=False,
+                    divergence="NONE", squeeze=False):
     s = 0.0
     d = direction
 
-    # ADX (18 pts)
-    s += min(_safe(adx)/40.0, 1.0) * 18
+    # ADX (15 pts)
+    s += min(_safe(adx)/40.0, 1.0) * 15
 
-    # CVD (18 pts) — confirmación de volumen direccional
+    # CVD (15 pts)
     cvd_v = _safe(cvd)
-    s += (max(0.0, min(-cvd_v,1.0)) if d=="SHORT" else max(0.0, min(cvd_v,1.0))) * 18
+    s += (max(0.0, min(-cvd_v,1.0)) if d=="SHORT" else max(0.0, min(cvd_v,1.0))) * 15
 
-    # StochRSI (12 pts) — señal rápida sin lag
+    # StochRSI (10 pts)
     sk = _safe(stoch_k, 50.0)
     if d == "SHORT":
-        # Queremos StochRSI > 80 (overbought → caída inminente)
-        s += max(0.0, (sk - 60) / 40) * 12
+        s += max(0.0, (sk - 60) / 40) * 10
     else:
-        # Queremos StochRSI < 20 (oversold → rebote inminente)
-        s += max(0.0, (40 - sk) / 40) * 12
+        s += max(0.0, (40 - sk) / 40) * 10
 
-    # VWAP Deviation (10 pts) — entrada cerca de la media real
+    # VWAP Deviation (8 pts)
     vd = _safe(vwap_dev)
     if d == "SHORT":
-        # Precio muy por encima del VWAP → sobreextendido → SHORT
-        s += max(0.0, min(vd/2.0, 1.0)) * 10
+        s += max(0.0, min(vd/2.0, 1.0)) * 8
     else:
-        # Precio muy por debajo del VWAP → oversold → LONG
-        s += max(0.0, min(-vd/2.0, 1.0)) * 10
+        s += max(0.0, min(-vd/2.0, 1.0)) * 8
 
-    # Momentum (12 pts)
+    # Momentum (10 pts)
     mom = _safe(momentum)
-    s += (max(0.0, min(-mom*30,1.0)) if d=="SHORT" else max(0.0, min(mom*30,1.0))) * 12
+    s += (max(0.0, min(-mom*30,1.0)) if d=="SHORT" else max(0.0, min(mom*30,1.0))) * 10
 
-    # MFI (8 pts)
+    # MFI (7 pts)
     mfi_v = _safe(mfi, 50.0)
-    s += (max(0.0,(50-mfi_v)/50) if d=="SHORT" else max(0.0,(mfi_v-50)/50)) * 8
+    s += (max(0.0,(50-mfi_v)/50) if d=="SHORT" else max(0.0,(mfi_v-50)/50)) * 7
 
-    # VDI (6 pts)
+    # VDI (5 pts)
     vdi_v = _safe(vdi)
-    s += (max(0.0,min(-vdi_v/3.0,1.0)) if d=="SHORT" else max(0.0,min(vdi_v/3.0,1.0))) * 6
+    s += (max(0.0,min(-vdi_v/3.0,1.0)) if d=="SHORT" else max(0.0,min(vdi_v/3.0,1.0))) * 5
 
-    # Estructura (12 pts) — BoS/CHoCH más fiable
+    # Estructura (10 pts)
     struct_map = {
-        "CHoCH↑": (12 if d=="LONG" else 0), "CHoCH↓": (12 if d=="SHORT" else 0),
-        "BoS↑":   (8  if d=="LONG" else 0), "BoS↓":   (8  if d=="SHORT" else 0),
+        "CHoCH↑": (10 if d=="LONG" else 0), "CHoCH↓": (10 if d=="SHORT" else 0),
+        "BoS↑":   (7  if d=="LONG" else 0), "BoS↓":   (7  if d=="SHORT" else 0),
     }
     s += struct_map.get(structure, 0)
 
-    # HTF (6 pts)
+    # HTF (5 pts)
     htf_v = _safe(htf_s, 0.5)
-    s += ((1.0-htf_v) if d=="SHORT" else htf_v) * 6
+    s += ((1.0-htf_v) if d=="SHORT" else htf_v) * 5
 
-    # Funding Rate bias (5 pts) — filtro de sentimiento de mercado
-    # SHORT_CROWDED → longs pagan → SHORT bajo presión → evitar
-    # LONG_CROWDED  → shorts pagan → SHORT favorecido
+    # Funding Rate (4 pts)
     if funding_bias == "LONG_CROWDED" and d == "SHORT":
-        s += 5   # mercado largo sobrecargado → SHORT es la operación contrarian
+        s += 4
     elif funding_bias == "SHORT_CROWDED" and d == "LONG":
-        s += 5
+        s += 4
     elif funding_bias == "SHORT_CROWDED" and d == "SHORT":
-        s -= 3   # funding negativo → peligroso para SHORT
+        s -= 3
 
-    # OBI — Order Book Imbalance (5 pts) — señal más rápida disponible
-    # Mide presión real de compradores vs vendedores en el libro de órdenes
+    # OBI (4 pts)
     obi_v = float(obi) if abs(float(obi)) <= 1.0 else 0.0
-    if d == "SHORT":
-        s += max(0.0, -obi_v) * 5   # OBI negativo → más vendedores → SHORT
-    else:
-        s += max(0.0,  obi_v) * 5   # OBI positivo → más compradores → LONG
+    s += (max(0.0, -obi_v) if d=="SHORT" else max(0.0, obi_v)) * 4
 
     # FVG (2 pts)
     if (d=="LONG" and fvg=="BULL") or (d=="SHORT" and fvg=="BEAR"):
         s += 2
+
+    # ── Señales de anticipación v6.6 ──────────────────────────────────────────
+
+    # EMA Cross (5 pts) — momentum de las medias
+    ec = _safe(ema_cross_pct)
+    if d == "SHORT" and ec < 0:
+        s += min(abs(ec) * 200, 1.0) * 5
+    elif d == "LONG" and ec > 0:
+        s += min(abs(ec) * 200, 1.0) * 5
+    elif abs(ec) < 0.0015:
+        s += 3  # pre-cross — punto de máxima indecisión = oportunidad
+
+    # Volume Surge (4 pts) — dinero entrando NOW
+    if volume_surge:
+        s += 4
+
+    # Divergencia precio/CVD (6 pts) — la más predictiva
+    if (d == "SHORT" and divergence == "BEAR_DIV") or \
+       (d == "LONG"  and divergence == "BULL_DIV"):
+        s += 6
+
+    # Squeeze (5 pts) — explosión inminente confirmada
+    if squeeze:
+        s += 5
 
     return round(min(max(s, 0.0), 100.0), 1)
 
@@ -357,9 +465,6 @@ def score_to_tier(score):
 # ── Función principal ─────────────────────────────────────────────────────────
 
 def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.0):
-    """
-    funding_rate: tasa de financiación actual (float). Positivo = longs pagan.
-    """
     import config as C
     import logging
     _log = logging.getLogger("indicators")
@@ -377,29 +482,34 @@ def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.
     arr = np.asarray(klines_3m, dtype=float)
     o,h,l,c,v = arr[:,1],arr[:,2],arr[:,3],arr[:,4],arr[:,5]
 
-    atr_arr          = calc_atr(h,l,c,C.ATR_LEN)
-    adx_arr,pdi,mdi  = calc_adx(h,l,c,C.ADX_LEN)
-    atr  = _safe(atr_arr[-1])
-    adx  = _safe(adx_arr[-1])
+    atr_arr         = calc_atr(h,l,c,C.ATR_LEN)
+    adx_arr,pdi,mdi = calc_adx(h,l,c,C.ADX_LEN)
+    atr = _safe(atr_arr[-1])
+    adx = _safe(adx_arr[-1])
 
     if atr <= 0 or not math.isfinite(atr):
         return _no("invalid_atr")
 
-    cvd_val = _safe(calc_cvd(o,c,v)[-1])
-    mom_val = _safe(calc_momentum(c,10)[-1])
-    mfi_val = _safe(calc_mfi(h,l,c,v,14)[-1], 50.0)
-    vdi_val = _safe(calc_vdi(c,v,20)[-1])
+    cvd_arr  = calc_cvd(o,c,v)
+    cvd_val  = _safe(cvd_arr[-1])
+    mom_val  = _safe(calc_momentum(c,10)[-1])
+    mfi_val  = _safe(calc_mfi(h,l,c,v,14)[-1], 50.0)
+    vdi_val  = _safe(calc_vdi(c,v,20)[-1])
 
-    # Nuevos indicadores v6.5
-    stoch_k_arr, stoch_d_arr = calc_stoch_rsi(c, 14, 14, 3, 3)
-    stoch_k_val = _safe(stoch_k_arr[-1], 50.0)
-    vwap_dev_val = _safe(calc_vwap_dev(h,l,c,v,20)[-1])
+    stoch_k_arr, _ = calc_stoch_rsi(c, 14, 14, 3, 3)
+    stoch_k_val    = _safe(stoch_k_arr[-1], 50.0)
+    vwap_dev_val   = _safe(calc_vwap_dev(h,l,c,v,20)[-1])
 
-    # Funding bias
+    # v6.6 anticipation
+    ema_cross_pct_val, pre_cross = calc_ema_cross(c, 9, 21)
+    vol_surge  = detect_volume_surge(v, period=20, mult=1.8)
+    divergence = detect_divergence(c, cvd_arr, lookback=20)
+    squeeze    = detect_squeeze(h, l, c, v)
+
     fr = _safe(funding_rate, 0.0)
-    if fr > 0.0003:      funding_bias = "LONG_CROWDED"    # longs muy sobrecargados
-    elif fr < -0.0003:   funding_bias = "SHORT_CROWDED"
-    else:                funding_bias = "NEUTRAL"
+    if fr > 0.0003:    funding_bias = "LONG_CROWDED"
+    elif fr < -0.0003: funding_bias = "SHORT_CROWDED"
+    else:              funding_bias = "NEUTRAL"
 
     cb        = C.CB_ENABLED and check_circuit_breaker(h,l,atr_arr,C.CB_ATR_MULT,C.CB_BARS)
     structure = detect_structure(h,l,c,5)
@@ -408,11 +518,21 @@ def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.
     htf_s     = _safe(htf_score(klines_15m,klines_1h,klines_4h), 0.5)
 
     if C.REQUIRE_TL_BREAK and tl_break == "NONE":
-        return _no("no_tl_break")
+        # v6.6: relajar filtro TL si hay señales de anticipación fuertes
+        has_anticipation = pre_cross or divergence != "NONE" or squeeze
+        if not has_anticipation:
+            return _no("no_tl_break")
 
     direction = tl_break if tl_break != "NONE" else ("LONG" if pdi[-1]>mdi[-1] else "SHORT")
 
-    # HTF mínimo
+    # v6.6: divergencia puede override dirección de ADX
+    if divergence == "BEAR_DIV" and direction == "LONG":
+        _log.debug("[%s] BEAR_DIV override: LONG→SHORT", symbol)
+        direction = "SHORT"
+    elif divergence == "BULL_DIV" and direction == "SHORT":
+        _log.debug("[%s] BULL_DIV override: SHORT→LONG", symbol)
+        direction = "LONG"
+
     htf_aligned = 0
     for kl,_ in [(klines_15m,1),(klines_1h,2),(klines_4h,4)]:
         if len(kl) < 30: continue
@@ -427,7 +547,9 @@ def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.
         direction, adx, cvd_val, mom_val, mfi_val, vdi_val,
         structure, tl_break, htf_s, fvg,
         stoch_k=stoch_k_val, vwap_dev=vwap_dev_val,
-        funding_bias=funding_bias, obi=0.0   # obi se pasa desde scanner
+        funding_bias=funding_bias, obi=0.0,
+        ema_cross_pct=ema_cross_pct_val, volume_surge=vol_surge,
+        divergence=divergence, squeeze=squeeze,
     )
     tier  = score_to_tier(score)
     entry = _safe(c[-1])
@@ -435,6 +557,11 @@ def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.
     sl_m  = getattr(C, "SL_ATR_MULT",  0.8)
     tp1_m = getattr(C, "TP1_ATR_MULT", 1.2)
     tp2_m = getattr(C, "TP2_ATR_MULT", 2.5)
+
+    # v6.6: SL más apretado + TP2 más lejos si hay squeeze (impulso fuerte esperado)
+    if squeeze:
+        sl_m  = max(sl_m * 0.85, 0.5)
+        tp2_m = tp2_m * 1.15
 
     if direction == "LONG":
         sl,tp1,tp2 = entry-atr*sl_m, entry+atr*tp1_m, entry+atr*tp2_m
@@ -448,5 +575,7 @@ def analyze(symbol, klines_3m, klines_15m, klines_1h, klines_4h, funding_rate=0.
         htf_score=htf_s, structure=structure, tl_break=tl_break,
         stoch_rsi=stoch_k_val, funding_bias=funding_bias,
         tl_break_active=(tl_break!="NONE"), circuit_breaker=cb,
+        ema_cross_pct=ema_cross_pct_val, volume_surge=vol_surge,
+        divergence=divergence, squeeze=squeeze,
         reason="ok",
     )
