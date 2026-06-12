@@ -294,7 +294,7 @@ class PositionManager:
     async def _update_sl(self, trade: OpenTrade, new_sl: float, reason: str):
         try:
             await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.4)
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.partial_qty or trade.qty,
@@ -306,9 +306,10 @@ class PositionManager:
                 trade.sl = new_sl
                 trade.trailing_sl = new_sl
                 log.info("[%s] SL %s → %.6f", trade.symbol, reason, new_sl)
-            elif code == 109420:
+            elif code in (109420, 110406):
                 trade.be_moved = True
-                log.debug("[%s] SL %s skip — posición ya cerrada", trade.symbol, reason)
+                log.debug("[%s] SL %s skip (code=%d) — orden ya gestionada",
+                          trade.symbol, reason, code)
             else:
                 log.warning("[%s] SL %s fallo: %s", trade.symbol, reason, resp)
         except Exception as e:
@@ -316,8 +317,22 @@ class PositionManager:
 
     async def _move_to_breakeven(self, trade: OpenTrade, current_price: float):
         try:
+            # FIX 110406: cancel + verificar que ordenes desaparecieron antes de colocar BE
             await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.5)
+
+            # Verificar que no queden ordenes SL activas
+            for attempt in range(3):
+                open_orders = await self.client.get_open_orders(trade.symbol)
+                sl_orders = [o for o in open_orders
+                             if o.get("type") in ("STOP_MARKET", "STOP")]
+                if not sl_orders:
+                    break
+                log.debug("[%s] BE: %d SL orders aun activas, esperando...",
+                          trade.symbol, len(sl_orders))
+                await self.client.cancel_all_orders(trade.symbol)
+                await asyncio.sleep(0.5 * (attempt + 1))
+
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.partial_qty or trade.qty,
@@ -329,9 +344,11 @@ class PositionManager:
                 trade.be_moved = True
                 trade.sl = trade.entry
                 log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
-            elif code == 109420:
+            elif code in (109420, 110406):
+                # 109420 = posicion cerrada, 110406 = SL ya existe (race condition)
                 trade.be_moved = True
-                log.debug("[%s] BE skip — posición ya cerrada en BingX", trade.symbol)
+                log.debug("[%s] BE skip (code=%d) — SL ya gestionado por BingX",
+                          trade.symbol, code)
             else:
                 log.warning("[%s] BE fallo: %s", trade.symbol, resp)
         except Exception as e:
