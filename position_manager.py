@@ -340,9 +340,9 @@ class PositionManager:
 
         try:
             side = "SELL" if trade.direction == "LONG" else "BUY"
-            resp = await self.client.place_market_order(
-                trade.symbol, side, close_qty,
-                reduce_only=True,
+            # v6.7 FIX: usar place_reduce_only_market — evita kwarg error
+            resp = await self.client.place_reduce_only_market(
+                trade.symbol, side, close_qty, trade.direction,
             )
             code = resp.get("code", -1)
             if code == 0:
