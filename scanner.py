@@ -1,5 +1,5 @@
 """
-QF×JP Bot v6.7 — Scanner
+QF×JP Bot v6.8 — Scanner
 MEJORAS v6.7:
   SPEED 1: SCAN_INTERVAL efectivo 20s (era 60s) — 3x más reacciones por hora
   SPEED 2: Batches de 30 sin sleep entre ellos (rate-limit safe con semáforo)
@@ -26,6 +26,10 @@ log = logging.getLogger("scanner")
 # ── Circuit breaker blacklist ─────────────────────────────────────────────────
 _cb_blacklist: dict[str, float] = {}
 CB_COOLDOWN = 600
+
+# ── v6.8: Cooldown por símbolo — evita abrir el mismo par dos veces seguidas ──
+_symbol_last_trade: dict[str, float] = {}
+SYMBOL_TRADE_COOLDOWN = 300   # 5 min entre trades del mismo símbolo
 
 # ── Priority tracking — símbolos con señal reciente suben en la cola ──────────
 _symbol_priority: dict[str, float] = defaultdict(float)   # symbol → last_signal_ts
@@ -89,6 +93,10 @@ async def _process_symbol(symbol, client, risk, pos_mgr):
     if symbol in _cb_blacklist and now - _cb_blacklist[symbol] < CB_COOLDOWN:
         return None
 
+    # v6.8: cooldown post-trade — no re-entrar en el mismo par < 5 min
+    if symbol in _symbol_last_trade and now - _symbol_last_trade[symbol] < SYMBOL_TRADE_COOLDOWN:
+        return None
+
     try:
         k3m, k15m, k1h, k4h, ob, fr = await _fetch_klines_all(client, symbol)
     except Exception as e:
@@ -119,6 +127,11 @@ async def _process_symbol(symbol, client, risk, pos_mgr):
         return None
 
     if sig.direction == "NONE":
+        return None
+
+    # v6.8: filtro calidad — ADX mínimo 20 (tendencia real, no ruido)
+    if sig.adx < 20:
+        log.debug("[%s] ADX=%.1f < 20 — sin tendencia, skip", symbol, sig.adx)
         return None
 
     if sig.circuit_breaker:
@@ -190,13 +203,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr):
         entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
         qty=qty, atr=sig.atr, order_id=order_id,
     )
+    _symbol_last_trade[symbol] = time.time()   # v6.8: marcar cooldown
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
     return sig
 
 
 async def scan_loop(client: BingXClient, risk: RiskManager, pos_mgr: PositionManager):
-    log.info("Scanner v6.7 iniciado. Modo: %s | Interval: %ds | TOP_N: %s",
+    log.info("Scanner v6.8 iniciado. Modo: %s | Interval: %ds | TOP_N: %s",
              C.MODE, C.SCAN_INTERVAL,
              C.TOP_N_SYMBOLS if C.TOP_N_SYMBOLS > 0 else "TODAS")
 

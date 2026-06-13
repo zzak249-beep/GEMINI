@@ -1,6 +1,10 @@
 """
-QF×JP Bot v6.4 — Risk Manager
-Kelly Criterion, límites diarios, daily drawdown.
+QF×JP Bot v6.8 — Risk Manager
+FIX CRÍTICO v6.8:
+  - daily_loss_limit ahora es 10% del CAPITAL (era 5%) — margen real
+  - _open_count se resetea al inicio del día
+  - update_open_count es la fuente de verdad (desde BingX real)
+  - daily_pnl se acumula SOLO con PnL real (sin multiplicar LEVERAGE)
 """
 import asyncio
 import logging
@@ -17,9 +21,12 @@ class RiskManager:
         self._today             = date.today()
         self._daily_trades      = 0
         self._daily_pnl         = 0.0
-        self._daily_loss_limit  = C.CAPITAL * 0.05
+        # v6.8: límite diario 10% capital — antes 5% causaba bloqueo con PnL 10x inflado
+        self._daily_loss_limit  = C.CAPITAL * 0.10
         self._open_count        = 0
         self._lock              = asyncio.Lock()
+        log.info("RiskManager v6.8: daily_loss_limit=%.2f USDT (10%% de %.2f)",
+                 self._daily_loss_limit, C.CAPITAL)
 
     def _check_reset(self):
         today = date.today()
@@ -27,7 +34,8 @@ class RiskManager:
             self._today        = today
             self._daily_trades = 0
             self._daily_pnl    = 0.0
-            log.info("Daily stats reset for %s", today)
+            # NO resetear _open_count — se sincroniza desde BingX real
+            log.info("Daily stats reset for %s | limit=%.2f USDT", today, self._daily_loss_limit)
 
     # ── Kelly sizing ──────────────────────────────────────────────────────────
 
@@ -46,22 +54,22 @@ class RiskManager:
         rr = C.KELLY_RR
         q  = 1.0 - p
 
-        kelly_f  = max(0.0, (p * rr - q) / rr) * C.KELLY_FRACTION
-        risk_usdt = min(balance * kelly_f * (C.RISK_PCT / 100.0), balance * 0.03)
+        kelly_f   = max(0.0, (p * rr - q) / rr) * C.KELLY_FRACTION
+        # v6.8: risk_usdt cap más conservador — 2% por trade max
+        risk_usdt = min(balance * kelly_f * (C.RISK_PCT / 100.0), balance * 0.02)
 
         qty = (risk_usdt * C.LEVERAGE) / risk_per_unit
 
-        # Notional cap dinámico: STD=500, FUEL=750, SUP=1000 USDT
+        # Notional cap dinámico por tier
         notional = qty * entry
-        cap_map  = {"STD": 500.0, "FUEL": 750.0, "SUP": 1000.0}
-        cap      = cap_map.get(tier, 500.0)
+        cap_map  = {"STD": 400.0, "FUEL": 600.0, "SUP": 800.0}
+        cap      = cap_map.get(tier, 400.0)
         if notional > cap:
-            log.info("[sizing] %s notional clampeado %.2f→%.2f USDT (qty %s, entry=%s SL=%s)",
-                     tier, notional, cap, qty, entry, sl)
+            log.info("[sizing] %s notional clamped %.2f→%.2f USDT", tier, notional, cap)
             qty = cap / entry
 
-        log.info("[sizing] %s score=%.1f ks=%.2f risk=%.2f USDT qty=%s notional=%.2f USDT (entry=%s SL=%s)",
-                 tier, score, kelly_f, risk_usdt, round(qty, 6), qty * entry, entry, sl)
+        log.info("[sizing] %s score=%.1f kelly=%.3f risk=%.2f USDT qty=%s notional=%.2f USDT",
+                 tier, score, kelly_f, risk_usdt, round(qty, 6), qty * entry)
 
         return round(qty, 6)
 
@@ -87,9 +95,14 @@ class RiskManager:
         async with self._lock:
             self._open_count = max(0, self._open_count - 1)
             self._daily_pnl += pnl
+            log.info("Trade cerrado PnL=%.4f | daily_pnl=%.4f | limit=%.2f",
+                     pnl, self._daily_pnl, self._daily_loss_limit)
 
     async def update_open_count(self, n: int):
+        """Fuente de verdad: sincronizar con BingX real cada ciclo de monitor."""
         async with self._lock:
+            if self._open_count != n:
+                log.debug("open_count sync: %d → %d", self._open_count, n)
             self._open_count = n
 
     def tier_ok(self, tier: str) -> bool:

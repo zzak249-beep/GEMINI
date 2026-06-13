@@ -1,7 +1,11 @@
 """
-QF×JP Bot v6.7 — Position Manager
+QF×JP Bot v6.8 — Position Manager
 MEJORAS v6.7 (velocidad + captura de profit):
   SPEED 1: POSITION_CHECK_INTERVAL recomendado 10s (era 30s) → 3x más reacciones
+FIX CRÍTICO v6.8:
+  FIX PNL:      _calc_pnl NO multiplica LEVERAGE — PnL era 10x inflado → bloqueo falso
+  FIX RECONCILE: be_moved=True en posiciones reconciliadas → evita bucle 110406
+  FIX REVERSAL: reversal_exit solo tras tp1_hit → no sale antes de ganar
   SPEED 2: BE se activa a 0.8× ATR (era 1.0×) — entra en BE antes del reversal
   SPEED 3: Trailing más ajustado post-BE: 1.2× ATR (era 1.5×)
   SPEED 4: TP1 parcial close asíncrono inmediato (no espera confirmación de loop)
@@ -111,6 +115,7 @@ class PositionManager:
                     open_time=time.time(),
                     best_price=entry,
                     partial_qty=qty,
+                    be_moved=True,   # FIX: posición existente ya tiene SL en BingX
                 )
             count += 1
             log.info("[%s] Reconciliado: %s qty=%.4f entry=%.6f",
@@ -226,22 +231,17 @@ class PositionManager:
             await self._manage_sl(trade, mark, cfg)
 
             # ── TP2 parcial anticipado ────────────────────────────────────────
-            # FIX 101205: verificar que la posicion sigue abierta en BingX
-            if not trade.tp2_partial_done and trade.tp1_hit and symbol in real_map:
-                real_qty = abs(float(real_map[symbol].get("positionAmt", 0) or 0))
+            if not trade.tp2_partial_done and trade.tp1_hit:
                 tp2_reached = (
                     (trade.direction == "LONG"  and mark >= trade.tp2) or
                     (trade.direction == "SHORT" and mark <= trade.tp2)
                 )
-                if tp2_reached and real_qty > 0:
-                    await self._partial_close_tp2(trade, mark, cfg, real_qty)
-                elif tp2_reached and real_qty == 0:
-                    # Posicion ya cerrada por BingX — marcar y limpiar
-                    trade.tp2_partial_done = True
-                    log.debug("[%s] TP2 parcial skip — qty=0 en BingX", symbol)
+                if tp2_reached:
+                    await self._partial_close_tp2(trade, mark, cfg)
 
             # ── NUEVO v6.7: Early exit por reversal desde best_price ──────────
-            if trade.be_moved and trade.atr > 0:
+            # FIX: solo hacer reversal_exit si TP1 ya fue hit (tenemos profit asegurado)
+            if trade.be_moved and trade.tp1_hit and trade.atr > 0:
                 reversal_threshold = trade.atr * cfg.reversal_mult
                 reversal = (
                     (trade.direction == "LONG"  and trade.best_price - mark > reversal_threshold) or
@@ -294,7 +294,7 @@ class PositionManager:
     async def _update_sl(self, trade: OpenTrade, new_sl: float, reason: str):
         try:
             await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.2)
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.partial_qty or trade.qty,
@@ -306,10 +306,9 @@ class PositionManager:
                 trade.sl = new_sl
                 trade.trailing_sl = new_sl
                 log.info("[%s] SL %s → %.6f", trade.symbol, reason, new_sl)
-            elif code in (109420, 110406):
+            elif code == 109420:
                 trade.be_moved = True
-                log.debug("[%s] SL %s skip (code=%d) — orden ya gestionada",
-                          trade.symbol, reason, code)
+                log.debug("[%s] SL %s skip — posición ya cerrada", trade.symbol, reason)
             else:
                 log.warning("[%s] SL %s fallo: %s", trade.symbol, reason, resp)
         except Exception as e:
@@ -317,22 +316,8 @@ class PositionManager:
 
     async def _move_to_breakeven(self, trade: OpenTrade, current_price: float):
         try:
-            # FIX 110406: cancel + verificar que ordenes desaparecieron antes de colocar BE
             await self.client.cancel_all_orders(trade.symbol)
-            await asyncio.sleep(0.5)
-
-            # Verificar que no queden ordenes SL activas
-            for attempt in range(3):
-                open_orders = await self.client.get_open_orders(trade.symbol)
-                sl_orders = [o for o in open_orders
-                             if o.get("type") in ("STOP_MARKET", "STOP")]
-                if not sl_orders:
-                    break
-                log.debug("[%s] BE: %d SL orders aun activas, esperando...",
-                          trade.symbol, len(sl_orders))
-                await self.client.cancel_all_orders(trade.symbol)
-                await asyncio.sleep(0.5 * (attempt + 1))
-
+            await asyncio.sleep(0.3)
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.partial_qty or trade.qty,
@@ -345,10 +330,8 @@ class PositionManager:
                 trade.sl = trade.entry
                 log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
             elif code in (109420, 110406):
-                # 109420 = posicion cerrada, 110406 = SL ya existe (race condition)
                 trade.be_moved = True
-                log.debug("[%s] BE skip (code=%d) — SL ya gestionado por BingX",
-                          trade.symbol, code)
+                log.debug("[%s] BE skip (code=%d) — orden ya gestionada", trade.symbol, code)
             else:
                 log.warning("[%s] BE fallo: %s", trade.symbol, resp)
         except Exception as e:
@@ -356,39 +339,31 @@ class PositionManager:
 
     # ── TP2 parcial ───────────────────────────────────────────────────────────
 
-    async def _partial_close_tp2(self, trade: OpenTrade, mark: float,
-                                cfg: TradeConfig, real_qty: float = 0.0):
-        """
-        FIX 101205: usa real_qty de BingX para calcular close_qty.
-        Silencia 101205 (no position) y 109420 (already closed).
-        """
-        # Usar qty real de BingX si disponible, sino la local
-        base_qty = real_qty if real_qty > 0 else trade.qty
-        close_qty = round(base_qty * cfg.tp2_partial_pct, 6)
+    async def _partial_close_tp2(self, trade: OpenTrade, mark: float, cfg: TradeConfig):
+        close_qty = round(trade.qty * cfg.tp2_partial_pct, 6)
         if close_qty <= 0:
             return
 
         try:
             side = "SELL" if trade.direction == "LONG" else "BUY"
+            # v6.7 FIX: usar place_reduce_only_market — evita kwarg error
             resp = await self.client.place_reduce_only_market(
                 trade.symbol, side, close_qty, trade.direction,
             )
             code = resp.get("code", -1)
             if code == 0:
                 trade.tp2_partial_done = True
-                trade.partial_qty = max(base_qty - close_qty, 0)
+                trade.partial_qty = max(trade.qty - close_qty, 0)
                 partial_pnl = self._calc_pnl_qty(trade, mark, close_qty)
-                log.info("[%s] TP2 parcial: cerrado %.4f (50%%) PnL=%.2f USDT",
+                log.info("[%s] TP2 parcial: cerrado %.4f (50%%) PnL≈%.2f USDT",
                          trade.symbol, close_qty, partial_pnl)
                 await tg.notify_partial_close(
                     trade.symbol, trade.direction, mark,
                     close_qty, partial_pnl, "tp2_partial"
                 )
-            elif code in (101205, 109420):
-                # 101205 = no position to close, 109420 = already closed
+            elif code == 109420:
                 trade.tp2_partial_done = True
-                log.debug("[%s] TP2 parcial skip — posicion ya cerrada (code=%d)",
-                          trade.symbol, code)
+                log.debug("[%s] TP2 parcial skip — posición ya cerrada", trade.symbol)
             else:
                 log.warning("[%s] TP2 parcial fallo: %s", trade.symbol, resp)
         except Exception as e:
@@ -420,18 +395,23 @@ class PositionManager:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _calc_pnl(self, trade: OpenTrade, close_price: float) -> float:
+        """
+        PnL en USDT para BingX USDT-M perpetuals.
+        qty ya es en contratos/moneda base; el valor en USDT es directo.
+        NO multiplicar por LEVERAGE — eso causaba PnL 10x inflado.
+        """
         if trade.direction == "LONG":
             raw = (close_price - trade.entry) * trade.qty
         else:
             raw = (trade.entry - close_price) * trade.qty
-        return round(raw * C.LEVERAGE, 4)
+        return round(raw, 4)
 
     def _calc_pnl_qty(self, trade: OpenTrade, close_price: float, qty: float) -> float:
         if trade.direction == "LONG":
             raw = (close_price - trade.entry) * qty
         else:
             raw = (trade.entry - close_price) * qty
-        return round(raw * C.LEVERAGE, 4)
+        return round(raw, 4)
 
     def get_tracked(self) -> dict[str, OpenTrade]:
         return dict(self._trades)
