@@ -415,7 +415,7 @@ class BingXClient:
         qty = self._round_qty(symbol, quantity)
         # FIX HEDGE MODE: closePosition=true es solo para One-Way mode.
         # En Hedge mode BingX exige positionSide + quantity real.
-        # quantity=0 + closePosition=true → 109420 "position not exist"
+        # reduceOnly=true evita check de margen en posiciones con PnL negativo (error 110424)
         params = {
             "symbol":       symbol,
             "side":         side,
@@ -423,6 +423,7 @@ class BingXClient:
             "type":         order_type,
             "stopPrice":    str(round(stop_price, 8)),
             "quantity":     str(qty),
+            "reduceOnly":   "true",
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
