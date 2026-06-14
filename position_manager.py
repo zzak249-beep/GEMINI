@@ -195,29 +195,37 @@ class PositionManager:
                 await self.remove_trade(trade.symbol, 0.0)
                 return
 
-            await self.client.cancel_all_orders(trade.symbol)
+            # FIX 109420: cancel_all_orders falla si no hay órdenes abiertas.
+            # Ignorar el error y continuar siempre al STOP_MARKET.
+            try:
+                await self.client.cancel_all_orders(trade.symbol)
+            except Exception as ce:
+                log.debug("[%s] cancel_all_orders ignorado: %s", trade.symbol, ce)
             await asyncio.sleep(0.3)
 
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
                 trade.symbol, side_close, trade.qty, trade.entry,
-                trade.direction, close_position=True, order_type="STOP_MARKET",
+                trade.direction, order_type="STOP_MARKET",
             )
             if resp.get("code", -1) == 0:
                 trade.be_moved = True
                 log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
             else:
-                log.warning("[%s] BE fallo: %s — restaurando SL original", trade.symbol, resp)
-                # FIX: re-poner SL original para no dejar posición expuesta
+                log.warning("[%s] BE fallo: %s — colocando SL", trade.symbol, resp)
                 await asyncio.sleep(0.2)
+                # Fallback: SL original, o -3%/+3% si la posición no tenía SL
+                sl_price = trade.sl if trade.sl > 0 else (
+                    trade.entry * 0.97 if trade.direction == "LONG" else trade.entry * 1.03
+                )
                 sl_resp = await self.client.place_stop_market_order(
-                    trade.symbol, side_close, trade.qty, trade.sl,
-                    trade.direction, close_position=True, order_type="STOP_MARKET",
+                    trade.symbol, side_close, trade.qty, sl_price,
+                    trade.direction, order_type="STOP_MARKET",
                 )
                 if sl_resp.get("code", -1) == 0:
-                    log.info("[%s] SL original restaurado @ %.6f", trade.symbol, trade.sl)
+                    log.info("[%s] SL colocado @ %.6f", trade.symbol, sl_price)
                 else:
-                    log.error("[%s] SL original NO restaurado: %s — POSICIÓN SIN PROTECCIÓN",
+                    log.error("[%s] SL NO colocado: %s — POSICIÓN SIN PROTECCIÓN",
                               trade.symbol, sl_resp)
         except Exception as e:
             log.error("[%s] _move_to_breakeven error: %s", trade.symbol, e)
