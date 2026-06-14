@@ -409,13 +409,12 @@ class BingXClient:
         quantity:       float,
         stop_price:     float,
         position_side:  str  = "LONG",
-        close_position: bool = True,   # ignorado — closePosition=true NO funciona en Hedge mode
+        close_position: bool = True,
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
-        # FIX HEDGE MODE: closePosition=true es solo para One-Way mode.
-        # En Hedge mode BingX exige positionSide + quantity real.
-        # reduceOnly=true evita check de margen en posiciones con PnL negativo (error 110424)
+        # HEDGE MODE: NO usar reduceOnly (BingX lo rechaza silenciosamente en Hedge mode).
+        # positionSide identifica la posición a cerrar — eso es suficiente.
         params = {
             "symbol":       symbol,
             "side":         side,
@@ -423,7 +422,6 @@ class BingXClient:
             "type":         order_type,
             "stopPrice":    str(round(stop_price, 8)),
             "quantity":     str(qty),
-            "reduceOnly":   "true",
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
@@ -494,19 +492,23 @@ class BingXClient:
 
         await asyncio.sleep(0.5)
 
-        qty_half = self._round_qty(symbol, qty / 2)
+        # Split: TP1 = mitad, TP2 = resto (evita pérdida por truncado)
+        precision  = self._precision_map.get(symbol, 6)
+        factor     = 10 ** precision
+        qty_half   = math.floor(qty / 2 * factor) / factor
+        qty_remain = math.floor((qty - qty_half) * factor) / factor
 
         sl_task  = self.place_stop_market_order(
             symbol, side_close, qty, sl_price, direction,
-            close_position=False, order_type="STOP_MARKET",
+            order_type="STOP_MARKET",
         )
         tp1_task = self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
-            close_position=False, order_type="TAKE_PROFIT_MARKET",
+            order_type="TAKE_PROFIT_MARKET",
         )
         tp2_task = self.place_stop_market_order(
-            symbol, side_close, qty_half, tp2_price, direction,
-            close_position=False, order_type="TAKE_PROFIT_MARKET",
+            symbol, side_close, qty_remain, tp2_price, direction,
+            order_type="TAKE_PROFIT_MARKET",
         )
 
         sl_r, tp1_r, tp2_r = await asyncio.gather(sl_task, tp1_task, tp2_task,
@@ -514,4 +516,13 @@ class BingXClient:
         results["sl"]  = sl_r  if isinstance(sl_r,  dict) else {"code": -1, "msg": str(sl_r)}
         results["tp1"] = tp1_r if isinstance(tp1_r, dict) else {"code": -1, "msg": str(tp1_r)}
         results["tp2"] = tp2_r if isinstance(tp2_r, dict) else {"code": -1, "msg": str(tp2_r)}
+
+        # Log resultado de protecciones
+        for label, r in [("SL", results["sl"]), ("TP1", results["tp1"]), ("TP2", results["tp2"])]:
+            code = r.get("code", -1) if isinstance(r, dict) else -1
+            if code == 0:
+                log.info("[%s] %s colocado OK", symbol, label)
+            else:
+                log.error("[%s] %s FALLIDO: %s", symbol, label, r)
+
         return results
