@@ -385,20 +385,21 @@ class BingXClient:
         symbol:        str,
         side:          str,
         quantity:      float,
-        position_side: str = "LONG",   # ignorado — One-Way mode no usa positionSide
+        position_side: str = "LONG",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
         if not self._check_min_qty(symbol, qty):
             log.warning("[%s] qty %.6f < min_qty — skip", symbol, qty)
             return {"code": -1, "msg": "qty_below_minimum"}
-        # FIX: One-Way mode → NO positionSide en ninguna orden
+        # HEDGE MODE: positionSide requerido por BingX
         params = {
-            "symbol":   symbol,
-            "side":     side,
-            "type":     "MARKET",
-            "quantity": str(qty),
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         "MARKET",
+            "quantity":     str(qty),
         }
-        log.info("[%s] MARKET order: side=%s qty=%s", symbol, side, qty)
+        log.info("[%s] MARKET side=%s positionSide=%s qty=%s", symbol, side, position_side, qty)
         return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def place_stop_market_order(
@@ -407,36 +408,26 @@ class BingXClient:
         side:           str,
         quantity:       float,
         stop_price:     float,
-        position_side:  str  = "LONG",   # ignorado — One-Way mode
-        close_position: bool = True,
+        position_side:  str  = "LONG",
+        close_position: bool = True,   # ignorado — closePosition=true NO funciona en Hedge mode
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
-        # FIX DEFINITIVO 109420: One-Way mode → NUNCA positionSide en órdenes
-        if close_position:
-            # SL: closePosition=true cierra toda la posición automáticamente
-            params = {
-                "symbol":        symbol,
-                "side":          side,
-                "type":          order_type,
-                "stopPrice":     str(round(stop_price, 8)),
-                "closePosition": "true",
-                "quantity":      "0",
-                "workingType":   "MARK_PRICE",
-                "priceProtect":  "true",
-            }
-        else:
-            # TP parcial: reduceOnly=true + cantidad real (sin closePosition ni positionSide)
-            params = {
-                "symbol":      symbol,
-                "side":        side,
-                "type":        order_type,
-                "stopPrice":   str(round(stop_price, 8)),
-                "quantity":    str(qty),
-                "reduceOnly":  "true",
-                "workingType": "MARK_PRICE",
-                "priceProtect":"true",
-            }
+        # FIX HEDGE MODE: closePosition=true es solo para One-Way mode.
+        # En Hedge mode BingX exige positionSide + quantity real.
+        # quantity=0 + closePosition=true → 109420 "position not exist"
+        params = {
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         order_type,
+            "stopPrice":    str(round(stop_price, 8)),
+            "quantity":     str(qty),
+            "workingType":  "MARK_PRICE",
+            "priceProtect": "true",
+        }
+        log.debug("[%s] %s side=%s positionSide=%s stopPrice=%s qty=%s",
+                  symbol, order_type, side, position_side, stop_price, qty)
         return await self._post("/openApi/swap/v2/trade/order", params)
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict:
@@ -455,17 +446,17 @@ class BingXClient:
         self,
         symbol:        str,
         quantity:      float,
-        position_side: str,   # ignorado — One-Way mode
+        position_side: str,
     ) -> dict:
         side = "SELL" if position_side == "LONG" else "BUY"
         qty  = self._round_qty(symbol, quantity)
-        # FIX: One-Way mode → reduceOnly=true, sin positionSide
+        # HEDGE MODE: positionSide requerido para cerrar la posición correcta
         return await self._post("/openApi/swap/v2/trade/order", {
-            "symbol":     symbol,
-            "side":       side,
-            "type":       "MARKET",
-            "quantity":   str(qty),
-            "reduceOnly": "true",
+            "symbol":       symbol,
+            "side":         side,
+            "positionSide": position_side,
+            "type":         "MARKET",
+            "quantity":     str(qty),
         })
 
     # ── open_trade completo (entrada + SL + TP1 + TP2) ───────────────────────
@@ -506,7 +497,7 @@ class BingXClient:
 
         sl_task  = self.place_stop_market_order(
             symbol, side_close, qty, sl_price, direction,
-            close_position=True, order_type="STOP_MARKET",
+            close_position=False, order_type="STOP_MARKET",
         )
         tp1_task = self.place_stop_market_order(
             symbol, side_close, qty_half, tp1_price, direction,
