@@ -404,10 +404,13 @@ class BingXClient:
 
     async def _get_real_position_side(self, symbol: str, direction: str) -> str:
         """
-        FIX DEFINITIVO 109420: lee el positionSide real desde BingX.
-        One-Way mode → devuelve "BOTH"
-        Hedge mode   → devuelve "LONG" o "SHORT"
-        Si falla     → intenta con BOTH primero (más común en BingX ES)
+        FIX DEFINITIVO 109420:
+        El error "PositionSide can only be LONG or SHORT" confirma HEDGE MODE.
+        En Hedge Mode: positionSide = "LONG" o "SHORT" (nunca BOTH).
+        En One-Way:    positionSide = "BOTH".
+        
+        Lee el valor real desde BingX. Si no encuentra la posición,
+        usa el direction pasado como argumento (LONG/SHORT) — correcto para Hedge.
         """
         try:
             positions = await self.get_open_positions()
@@ -420,8 +423,9 @@ class BingXClient:
                     return ps
         except Exception as e:
             log.debug("[%s] _get_real_position_side error: %s", symbol, e)
-        # Fallback: en BingX España el modo aislado usa BOTH
-        return "BOTH"
+        # Fallback: usar direction (LONG/SHORT) — correcto para Hedge Mode
+        # Si fuera One-Way, BingX aceptará LONG/SHORT igual (ignora el campo)
+        return direction
 
     async def place_stop_market_order(
         self,
@@ -455,19 +459,21 @@ class BingXClient:
                   symbol, order_type, side, real_ps, stop_price, qty)
         resp = await self._post("/openApi/swap/v2/trade/order", params)
 
-        # Si falla con BOTH → reintentar con LONG/SHORT original
-        if isinstance(resp, dict) and resp.get("code", -1) != 0 and real_ps == "BOTH":
-            log.warning("[%s] BOTH falló (%s) → reintentando con %s",
-                        symbol, resp.get("msg",""), position_side)
-            params["positionSide"] = position_side
-            resp = await self._post("/openApi/swap/v2/trade/order", params)
-
-        # Si aún falla con LONG/SHORT → reintentar con BOTH
-        elif isinstance(resp, dict) and resp.get("code", -1) != 0 and real_ps != "BOTH":
-            log.warning("[%s] %s falló (%s) → reintentando con BOTH",
-                        symbol, real_ps, resp.get("msg",""))
-            params["positionSide"] = "BOTH"
-            resp = await self._post("/openApi/swap/v2/trade/order", params)
+        if isinstance(resp, dict) and resp.get("code", -1) != 0:
+            msg = resp.get("msg", "")
+            # "PositionSide can only be LONG or SHORT" → estamos en Hedge Mode
+            # → forzar direction (LONG/SHORT), nunca BOTH
+            if "PositionSide" in msg or "positionSide" in msg:
+                log.warning("[%s] Hedge mode detectado → forzando positionSide=%s",
+                            symbol, position_side)
+                params["positionSide"] = position_side
+                resp = await self._post("/openApi/swap/v2/trade/order", params)
+            # "position not exist" con LONG/SHORT → probar BOTH (One-Way mode)
+            elif "position not exist" in msg and real_ps != "BOTH":
+                log.warning("[%s] position not exist → probando BOTH (One-Way mode)",
+                            symbol)
+                params["positionSide"] = "BOTH"
+                resp = await self._post("/openApi/swap/v2/trade/order", params)
 
         return resp
 
@@ -502,13 +508,18 @@ class BingXClient:
         log.info("[%s] CLOSE MARKET side=%s positionSide=%s(real) qty=%s",
                  symbol, side, real_ps, qty)
         resp = await self._post("/openApi/swap/v2/trade/order", params)
-        # Fallback: si falla con positionSide detectado, probar el contrario
         if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            alt_ps = position_side if real_ps == "BOTH" else "BOTH"
-            log.warning("[%s] close fallido con %s → reintentando con %s",
-                        symbol, real_ps, alt_ps)
-            params["positionSide"] = alt_ps
-            resp = await self._post("/openApi/swap/v2/trade/order", params)
+            msg = resp.get("msg", "")
+            if "PositionSide" in msg or "positionSide" in msg:
+                # Hedge mode → forzar LONG/SHORT
+                params["positionSide"] = position_side
+                log.warning("[%s] close: Hedge mode → %s", symbol, position_side)
+                resp = await self._post("/openApi/swap/v2/trade/order", params)
+            elif "position not exist" in msg and real_ps != "BOTH":
+                # One-Way mode → usar BOTH
+                params["positionSide"] = "BOTH"
+                log.warning("[%s] close: One-Way mode → BOTH", symbol)
+                resp = await self._post("/openApi/swap/v2/trade/order", params)
         return resp
 
     # ── open_trade completo (entrada + SL + TP1 + TP2) ───────────────────────
