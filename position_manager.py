@@ -115,10 +115,25 @@ class PositionManager:
             amt = float(pos.get("positionAmt", 0) or 0)
             if not sym or amt == 0:
                 continue
-            direction = "LONG" if amt > 0 else "SHORT"
-            pos_side  = pos.get("positionSide", "BOTH")
+
+            pos_side = pos.get("positionSide", "BOTH")
             if pos_side not in ("LONG", "SHORT", "BOTH"):
                 pos_side = "BOTH"
+
+            # ── FIX v7.2: positionSide explícito (LONG/SHORT) tiene PRIORIDAD
+            # sobre el signo de positionAmt. En cuentas con margen aislado /
+            # ciertas configuraciones, BingX devuelve positionAmt SIEMPRE
+            # positivo y la dirección real va en positionSide. Si solo
+            # mirábamos el signo de positionAmt, posiciones SHORT (ej.
+            # CATIUSDT, ACUUSDT, ARCUSDT) se reconciliaban como LONG,
+            # provocando 110412 al colocar el SL en _activate_trail
+            # (BingX espera BUY STOP > mark para SHORT, recibíamos
+            # SELL STOP < mark calculado para LONG).
+            if pos_side in ("LONG", "SHORT"):
+                direction = pos_side
+            else:
+                # positionSide == "BOTH" → único fallback fiable: signo de positionAmt
+                direction = "LONG" if amt > 0 else "SHORT"
             entry = float(pos.get("avgPrice", pos.get("entryPrice", 0)) or 0)
             qty   = abs(amt)
             sl    = entry * (0.99 if direction == "LONG" else 1.01)
