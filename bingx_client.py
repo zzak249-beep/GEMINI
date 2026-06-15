@@ -455,11 +455,10 @@ class BingXClient:
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
-        # FIX v7.1 — reduceOnly para cierre de posición
-        # Sin esto, en modo One-Way (positionSide=BOTH) un SELL STOP_MARKET sin
-        # reduceOnly puede interpretarse como apertura de SHORT vía stop, lo que
-        # exige stopPrice > markPrice → error 110412.
-        if close_position:
+        # FIX v7.1 — reduceOnly SOLO en One-Way mode (positionSide=BOTH)
+        # • One-Way (BOTH): sin reduceOnly BingX interpreta SELL STOP como SHORT entry → 110412
+        # • Hedge mode (LONG/SHORT): reduceOnly está PROHIBIDO → error 109400
+        if close_position and real_ps == "BOTH":
             params["reduceOnly"] = "true"
 
         log.debug("[%s] %s side=%s positionSide=%s(real) stopPrice=%s qty=%s reduce=%s",
