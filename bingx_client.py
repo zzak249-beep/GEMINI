@@ -402,6 +402,27 @@ class BingXClient:
         log.info("[%s] MARKET side=%s positionSide=%s qty=%s", symbol, side, position_side, qty)
         return await self._post("/openApi/swap/v2/trade/order", params)
 
+    async def _get_real_position_side(self, symbol: str, direction: str) -> str:
+        """
+        FIX DEFINITIVO 109420: lee el positionSide real desde BingX.
+        One-Way mode → devuelve "BOTH"
+        Hedge mode   → devuelve "LONG" o "SHORT"
+        Si falla     → intenta con BOTH primero (más común en BingX ES)
+        """
+        try:
+            positions = await self.get_open_positions()
+            for p in positions:
+                if p.get("symbol") != symbol:
+                    continue
+                ps = p.get("positionSide", "")
+                if ps in ("LONG", "SHORT", "BOTH"):
+                    log.debug("[%s] positionSide real: %s", symbol, ps)
+                    return ps
+        except Exception as e:
+            log.debug("[%s] _get_real_position_side error: %s", symbol, e)
+        # Fallback: en BingX España el modo aislado usa BOTH
+        return "BOTH"
+
     async def place_stop_market_order(
         self,
         symbol:         str,
@@ -413,21 +434,42 @@ class BingXClient:
         order_type:     str  = "STOP_MARKET",
     ) -> dict:
         qty = self._round_qty(symbol, quantity)
-        # HEDGE MODE: NO usar reduceOnly (BingX lo rechaza silenciosamente en Hedge mode).
-        # positionSide identifica la posición a cerrar — eso es suficiente.
+
+        # FIX DEFINITIVO 109420:
+        # BingX en modo aislado (Modo de activo único) usa positionSide=BOTH.
+        # Si mandamos LONG/SHORT → error 109420 "position not exist".
+        # Solución: leer el positionSide real desde la API antes de mandar la orden.
+        real_ps = await self._get_real_position_side(symbol, position_side)
+
         params = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": position_side,
+            "positionSide": real_ps,
             "type":         order_type,
             "stopPrice":    str(round(stop_price, 8)),
             "quantity":     str(qty),
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
-        log.debug("[%s] %s side=%s positionSide=%s stopPrice=%s qty=%s",
-                  symbol, order_type, side, position_side, stop_price, qty)
-        return await self._post("/openApi/swap/v2/trade/order", params)
+        log.debug("[%s] %s side=%s positionSide=%s(real) stopPrice=%s qty=%s",
+                  symbol, order_type, side, real_ps, stop_price, qty)
+        resp = await self._post("/openApi/swap/v2/trade/order", params)
+
+        # Si falla con BOTH → reintentar con LONG/SHORT original
+        if isinstance(resp, dict) and resp.get("code", -1) != 0 and real_ps == "BOTH":
+            log.warning("[%s] BOTH falló (%s) → reintentando con %s",
+                        symbol, resp.get("msg",""), position_side)
+            params["positionSide"] = position_side
+            resp = await self._post("/openApi/swap/v2/trade/order", params)
+
+        # Si aún falla con LONG/SHORT → reintentar con BOTH
+        elif isinstance(resp, dict) and resp.get("code", -1) != 0 and real_ps != "BOTH":
+            log.warning("[%s] %s falló (%s) → reintentando con BOTH",
+                        symbol, real_ps, resp.get("msg",""))
+            params["positionSide"] = "BOTH"
+            resp = await self._post("/openApi/swap/v2/trade/order", params)
+
+        return resp
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict:
         return await self._delete(
@@ -447,16 +489,27 @@ class BingXClient:
         quantity:      float,
         position_side: str,
     ) -> dict:
-        side = "SELL" if position_side == "LONG" else "BUY"
-        qty  = self._round_qty(symbol, quantity)
-        # HEDGE MODE: positionSide requerido para cerrar la posición correcta
-        return await self._post("/openApi/swap/v2/trade/order", {
+        side    = "SELL" if position_side == "LONG" else "BUY"
+        qty     = self._round_qty(symbol, quantity)
+        real_ps = await self._get_real_position_side(symbol, position_side)
+        params  = {
             "symbol":       symbol,
             "side":         side,
-            "positionSide": position_side,
+            "positionSide": real_ps,
             "type":         "MARKET",
             "quantity":     str(qty),
-        })
+        }
+        log.info("[%s] CLOSE MARKET side=%s positionSide=%s(real) qty=%s",
+                 symbol, side, real_ps, qty)
+        resp = await self._post("/openApi/swap/v2/trade/order", params)
+        # Fallback: si falla con positionSide detectado, probar el contrario
+        if isinstance(resp, dict) and resp.get("code", -1) != 0:
+            alt_ps = position_side if real_ps == "BOTH" else "BOTH"
+            log.warning("[%s] close fallido con %s → reintentando con %s",
+                        symbol, real_ps, alt_ps)
+            params["positionSide"] = alt_ps
+            resp = await self._post("/openApi/swap/v2/trade/order", params)
+        return resp
 
     # ── open_trade completo (entrada + SL + TP1 + TP2) ───────────────────────
 
