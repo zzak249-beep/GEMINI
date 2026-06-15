@@ -59,9 +59,10 @@ def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
     if sl_price <= 0:
         return False
     if direction == "LONG":
-        return sl_price < mark * 0.9999   # pequeño margen de seguridad
+        # Margen 0.2%: cubre diferencia lastPrice vs markPrice y latencia API
+        return sl_price < mark * 0.998
     else:
-        return sl_price > mark * 1.0001
+        return sl_price > mark * 1.002
 
 
 # ── Dataclass ─────────────────────────────────────────────────────────────────
@@ -319,6 +320,8 @@ class PositionManager:
         trade.be_moved        = True    # compat con código legacy
         trade.peak_price      = current_mark
 
+        already_cancelled = False   # FIX v7.1: evitar doble cancel_all_orders
+
         try:
             # Re-fetch precio fresco para detectar reversiones rápidas
             ticker = await self.client.get_ticker(symbol)
@@ -336,6 +339,7 @@ class PositionManager:
                 # Cancelar SL+TP originales (solo si el BE va a ser válido)
                 try:
                     await self.client.cancel_all_orders(symbol)
+                    already_cancelled = True    # FIX v7.1
                     await asyncio.sleep(0.3)
                 except Exception as ce:
                     log.debug("[%s] cancel_all_orders: %s", symbol, ce)
@@ -371,17 +375,29 @@ class PositionManager:
                             symbol, mark, trade.entry, trade.direction)
                 # No hacemos cancel_all — el SL original sigue protegiendo
 
-            # ── Fallback universal: SL en mark offset (siempre válido) ───────
+            # ── Fallback universal: SL en mark offset ─────────────────────────
+            # FIX v7.1: re-fetch mark FRESCO antes de calcular em_sl.
+            # El mark inicial puede estar 1-2s obsoleto tras cancel_all + sleep + fallo BE.
+            try:
+                t2 = await self.client.get_ticker(symbol)
+                m2 = float(t2.get("lastPrice", mark) or mark)
+                if m2 > 0:
+                    mark = m2
+                    trade.peak_price = mark
+            except Exception:
+                pass    # usar mark anterior si el re-fetch falla
+
             # Para LONG: 1.5% bajo mark | Para SHORT: 1.5% sobre mark
             em_sl = mark * 0.985 if trade.direction == "LONG" else mark * 1.015
 
             if _sl_valid(em_sl, mark, trade.direction):
-                # Primero intentar cancel (puede no haber nada que cancelar)
-                try:
-                    await self.client.cancel_all_orders(symbol)
-                    await asyncio.sleep(0.3)
-                except Exception:
-                    pass
+                # FIX v7.1: solo cancelar si NO cancelamos ya en el path del BE
+                if not already_cancelled:
+                    try:
+                        await self.client.cancel_all_orders(symbol)
+                        await asyncio.sleep(0.3)
+                    except Exception:
+                        pass
 
                 em_resp = await self.client.place_stop_market_order(
                     symbol, side_close, trade.qty, em_sl,

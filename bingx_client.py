@@ -455,14 +455,22 @@ class BingXClient:
             "workingType":  "MARK_PRICE",
             "priceProtect": "true",
         }
-        log.debug("[%s] %s side=%s positionSide=%s(real) stopPrice=%s qty=%s",
-                  symbol, order_type, side, real_ps, stop_price, qty)
+        # FIX v7.1 — reduceOnly para cierre de posición
+        # Sin esto, en modo One-Way (positionSide=BOTH) un SELL STOP_MARKET sin
+        # reduceOnly puede interpretarse como apertura de SHORT vía stop, lo que
+        # exige stopPrice > markPrice → error 110412.
+        if close_position:
+            params["reduceOnly"] = "true"
+
+        log.debug("[%s] %s side=%s positionSide=%s(real) stopPrice=%s qty=%s reduce=%s",
+                  symbol, order_type, side, real_ps, stop_price, qty,
+                  params.get("reduceOnly", "false"))
         resp = await self._post("/openApi/swap/v2/trade/order", params)
 
         if isinstance(resp, dict) and resp.get("code", -1) != 0:
-            msg = resp.get("msg", "")
+            msg  = resp.get("msg", "")
+            code = resp.get("code", -1)
             # "PositionSide can only be LONG or SHORT" → estamos en Hedge Mode
-            # → forzar direction (LONG/SHORT), nunca BOTH
             if "PositionSide" in msg or "positionSide" in msg:
                 log.warning("[%s] Hedge mode detectado → forzando positionSide=%s",
                             symbol, position_side)
@@ -473,6 +481,13 @@ class BingXClient:
                 log.warning("[%s] position not exist → probando BOTH (One-Way mode)",
                             symbol)
                 params["positionSide"] = "BOTH"
+                resp = await self._post("/openApi/swap/v2/trade/order", params)
+            # 110412 "Stop Loss price should be greater/less than current price"
+            # → conflicto priceProtect con mark price en BingX → retry sin priceProtect
+            elif code == 110412 and "priceProtect" in params:
+                log.warning("[%s] 110412 priceProtect conflict → retry sin priceProtect "
+                            "(stopPrice=%.8f)", symbol, stop_price)
+                params.pop("priceProtect", None)
                 resp = await self._post("/openApi/swap/v2/trade/order", params)
 
         return resp
