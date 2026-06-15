@@ -82,7 +82,43 @@ class PositionManager:
             log.info("[%s] Reconciliado: %s qty=%.4f @ %.6f", sym, direction, qty, entry)
 
         if count:
-            log.info("reconcile: %d posición(es) — open_count se sincronizará en primer ciclo", count)
+            log.info("reconcile: %d posición(es) — colocando SL emergencia...", count)
+            await self._place_emergency_sl_all()
+
+    async def _place_emergency_sl_all(self):
+        """
+        Coloca SL inmediato en todas las posiciones reconciliadas.
+        SL calculado desde mark price actual (no entry) para evitar
+        "Stop Loss price should be greater/less than current price".
+        """
+        async with self._lock:
+            trades = dict(self._trades)
+        for sym, trade in trades.items():
+            try:
+                ticker = await self.client.get_ticker(sym)
+                mark   = float(ticker.get("lastPrice", trade.entry) or trade.entry)
+                if mark <= 0:
+                    mark = trade.entry
+
+                side_close = "SELL" if trade.direction == "LONG" else "BUY"
+                # 2% desde mark price → siempre válido para BingX
+                sl_price = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
+
+                log.info("[%s] SL emergencia: mark=%.6f sl=%.6f %s",
+                         sym, mark, sl_price, trade.direction)
+
+                resp = await self.client.place_stop_market_order(
+                    sym, side_close, trade.qty, sl_price,
+                    trade.direction, order_type="STOP_MARKET",
+                )
+                if resp.get("code", -1) == 0:
+                    trade.sl = sl_price
+                    log.info("[%s] SL emergencia OK @ %.6f", sym, sl_price)
+                else:
+                    log.error("[%s] SL emergencia FALLIDO: %s", sym, resp)
+            except Exception as e:
+                log.error("[%s] _place_emergency_sl_all: %s", sym, e)
+            await asyncio.sleep(0.4)
 
     # ── Registro ──────────────────────────────────────────────────────────────
 
