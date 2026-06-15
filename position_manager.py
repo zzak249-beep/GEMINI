@@ -20,17 +20,18 @@ log = logging.getLogger("position_mgr")
 
 @dataclass
 class OpenTrade:
-    symbol:    str
-    direction: str
-    entry:     float
-    sl:        float
-    tp1:       float
-    tp2:       float
-    qty:       float
-    atr:       float
-    order_id:  str
-    be_moved:  bool = False
-    tp1_hit:   bool = False
+    symbol:        str
+    direction:     str
+    entry:         float
+    sl:            float
+    tp1:           float
+    tp2:           float
+    qty:           float
+    atr:           float
+    order_id:      str
+    be_moved:      bool = False
+    tp1_hit:       bool = False
+    position_side: str  = ""   # LONG/SHORT/BOTH leído de BingX
 
 
 class PositionManager:
@@ -61,6 +62,10 @@ class PositionManager:
             if not sym or amt == 0:
                 continue
             direction = "LONG" if amt > 0 else "SHORT"
+            # FIX 109420: leer positionSide real (BOTH en One-Way, LONG/SHORT en Hedge)
+            pos_side  = pos.get("positionSide", "BOTH")
+            if pos_side not in ("LONG", "SHORT", "BOTH"):
+                pos_side = "BOTH"
             entry = float(pos.get("avgPrice", pos.get("entryPrice", 0)) or 0)
             qty   = abs(amt)
             sl    = entry * (0.99 if direction == "LONG" else 1.01)
@@ -71,6 +76,7 @@ class PositionManager:
                     symbol=sym, direction=direction, entry=entry,
                     sl=sl, tp1=tp1, tp2=tp2, qty=qty,
                     atr=entry * 0.005, order_id="reconciled",
+                    position_side=pos_side,
                 )
             count += 1
             log.info("[%s] Reconciliado: %s qty=%.4f @ %.6f", sym, direction, qty, entry)
