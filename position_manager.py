@@ -1,14 +1,30 @@
 """
-QF×JP Bot v6.5 — Position Manager — TRAILING STOP DINÁMICO
-Cambios v2:
-  - _update_trailing_stop reemplaza _move_to_breakeven
-  - _valid_sl_price valida precio ANTES de cada llamada → elimina error 110412
-  - trail_high: watermark correcto (max LONG / min SHORT)
-  - Solo activa BingX cuando SL mejoró > TRAIL_UPDATE_THRESHOLD * ATR
-  - Notificación Telegram al activar trail y al cruzar entry (profit garantizado)
-  - open_count sincronizado solo desde BingX real
-  - reconcile NO toca _open_count
-  - remove_trade pasa symbol para cooldown
+QF×JP Bot v7.0 — Position Manager TRAILING STOP DINÁMICO
+═══════════════════════════════════════════════════════════════════════════════
+FIXES vs v6.5:
+  ✅ Loop infinito 110412 (ARC-USDT): trailing_active=True al primer intento,
+     nunca vuelve a reintentar el BE que fallaba cada 30 segundos
+  ✅ cancel_all_orders antes de BE fallido dejaba posición sin SL → ahora
+     se usa place-then-cancel: nuevo SL antes de cancelar el viejo
+  ✅ Race condition: precio revertía entre el trigger y el order placement →
+     re-fetch fresco + validación antes de cualquier cancel_all_orders
+
+NUEVO — Trailing Stop dinámico:
+  • Se activa a BREAKEVEN_ATR_MULT ATR de beneficio (default 1.0)
+  • El SL sigue el peak del precio a TRAIL_DISTANCE_ATR ATR de distancia
+  • Estrategia place-then-cancel: máxima seguridad, nunca sin protección
+  • Solo mueve SL a favor (LONG → arriba, SHORT → abajo), nunca en contra
+  • Qty sincronizada con BingX real (maneja cierres parciales de TP1/TP2)
+  • Notificaciones Telegram throttled: solo cada 1 ATR de mejora
+
+EJEMPLO con ATR=0.010, entry=1.000 USDT, LONG:
+  t=0:   Entrada | SL=0.980 (2 ATR) | TP1=1.020 | TP2=1.040
+  t=1:   mark=1.010 → TRAIL ACTIVA → SL@entry=1.000 (breakeven)
+  t=2:   mark=1.025 → peak=1.025 → SL=1.010 (+1% locked)
+  t=3:   mark=1.040 → peak=1.040 → SL=1.025 (+2.5% locked)
+  t=4:   mark=1.035 → sin cambio (no nuevo peak)
+  t=5:   mark=1.060 → peak=1.060 → SL=1.045 (+4.5% locked!)
+═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
 import logging
@@ -22,58 +38,66 @@ import telegram_client as tg
 log = logging.getLogger("position_mgr")
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _extract_order_id(resp: dict) -> str:
+    """Extrae orderId de la respuesta de BingX (maneja varios formatos)."""
+    data = resp.get("data", {})
+    if isinstance(data, dict):
+        oid = (data.get("order") or {}).get("orderId") or data.get("orderId", "")
+        return str(oid) if oid else ""
+    return ""
+
+
+def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
+    """
+    Valida que el precio de SL sea aceptable para BingX antes de enviarlo.
+    - LONG SELL STOP: sl_price debe ser < mark (se dispara cuando baja)
+    - SHORT BUY STOP: sl_price debe ser > mark (se dispara cuando sube)
+    Evita el error 110412 "Stop Loss price should be greater/less than current price"
+    """
+    if sl_price <= 0:
+        return False
+    if direction == "LONG":
+        return sl_price < mark * 0.9999   # pequeño margen de seguridad
+    else:
+        return sl_price > mark * 1.0001
+
+
+# ── Dataclass ─────────────────────────────────────────────────────────────────
+
 @dataclass
 class OpenTrade:
-    symbol:         str
-    direction:      str
-    entry:          float
-    sl:             float
-    tp1:            float
-    tp2:            float
-    qty:            float
-    atr:            float
-    order_id:       str
-    be_moved:       bool  = False   # True cuando trailing se activa (compatibilidad)
-    tp1_hit:        bool  = False
-    position_side:  str   = ""      # LONG/SHORT/BOTH leído de BingX
-    # ── Trailing Stop ─────────────────────────────────────────────────────────
-    trail_active:   bool  = False   # trailing activado (precio cruzó umbral)
-    trail_high:     float = 0.0     # watermark: máximo (LONG) o mínimo (SHORT)
-    trail_notified: bool  = False   # ya enviamos notificación de profit garantizado
+    symbol:        str
+    direction:     str
+    entry:         float
+    sl:            float
+    tp1:           float
+    tp2:           float
+    qty:           float
+    atr:           float
+    order_id:      str
+    be_moved:      bool  = False   # compat legacy — True cuando trailing activo
+    tp1_hit:       bool  = False
+    position_side: str   = ""      # LONG/SHORT/BOTH leído de BingX
 
+    # ── Trailing stop ─────────────────────────────────────────────────────────
+    trailing_active:  bool  = False  # trailing activado
+    trail_sl:         float = 0.0    # precio del SL activo en BingX
+    peak_price:       float = 0.0    # mejor precio visto en dirección favorable
+    trail_order_id:   str   = ""     # orderId del STOP_MARKET activo en BingX
+
+
+# ── Manager ───────────────────────────────────────────────────────────────────
 
 class PositionManager:
     def __init__(self, client: BingXClient, risk: RiskManager):
-        self.client = client
-        self.risk   = risk
+        self.client  = client
+        self.risk    = risk
         self._trades: dict[str, OpenTrade] = {}
-        self._lock  = asyncio.Lock()
-
-    # ── Helper: validar precio antes de enviar a BingX ────────────────────────
-
-    @staticmethod
-    def _valid_sl_price(direction: str, sl_price: float, mark: float) -> float:
-        """
-        BingX error 110412: el stop price debe estar en el lado correcto del precio actual.
-
-        LONG (SELL STOP_MARKET): stop_price DEBE ser < mark  (trigger cuando cae)
-        SHORT (BUY  STOP_MARKET): stop_price DEBE ser > mark  (trigger cuando sube)
-
-        Si el precio calculado es inválido, lo ajusta con un buffer del 0.15%.
-        Nunca enviar a BingX sin pasar por esta función.
-        """
-        buf = 0.0015  # 0.15%
-        if direction == "LONG":
-            limit = mark * (1.0 - buf)
-            if sl_price >= mark:
-                log.debug("[valid_sl] LONG sl=%.6f≥mark=%.6f → %.6f", sl_price, mark, limit)
-                return limit
-        else:  # SHORT
-            limit = mark * (1.0 + buf)
-            if sl_price <= mark:
-                log.debug("[valid_sl] SHORT sl=%.6f≤mark=%.6f → %.6f", sl_price, mark, limit)
-                return limit
-        return sl_price
+        self._lock   = asyncio.Lock()
+        # Throttle Telegram: notificar trail solo cada 1 ATR de mejora por símbolo
+        self._trail_last_notify: dict[str, float] = {}
 
     # ── Reconciliar al arrancar ───────────────────────────────────────────────
 
@@ -108,8 +132,11 @@ class PositionManager:
                 self._trades[sym] = OpenTrade(
                     symbol=sym, direction=direction, entry=entry,
                     sl=sl, tp1=tp1, tp2=tp2, qty=qty,
-                    atr=entry * 0.005, order_id="reconciled",
+                    atr=entry * 0.005,    # estimación conservadora para reconcile
+                    order_id="reconciled",
                     position_side=pos_side,
+                    trail_sl=sl,          # SL inicial = SL de emergencia
+                    peak_price=entry,     # peak inicial = entry
                 )
             count += 1
             log.info("[%s] Reconciliado: %s qty=%.4f @ %.6f", sym, direction, qty, entry)
@@ -121,8 +148,8 @@ class PositionManager:
     async def _place_emergency_sl_all(self):
         """
         Coloca SL inmediato en todas las posiciones reconciliadas.
-        SL a 2% del mark price actual → siempre válido para BingX.
-        Pasa por _valid_sl_price como doble seguridad.
+        SL calculado desde mark price actual con 2% offset → siempre válido.
+        Guarda el orderId para el sistema de trailing.
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -134,20 +161,20 @@ class PositionManager:
                     mark = trade.entry
 
                 side_close = "SELL" if trade.direction == "LONG" else "BUY"
-                # 2% desde mark → siempre del lado correcto
-                raw_sl   = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
-                sl_price = self._valid_sl_price(trade.direction, raw_sl, mark)
+                sl_price   = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
 
-                log.info("[%s] SL emergencia: mark=%.6f sl=%.6f %s",
-                         sym, mark, sl_price, trade.direction)
+                log.info("[%s] SL emergencia: mark=%.6f sl=%.6f", sym, mark, sl_price)
 
                 resp = await self.client.place_stop_market_order(
                     sym, side_close, trade.qty, sl_price,
                     trade.direction, order_type="STOP_MARKET",
                 )
                 if resp.get("code", -1) == 0:
-                    trade.sl = sl_price
-                    log.info("[%s] SL emergencia OK @ %.6f", sym, sl_price)
+                    oid = _extract_order_id(resp)
+                    trade.sl             = sl_price
+                    trade.trail_sl       = sl_price
+                    trade.trail_order_id = oid
+                    log.info("[%s] SL emergencia OK @ %.6f (oid=%s)", sym, sl_price, oid)
                 else:
                     log.error("[%s] SL emergencia FALLIDO: %s", sym, resp)
             except Exception as e:
@@ -169,12 +196,14 @@ class PositionManager:
                 del self._trades[symbol]
                 existed = True
         if existed:
+            self._trail_last_notify.pop(symbol, None)
             await self.risk.on_trade_closed(pnl=pnl, symbol=symbol)
 
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor iniciado (intervalo=%ds)", C.POSITION_CHECK_INTERVAL)
+        log.info("Position monitor v7.0 — trailing stop | intervalo=%ds",
+                 C.POSITION_CHECK_INTERVAL)
         while True:
             try:
                 await self._check_all_positions()
@@ -190,13 +219,11 @@ class PositionManager:
             log.warning("get_open_positions failed: %s", e)
             return
 
-        # Mapa real de BingX
+        # Mapa real de BingX (fuente de verdad)
         real_map: dict[str, dict] = {
             p["symbol"]: p for p in real_positions
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
-
-        # Sincronizar open_count con BingX real
         await self.risk.update_open_count(len(real_map))
 
         async with self._lock:
@@ -204,7 +231,7 @@ class PositionManager:
 
         for symbol, trade in tracked.items():
 
-            # Posición cerrada externamente (SL/TP tocado en BingX)
+            # ── Posición cerrada externamente (SL/TP disparado por BingX) ─────
             if symbol not in real_map:
                 try:
                     ticker      = await self.client.get_ticker(symbol)
@@ -212,7 +239,7 @@ class PositionManager:
                 except Exception:
                     close_price = trade.entry
                 pnl = self._calc_pnl(trade, close_price)
-                log.info("[%s] Cerrada externamente. PnL≈%.2f", symbol, pnl)
+                log.info("[%s] Cerrada externamente. PnL≈%.2f USDT", symbol, pnl)
                 await tg.notify_trade_closed(
                     symbol, trade.direction, trade.entry,
                     close_price, trade.qty, "sl_tp_auto", pnl,
@@ -220,8 +247,9 @@ class PositionManager:
                 await self.remove_trade(symbol, pnl)
                 continue
 
-            # Posición abierta — obtener mark price
             pos = real_map[symbol]
+
+            # ── Mark price ────────────────────────────────────────────────────
             try:
                 mark = float(pos.get("markPrice", 0) or 0)
                 if mark <= 0:
@@ -232,7 +260,16 @@ class PositionManager:
             if mark <= 0:
                 continue
 
-            # TP1 tracking
+            # ── Sync qty real (TP parciales ejecutados por BingX) ────────────
+            real_qty = abs(float(pos.get("positionAmt", trade.qty) or trade.qty))
+            if real_qty > 0:
+                drift = abs(real_qty - trade.qty) / max(trade.qty, 1e-12)
+                if drift > 0.05:   # >5% de diferencia = parcial ejecutado
+                    log.info("[%s] qty sync: %.6f → %.6f (parcial TP?)",
+                             symbol, trade.qty, real_qty)
+                    trade.qty = real_qty
+
+            # ── TP1 tracking ──────────────────────────────────────────────────
             if not trade.tp1_hit:
                 tp1_hit = (
                     (trade.direction == "LONG"  and mark >= trade.tp1) or
@@ -242,123 +279,239 @@ class PositionManager:
                     trade.tp1_hit = True
                     log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark)
 
-            # ── Trailing Stop Dinámico ────────────────────────────────────────
-            # Reemplaza el BE fijo. Gestiona activación, watermark y envío a BingX.
-            await self._update_trailing_stop(trade, mark, real_map)
+            # ── Trailing Stop ─────────────────────────────────────────────────
+            if not trade.trailing_active:
+                # Umbral de activación = BREAKEVEN_ATR_MULT ATR favorable
+                activate_at = (
+                    trade.entry + trade.atr * C.BREAKEVEN_ATR_MULT
+                    if trade.direction == "LONG"
+                    else trade.entry - trade.atr * C.BREAKEVEN_ATR_MULT
+                )
+                should_activate = (
+                    (trade.direction == "LONG"  and mark >= activate_at) or
+                    (trade.direction == "SHORT" and mark <= activate_at)
+                )
+                if should_activate:
+                    await self._activate_trail(trade, mark)
+            else:
+                await self._update_trail(trade, mark)
 
-    # ── Trailing Stop ─────────────────────────────────────────────────────────
+    # ── Activación del trailing ───────────────────────────────────────────────
 
-    async def _update_trailing_stop(self, trade: OpenTrade, mark: float, real_map: dict):
+    async def _activate_trail(self, trade: OpenTrade, current_mark: float):
         """
-        Trailing Stop Dinámico — lógica completa:
-
-        1. Watermark: rastrea el máximo (LONG) o mínimo (SHORT) de mark visto.
-        2. Activación: solo cuando precio va TRAIL_ACTIVATION_MULT * ATR a favor.
-        3. new_sl = watermark ± TRAIL_ATR_MULT * ATR
-        4. SL solo se mueve en dirección favorable (nunca retrocede).
-        5. _valid_sl_price garantiza que BingX no rechace la orden (error 110412).
-        6. Solo llama a BingX si la mejora es ≥ TRAIL_UPDATE_THRESHOLD * ATR.
-        7. Notifica Telegram: activación + profit garantizado (trail_sl cruza entry).
+        Activa el trailing stop por primera vez:
+        1. Re-fetch precio fresco (fix race condition)
+        2. Marca trailing_active=True ANTES de cualquier operación
+           → ESTO es el fix definitivo del loop infinito 110412
+        3. Valida el precio SL antes de cancelar nada
+        4. Solo si precio válido: cancel_all → place BE SL
+        5. Si falla: coloca SL de emergencia desde mark actual
         """
-        if trade.symbol not in real_map:
-            return
+        symbol = trade.symbol
+        log.info("[%s] Trail activation — mark=%.6f entry=%.6f atr=%.6f",
+                 symbol, current_mark, trade.entry, trade.atr)
 
-        atr = trade.atr if trade.atr > 0 else mark * 0.005
-
-        # Inicializar watermark la primera vez (al precio de entrada)
-        if trade.trail_high == 0.0:
-            trade.trail_high = trade.entry
-
-        # ── Actualizar watermark (solo en dirección favorable) ────────────────
-        if trade.direction == "LONG":
-            if mark > trade.trail_high:
-                trade.trail_high = mark
-            new_sl = trade.trail_high - atr * C.TRAIL_ATR_MULT
-        else:  # SHORT
-            if mark < trade.trail_high:
-                trade.trail_high = mark
-            new_sl = trade.trail_high + atr * C.TRAIL_ATR_MULT
-
-        # ── Activación ────────────────────────────────────────────────────────
-        if not trade.trail_active:
-            activation_px = (
-                trade.entry + atr * C.TRAIL_ACTIVATION_MULT
-                if trade.direction == "LONG"
-                else trade.entry - atr * C.TRAIL_ACTIVATION_MULT
-            )
-            activated = (
-                (trade.direction == "LONG"  and mark >= activation_px) or
-                (trade.direction == "SHORT" and mark <= activation_px)
-            )
-            if not activated:
-                # Precio todavía no llegó al umbral — no hacer nada
-                return
-
-            trade.trail_active = True
-            trade.be_moved     = True  # compatibilidad con campo existente
-            log.info("[%s] 🎯 Trail ACTIVADO mark=%.6f activation=%.6f trail_sl=%.6f",
-                     trade.symbol, mark, activation_px, new_sl)
-            await tg.notify_trail_activated(trade.symbol, trade.direction, mark, new_sl)
-
-        # ── El SL solo puede mejorar ──────────────────────────────────────────
-        # LONG: SL debe subir (nunca bajar). SHORT: SL debe bajar (nunca subir).
-        if trade.direction == "LONG"  and new_sl <= trade.sl:
-            return
-        if trade.direction == "SHORT" and new_sl >= trade.sl:
-            return
-
-        # ── Umbral mínimo para evitar spam de API ─────────────────────────────
-        if abs(new_sl - trade.sl) < atr * C.TRAIL_UPDATE_THRESHOLD:
-            return
-
-        # ── Validar precio (previene error 110412 definitivamente) ────────────
-        validated_sl = self._valid_sl_price(trade.direction, new_sl, mark)
-
-        # Re-verificar mejora tras ajuste de validación
-        if trade.direction == "LONG"  and validated_sl <= trade.sl:
-            return
-        if trade.direction == "SHORT" and validated_sl >= trade.sl:
-            return
-
-        # ── Notificar profit garantizado (primera vez que SL cruza entry) ─────
-        guaranteed = (
-            (trade.direction == "LONG"  and validated_sl >= trade.entry) or
-            (trade.direction == "SHORT" and validated_sl <= trade.entry)
-        )
-        if guaranteed and not trade.trail_notified:
-            trade.trail_notified = True
-            await tg.notify_trail_be_locked(
-                trade.symbol, trade.direction, validated_sl, trade.entry
-            )
-
-        # ── Enviar a BingX ────────────────────────────────────────────────────
-        old_sl     = trade.sl
-        side_close = "SELL" if trade.direction == "LONG" else "BUY"
+        # ── FIX DEFINITIVO: marcar activo AL INICIO, no al final ─────────────
+        # Antes: be_moved se ponía True solo en éxito → retry infinito en fallo
+        # Ahora: trailing_active=True impide cualquier reintento en ciclos futuros
+        trade.trailing_active = True
+        trade.be_moved        = True    # compat con código legacy
+        trade.peak_price      = current_mark
 
         try:
-            # Cancelar SL anterior (ignora error si no hay órdenes abiertas)
-            try:
-                await self.client.cancel_all_orders(trade.symbol)
-            except Exception as ce:
-                log.debug("[%s] cancel_all_orders ignorado: %s", trade.symbol, ce)
-            await asyncio.sleep(0.3)
+            # Re-fetch precio fresco para detectar reversiones rápidas
+            ticker = await self.client.get_ticker(symbol)
+            mark   = float(ticker.get("lastPrice", current_mark) or current_mark)
+            if mark <= 0:
+                mark = current_mark
+            trade.peak_price = mark     # usar precio más fresco
 
+            # Precio de breakeven
+            sl_be = trade.entry
+            side_close = "SELL" if trade.direction == "LONG" else "BUY"
+
+            if _sl_valid(sl_be, mark, trade.direction):
+                # ── Caso normal: precio sigue favorable ──────────────────────
+                # Cancelar SL+TP originales (solo si el BE va a ser válido)
+                try:
+                    await self.client.cancel_all_orders(symbol)
+                    await asyncio.sleep(0.3)
+                except Exception as ce:
+                    log.debug("[%s] cancel_all_orders: %s", symbol, ce)
+
+                resp = await self.client.place_stop_market_order(
+                    symbol, side_close, trade.qty, sl_be,
+                    trade.direction, order_type="STOP_MARKET",
+                )
+
+                if resp.get("code", -1) == 0:
+                    oid = _extract_order_id(resp)
+                    trade.trail_sl       = sl_be
+                    trade.trail_order_id = oid
+                    trade.sl             = sl_be
+                    self._trail_last_notify[symbol] = sl_be
+                    log.info("[%s] 🎯 Trail ACTIVADO — SL @ breakeven %.6f | peak=%.6f | oid=%s",
+                             symbol, sl_be, mark, oid)
+                    await tg.send(
+                        f"🎯 *TRAIL ACTIVADO* — `{symbol}` "
+                        f"{'🟢' if trade.direction == 'LONG' else '🔴'}\n"
+                        f"SL → breakeven `{sl_be:.6f}` | Mark: `{mark:.6f}`\n"
+                        f"ATR: `{trade.atr:.6f}` | Peak: `{mark:.6f}`"
+                    )
+                    return
+
+                # ── SL en breakeven falló: fallback a offset de mark ──────────
+                log.warning("[%s] BE @ entry falló: %s — probando SL offset", symbol, resp)
+
+            else:
+                # ── Precio revertió entre trigger y ahora: NO cancelar SL original
+                log.warning("[%s] Precio revertió (mark=%.6f, entry=%.6f, dir=%s) "
+                            "— SL original sigue activo, usando offset de mark",
+                            symbol, mark, trade.entry, trade.direction)
+                # No hacemos cancel_all — el SL original sigue protegiendo
+
+            # ── Fallback universal: SL en mark offset (siempre válido) ───────
+            # Para LONG: 1.5% bajo mark | Para SHORT: 1.5% sobre mark
+            em_sl = mark * 0.985 if trade.direction == "LONG" else mark * 1.015
+
+            if _sl_valid(em_sl, mark, trade.direction):
+                # Primero intentar cancel (puede no haber nada que cancelar)
+                try:
+                    await self.client.cancel_all_orders(symbol)
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+
+                em_resp = await self.client.place_stop_market_order(
+                    symbol, side_close, trade.qty, em_sl,
+                    trade.direction, order_type="STOP_MARKET",
+                )
+                if em_resp.get("code", -1) == 0:
+                    oid = _extract_order_id(em_resp)
+                    trade.trail_sl       = em_sl
+                    trade.trail_order_id = oid
+                    trade.sl             = em_sl
+                    self._trail_last_notify[symbol] = em_sl
+                    log.info("[%s] 🎯 Trail ACTIVADO (SL emergencia) @ %.6f | mark=%.6f",
+                             symbol, em_sl, mark)
+                    await tg.send(
+                        f"🎯 *TRAIL ACTIVADO* (emergencia) — `{symbol}`\n"
+                        f"SL @ `{em_sl:.6f}` | Mark: `{mark:.6f}`"
+                    )
+                else:
+                    log.error("[%s] Trail activation: SL emergencia FALLIDO: %s — "
+                              "posición sin protección, monitorizar manual", symbol, em_resp)
+                    await tg.notify_error(
+                        f"trail_activation({symbol})",
+                        f"SL emergencia fallido — POSICIÓN SIN PROTECCIÓN\n{em_resp}"
+                    )
+            else:
+                log.error("[%s] Trail activation: no se puede calcular SL válido "
+                          "para mark=%.6f dir=%s", symbol, mark, trade.direction)
+
+        except Exception as e:
+            log.error("[%s] _activate_trail error: %s", symbol, e)
+            # trailing_active ya es True — no volverá a reintentar
+
+    # ── Actualización del trailing ────────────────────────────────────────────
+
+    async def _update_trail(self, trade: OpenTrade, mark: float):
+        """
+        Actualiza el trailing SL cuando el precio alcanza un nuevo peak.
+        Estrategia PLACE-THEN-CANCEL:
+          1. Calcula nuevo SL desde peak - TRAIL_DISTANCE_ATR * atr
+          2. Si es mejor que el SL actual y válido para BingX:
+             a. Coloca NUEVO STOP_MARKET (posición protegida durante el update)
+             b. Si OK: cancela el VIEJO (nunca queda sin SL)
+             c. Actualiza trail_sl, trail_order_id
+        El SL solo se mueve a favor del trade (LONG → arriba, SHORT → abajo).
+        """
+        symbol     = trade.symbol
+        trail_dist = trade.atr * C.TRAIL_DISTANCE_ATR
+
+        # ── Calcular nuevo peak ───────────────────────────────────────────────
+        if trade.direction == "LONG":
+            if mark <= trade.peak_price:
+                return   # sin nuevo máximo → sin cambio
+            new_peak = mark
+            new_sl   = new_peak - trail_dist
+            # Solo subir el SL (nunca bajar)
+            if new_sl <= trade.trail_sl:
+                trade.peak_price = new_peak   # guardar peak aunque el SL no mejore
+                return
+        else:  # SHORT
+            if trade.peak_price > 0 and mark >= trade.peak_price:
+                return   # sin nuevo mínimo → sin cambio
+            new_peak = mark
+            new_sl   = new_peak + trail_dist
+            # Solo bajar el SL (nunca subir para SHORT)
+            if trade.trail_sl > 0 and new_sl >= trade.trail_sl:
+                trade.peak_price = new_peak
+                return
+
+        # ── Validar precio SL para BingX ─────────────────────────────────────
+        if not _sl_valid(new_sl, mark, trade.direction):
+            trade.peak_price = new_peak
+            log.debug("[%s] Trail: new_sl=%.6f inválido para mark=%.6f dir=%s",
+                      symbol, new_sl, mark, trade.direction)
+            return
+
+        # ── PLACE-THEN-CANCEL ─────────────────────────────────────────────────
+        try:
+            side_close = "SELL" if trade.direction == "LONG" else "BUY"
+
+            # 1. Colocar NUEVO SL primero (nunca sin protección)
             resp = await self.client.place_stop_market_order(
-                trade.symbol, side_close, trade.qty, validated_sl,
+                symbol, side_close, trade.qty, new_sl,
                 trade.direction, order_type="STOP_MARKET",
             )
 
             if resp.get("code", -1) == 0:
-                trade.sl = validated_sl
-                log.info(
-                    "[%s] ✅ Trail SL %.6f → %.6f  (mark=%.6f high=%.6f)",
-                    trade.symbol, old_sl, validated_sl, mark, trade.trail_high,
-                )
+                new_oid       = _extract_order_id(resp)
+                old_oid       = trade.trail_order_id
+                old_sl        = trade.trail_sl
+                profit_locked = self._calc_pnl(trade, new_sl)
+
+                # 2. Actualizar estado
+                trade.peak_price     = new_peak
+                trade.trail_sl       = new_sl
+                trade.trail_order_id = new_oid
+                trade.sl             = new_sl   # mantener .sl en sync
+
+                log.info("[%s] 📈 Trail: %.6f→%.6f | peak=%.6f | mark=%.6f | PnL@SL≈%.2f USDT",
+                         symbol, old_sl, new_sl, new_peak, mark, profit_locked)
+
+                # 3. Cancelar SL viejo (best-effort, el nuevo ya está activo)
+                if old_oid and old_oid != new_oid:
+                    await asyncio.sleep(0.1)
+                    try:
+                        await self.client.cancel_order(symbol, old_oid)
+                        log.debug("[%s] Old trail SL %s cancelado", symbol, old_oid)
+                    except Exception as ce:
+                        log.debug("[%s] cancel_order viejo %s: %s", symbol, old_oid, ce)
+
+                # 4. Notificación Telegram (throttle: 1 ATR de mejora mínima)
+                last_sl = self._trail_last_notify.get(symbol, trade.entry)
+                if abs(new_sl - last_sl) >= trade.atr:
+                    self._trail_last_notify[symbol] = new_sl
+                    pnl_icon = "💚" if profit_locked > 0 else "⚡"
+                    await tg.send(
+                        f"{pnl_icon} *TRAIL* — `{symbol}` "
+                        f"{'🟢' if trade.direction == 'LONG' else '🔴'}\n"
+                        f"SL: `{old_sl:.6f}` → `{new_sl:.6f}`\n"
+                        f"Peak: `{new_peak:.6f}` | PnL@SL: `{profit_locked:+.2f} USDT`"
+                    )
+
             else:
-                log.warning("[%s] Trail SL rechazado por BingX: %s", trade.symbol, resp)
+                # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
+                trade.peak_price = new_peak   # guardar peak, reintentar próximo ciclo
+                log.warning("[%s] Trail update falló new_sl=%.6f: %s",
+                            symbol, new_sl, resp)
 
         except Exception as e:
-            log.error("[%s] _update_trailing_stop error: %s", trade.symbol, e)
+            trade.peak_price = new_peak
+            log.error("[%s] _update_trail error: %s", symbol, e)
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 

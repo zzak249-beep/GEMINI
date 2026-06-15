@@ -1,6 +1,6 @@
 """
-QF×JP Bot v6.5 — Main
-FastAPI con lifespan moderno + reconciliación al arrancar
+QF×JP Bot v7.0 — Main
+FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info en /status
 """
 import asyncio
 import logging
@@ -55,7 +55,6 @@ async def _run_monitor():
 
 
 async def _run_complement():
-    """Complement engine: copy, guardian, hedge, símbolos exclusivos."""
     import os
     if os.getenv("COMPLEMENT_MODE", "") == "DISABLED":
         log.info("Complement engine desactivado")
@@ -70,16 +69,18 @@ async def _run_complement():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global client, risk, pos_mgr
+    global client, risk, pos_mgr, master, complement
 
-    log.info("═" * 50)
-    log.info("  QF×JP Bot v6.5 — ANTI-LIQUIDACIÓN")
+    log.info("═" * 54)
+    log.info("  QF×JP Bot v7.0 — TRAILING STOP + ANTI-LIQUIDACIÓN")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
     log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
              C.MAX_NOTIONAL_USDT, C.DAILY_LOSS_PCT)
-    log.info("  SL mult: %.1f | Max open: %d", C.SL_ATR_MULT, C.MAX_OPEN_TRADES)
-    log.info("═" * 50)
+    log.info("  SL mult: %.1f | Trail activation: %.1f ATR | Trail dist: %.1f ATR",
+             C.SL_ATR_MULT, C.BREAKEVEN_ATR_MULT, C.TRAIL_DISTANCE_ATR)
+    log.info("  Max open: %d | Max daily: %d", C.MAX_OPEN_TRADES, C.MAX_DAILY_TRADES)
+    log.info("═" * 54)
 
     client     = BingXClient()
     risk       = RiskManager()
@@ -92,7 +93,6 @@ async def lifespan(app: FastAPI):
     if not C.TELEGRAM_TOKEN or not C.TELEGRAM_CHAT_ID:
         log.warning("Telegram no configurado")
 
-    # Balance inicial
     try:
         balance = await client.get_balance()
         log.info("Balance: %.4f USDT", balance)
@@ -100,7 +100,6 @@ async def lifespan(app: FastAPI):
         log.warning("Balance inicial no disponible: %s", e)
         balance = 0.0
 
-    # Reconciliar posiciones abiertas tras redeploy
     if C.MODE == "LIVE":
         try:
             await pos_mgr.reconcile_on_startup()
@@ -127,7 +126,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="QF×JP Bot v6.5",
+    title="QF×JP Bot v7.0",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -136,7 +135,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "6.5", "mode": C.MODE}
+    return {"status": "ok", "version": "7.0", "mode": C.MODE}
 
 
 @app.get("/status")
@@ -149,19 +148,30 @@ async def status():
         balance = -1.0
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "6.5",
+        "version": "7.0",
         "mode":    C.MODE,
         "balance": round(balance, 2),
         "risk":    risk.status(),
         "trades":  {
             sym: {
-                "direction": t.direction,
-                "entry":     t.entry,
-                "sl":        t.sl,
-                "tp1":       t.tp1,
-                "tp2":       t.tp2,
-                "qty":       t.qty,
-                "be_moved":  t.be_moved,
+                "direction":       t.direction,
+                "entry":           t.entry,
+                "sl":              t.sl,
+                "tp1":             t.tp1,
+                "tp2":             t.tp2,
+                "qty":             t.qty,
+                "be_moved":        t.be_moved,
+                # ── Trailing info ─────────────────────────────────────────────
+                "trailing_active": t.trailing_active,
+                "trail_sl":        round(t.trail_sl, 8) if t.trail_sl else None,
+                "peak_price":      round(t.peak_price, 8) if t.peak_price else None,
+                "pnl_at_trail_sl": round(
+                    (t.trail_sl - t.entry) * t.qty * C.LEVERAGE
+                    if t.direction == "LONG" and t.trail_sl > 0
+                    else (t.entry - t.trail_sl) * t.qty * C.LEVERAGE
+                    if t.direction == "SHORT" and t.trail_sl > 0
+                    else 0.0, 2
+                ),
             }
             for sym, t in tracked.items()
         },
