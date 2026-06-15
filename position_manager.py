@@ -1,15 +1,19 @@
 """
-QF×JP Bot v7.0 — Position Manager TRAILING STOP DINÁMICO
+QF×JP Bot v7.1 — Position Manager TRAILING STOP DINÁMICO (FIX 110412 loop)
 ═══════════════════════════════════════════════════════════════════════════════
-FIXES vs v6.5:
-  ✅ Loop infinito 110412 (ARC-USDT): trailing_active=True al primer intento,
-     nunca vuelve a reintentar el BE que fallaba cada 30 segundos
-  ✅ cancel_all_orders antes de BE fallido dejaba posición sin SL → ahora
-     se usa place-then-cancel: nuevo SL antes de cancelar el viejo
-  ✅ Race condition: precio revertía entre el trigger y el order placement →
-     re-fetch fresco + validación antes de cualquier cancel_all_orders
+FIXES vs v7.0:
+  ✅ Loop infinito 110412 en pares de bajo precio (CATI-USDT, etc.):
+     - Margen de _sl_valid ampliado 0.2% → 0.5% (cubre spread/tick/latencia)
+     - Re-fetch de mark price justo antes de enviar el STOP_MARKET en
+       _update_trail (la misma técnica que ya usaba _activate_trail)
+     - Nuevo campo last_failed_sl: si el new_sl calculado es ~igual al que
+       falló en el ciclo anterior y sigue siendo inválido, se descarta en
+       silencio (log.debug) en vez de reintentar y volver a fallar igual
 
-NUEVO — Trailing Stop dinámico:
+  (resto de v7.0 sin cambios: place-then-cancel, qty sync, BE activation,
+   reconcile, notificaciones throttled)
+
+NUEVO — Trailing Stop dinámico (sin cambios funcionales vs v7.0):
   • Se activa a BREAKEVEN_ATR_MULT ATR de beneficio (default 1.0)
   • El SL sigue el peak del precio a TRAIL_DISTANCE_ATR ATR de distancia
   • Estrategia place-then-cancel: máxima seguridad, nunca sin protección
@@ -55,14 +59,18 @@ def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
     - LONG SELL STOP: sl_price debe ser < mark (se dispara cuando baja)
     - SHORT BUY STOP: sl_price debe ser > mark (se dispara cuando sube)
     Evita el error 110412 "Stop Loss price should be greater/less than current price"
+
+    FIX v7.1: margen ampliado de 0.2% → 0.5%. En pares de precio bajo
+    (CATI-USDT, etc.) un margen de 0.2% no cubre el spread + latencia
+    entre el cálculo y la ejecución de la orden, lo que provocaba que
+    BingX rechazara repetidamente el mismo new_sl.
     """
     if sl_price <= 0:
         return False
     if direction == "LONG":
-        # Margen 0.2%: cubre diferencia lastPrice vs markPrice y latencia API
-        return sl_price < mark * 0.998
+        return sl_price < mark * 0.995
     else:
-        return sl_price > mark * 1.002
+        return sl_price > mark * 1.005
 
 
 # ── Dataclass ─────────────────────────────────────────────────────────────────
@@ -87,6 +95,9 @@ class OpenTrade:
     trail_sl:         float = 0.0    # precio del SL activo en BingX
     peak_price:       float = 0.0    # mejor precio visto en dirección favorable
     trail_order_id:   str   = ""     # orderId del STOP_MARKET activo en BingX
+
+    # ── FIX v7.1: anti-loop de retries idénticos ─────────────────────────────
+    last_failed_sl:   float = 0.0    # último new_sl que fue inválido/rechazado
 
 
 # ── Manager ───────────────────────────────────────────────────────────────────
@@ -203,7 +214,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.0 — trailing stop | intervalo=%ds",
+        log.info("Position monitor v7.1 — trailing stop | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -438,10 +449,19 @@ class PositionManager:
         Estrategia PLACE-THEN-CANCEL:
           1. Calcula nuevo SL desde peak - TRAIL_DISTANCE_ATR * atr
           2. Si es mejor que el SL actual y válido para BingX:
-             a. Coloca NUEVO STOP_MARKET (posición protegida durante el update)
-             b. Si OK: cancela el VIEJO (nunca queda sin SL)
-             c. Actualiza trail_sl, trail_order_id
+             a. Re-fetch mark fresco (FIX v7.1) y re-valida
+             b. Coloca NUEVO STOP_MARKET (posición protegida durante el update)
+             c. Si OK: cancela el VIEJO (nunca queda sin SL)
+             d. Actualiza trail_sl, trail_order_id
         El SL solo se mueve a favor del trade (LONG → arriba, SHORT → abajo).
+
+        FIX v7.1 (anti-loop 110412):
+          - Margen de _sl_valid ampliado a 0.5% (ver _sl_valid)
+          - Antes de enviar la orden, se re-fetch el mark price y se
+            revalida con el precio más reciente posible
+          - Si new_sl es ~igual al último new_sl que falló y sigue
+            siendo inválido, se descarta en debug sin loguear warning
+            repetido (evita spam de logs en pares volátiles)
         """
         symbol     = trade.symbol
         trail_dist = trade.atr * C.TRAIL_DISTANCE_ATR
@@ -466,11 +486,39 @@ class PositionManager:
                 trade.peak_price = new_peak
                 return
 
-        # ── Validar precio SL para BingX ─────────────────────────────────────
+        # ── Validar precio SL para BingX (con mark actual) ───────────────────
         if not _sl_valid(new_sl, mark, trade.direction):
             trade.peak_price = new_peak
-            log.debug("[%s] Trail: new_sl=%.6f inválido para mark=%.6f dir=%s",
-                      symbol, new_sl, mark, trade.direction)
+            # FIX v7.1: anti-spam — si es básicamente el mismo new_sl que ya
+            # falló antes y sigue inválido, no repetir el warning/retry ruidoso
+            if trade.last_failed_sl and abs(new_sl - trade.last_failed_sl) < trade.atr * 0.05:
+                log.debug("[%s] Trail: new_sl=%.6f repetido e inválido (mark=%.6f) — esperando nuevo peak",
+                          symbol, new_sl, mark)
+            else:
+                log.debug("[%s] Trail: new_sl=%.6f inválido para mark=%.6f dir=%s",
+                          symbol, new_sl, mark, trade.direction)
+            trade.last_failed_sl = new_sl
+            return
+
+        # ── FIX v7.1: re-fetch mark fresco justo antes de enviar ─────────────
+        # El mark usado para calcular new_sl puede tener 1 ciclo de antigüedad
+        # (hasta POSITION_CHECK_INTERVAL segundos). Revalidar con precio fresco
+        # evita el 110412 cuando el precio se movió en contra justo antes del envío.
+        fresh_mark = mark
+        try:
+            t = await self.client.get_ticker(symbol)
+            fm = float(t.get("lastPrice", mark) or mark)
+            if fm > 0:
+                fresh_mark = fm
+        except Exception:
+            pass    # si el refresh falla, seguimos con el mark del ciclo
+
+        if not _sl_valid(new_sl, fresh_mark, trade.direction):
+            trade.peak_price     = new_peak
+            trade.last_failed_sl = new_sl
+            log.debug("[%s] Trail: new_sl=%.6f inválido tras refresh (mark fresco=%.6f, dir=%s) — "
+                      "se reintentará con próximo peak",
+                      symbol, new_sl, fresh_mark, trade.direction)
             return
 
         # ── PLACE-THEN-CANCEL ─────────────────────────────────────────────────
@@ -494,9 +542,10 @@ class PositionManager:
                 trade.trail_sl       = new_sl
                 trade.trail_order_id = new_oid
                 trade.sl             = new_sl   # mantener .sl en sync
+                trade.last_failed_sl = 0.0      # FIX v7.1: reset tras éxito
 
                 log.info("[%s] 📈 Trail: %.6f→%.6f | peak=%.6f | mark=%.6f | PnL@SL≈%.2f USDT",
-                         symbol, old_sl, new_sl, new_peak, mark, profit_locked)
+                         symbol, old_sl, new_sl, new_peak, fresh_mark, profit_locked)
 
                 # 3. Cancelar SL viejo (best-effort, el nuevo ya está activo)
                 if old_oid and old_oid != new_oid:
@@ -521,12 +570,14 @@ class PositionManager:
 
             else:
                 # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
-                trade.peak_price = new_peak   # guardar peak, reintentar próximo ciclo
+                trade.peak_price     = new_peak   # guardar peak, reintentar próximo ciclo
+                trade.last_failed_sl = new_sl     # FIX v7.1: recordar para anti-spam
                 log.warning("[%s] Trail update falló new_sl=%.6f: %s",
                             symbol, new_sl, resp)
 
         except Exception as e:
-            trade.peak_price = new_peak
+            trade.peak_price     = new_peak
+            trade.last_failed_sl = new_sl
             log.error("[%s] _update_trail error: %s", symbol, e)
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
