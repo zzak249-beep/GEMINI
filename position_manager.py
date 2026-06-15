@@ -1,7 +1,11 @@
 """
-QF×JP Bot v6.5 — Position Manager CORREGIDO
-Fixes:
-  - BE usa real_map del ciclo (no llamada extra → elimina 'position not exist')
+QF×JP Bot v6.5 — Position Manager — TRAILING STOP DINÁMICO
+Cambios v2:
+  - _update_trailing_stop reemplaza _move_to_breakeven
+  - _valid_sl_price valida precio ANTES de cada llamada → elimina error 110412
+  - trail_high: watermark correcto (max LONG / min SHORT)
+  - Solo activa BingX cuando SL mejoró > TRAIL_UPDATE_THRESHOLD * ATR
+  - Notificación Telegram al activar trail y al cruzar entry (profit garantizado)
   - open_count sincronizado solo desde BingX real
   - reconcile NO toca _open_count
   - remove_trade pasa symbol para cooldown
@@ -20,18 +24,22 @@ log = logging.getLogger("position_mgr")
 
 @dataclass
 class OpenTrade:
-    symbol:        str
-    direction:     str
-    entry:         float
-    sl:            float
-    tp1:           float
-    tp2:           float
-    qty:           float
-    atr:           float
-    order_id:      str
-    be_moved:      bool = False
-    tp1_hit:       bool = False
-    position_side: str  = ""   # LONG/SHORT/BOTH leído de BingX
+    symbol:         str
+    direction:      str
+    entry:          float
+    sl:             float
+    tp1:            float
+    tp2:            float
+    qty:            float
+    atr:            float
+    order_id:       str
+    be_moved:       bool  = False   # True cuando trailing se activa (compatibilidad)
+    tp1_hit:        bool  = False
+    position_side:  str   = ""      # LONG/SHORT/BOTH leído de BingX
+    # ── Trailing Stop ─────────────────────────────────────────────────────────
+    trail_active:   bool  = False   # trailing activado (precio cruzó umbral)
+    trail_high:     float = 0.0     # watermark: máximo (LONG) o mínimo (SHORT)
+    trail_notified: bool  = False   # ya enviamos notificación de profit garantizado
 
 
 class PositionManager:
@@ -40,6 +48,32 @@ class PositionManager:
         self.risk   = risk
         self._trades: dict[str, OpenTrade] = {}
         self._lock  = asyncio.Lock()
+
+    # ── Helper: validar precio antes de enviar a BingX ────────────────────────
+
+    @staticmethod
+    def _valid_sl_price(direction: str, sl_price: float, mark: float) -> float:
+        """
+        BingX error 110412: el stop price debe estar en el lado correcto del precio actual.
+
+        LONG (SELL STOP_MARKET): stop_price DEBE ser < mark  (trigger cuando cae)
+        SHORT (BUY  STOP_MARKET): stop_price DEBE ser > mark  (trigger cuando sube)
+
+        Si el precio calculado es inválido, lo ajusta con un buffer del 0.15%.
+        Nunca enviar a BingX sin pasar por esta función.
+        """
+        buf = 0.0015  # 0.15%
+        if direction == "LONG":
+            limit = mark * (1.0 - buf)
+            if sl_price >= mark:
+                log.debug("[valid_sl] LONG sl=%.6f≥mark=%.6f → %.6f", sl_price, mark, limit)
+                return limit
+        else:  # SHORT
+            limit = mark * (1.0 + buf)
+            if sl_price <= mark:
+                log.debug("[valid_sl] SHORT sl=%.6f≤mark=%.6f → %.6f", sl_price, mark, limit)
+                return limit
+        return sl_price
 
     # ── Reconciliar al arrancar ───────────────────────────────────────────────
 
@@ -62,7 +96,6 @@ class PositionManager:
             if not sym or amt == 0:
                 continue
             direction = "LONG" if amt > 0 else "SHORT"
-            # FIX 109420: leer positionSide real (BOTH en One-Way, LONG/SHORT en Hedge)
             pos_side  = pos.get("positionSide", "BOTH")
             if pos_side not in ("LONG", "SHORT", "BOTH"):
                 pos_side = "BOTH"
@@ -88,8 +121,8 @@ class PositionManager:
     async def _place_emergency_sl_all(self):
         """
         Coloca SL inmediato en todas las posiciones reconciliadas.
-        SL calculado desde mark price actual (no entry) para evitar
-        "Stop Loss price should be greater/less than current price".
+        SL a 2% del mark price actual → siempre válido para BingX.
+        Pasa por _valid_sl_price como doble seguridad.
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -101,8 +134,9 @@ class PositionManager:
                     mark = trade.entry
 
                 side_close = "SELL" if trade.direction == "LONG" else "BUY"
-                # 2% desde mark price → siempre válido para BingX
-                sl_price = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
+                # 2% desde mark → siempre del lado correcto
+                raw_sl   = mark * 0.98 if trade.direction == "LONG" else mark * 1.02
+                sl_price = self._valid_sl_price(trade.direction, raw_sl, mark)
 
                 log.info("[%s] SL emergencia: mark=%.6f sl=%.6f %s",
                          sym, mark, sl_price, trade.direction)
@@ -162,7 +196,7 @@ class PositionManager:
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
 
-        # ── FIX: sincronizar open_count con BingX real ────────────────────────
+        # Sincronizar open_count con BingX real
         await self.risk.update_open_count(len(real_map))
 
         async with self._lock:
@@ -170,7 +204,7 @@ class PositionManager:
 
         for symbol, trade in tracked.items():
 
-            # Posición cerrada externamente
+            # Posición cerrada externamente (SL/TP tocado en BingX)
             if symbol not in real_map:
                 try:
                     ticker      = await self.client.get_ticker(symbol)
@@ -186,7 +220,7 @@ class PositionManager:
                 await self.remove_trade(symbol, pnl)
                 continue
 
-            # Posición abierta
+            # Posición abierta — obtener mark price
             pos = real_map[symbol]
             try:
                 mark = float(pos.get("markPrice", 0) or 0)
@@ -208,69 +242,123 @@ class PositionManager:
                     trade.tp1_hit = True
                     log.info("[%s] TP1 alcanzado @ %.6f", symbol, mark)
 
-            # Breakeven
-            if not trade.be_moved:
-                be_trigger = (
-                    trade.entry + trade.atr * C.BREAKEVEN_ATR_MULT
-                    if trade.direction == "LONG"
-                    else trade.entry - trade.atr * C.BREAKEVEN_ATR_MULT
-                )
-                be_reached = (
-                    (trade.direction == "LONG"  and mark >= be_trigger) or
-                    (trade.direction == "SHORT" and mark <= be_trigger)
-                )
-                if be_reached:
-                    # ── FIX: pasar real_map para no hacer llamada extra ────────
-                    await self._move_to_breakeven(trade, mark, real_map)
+            # ── Trailing Stop Dinámico ────────────────────────────────────────
+            # Reemplaza el BE fijo. Gestiona activación, watermark y envío a BingX.
+            await self._update_trailing_stop(trade, mark, real_map)
 
-    async def _move_to_breakeven(self, trade: OpenTrade, current_price: float,
-                                  real_map: dict = None):
+    # ── Trailing Stop ─────────────────────────────────────────────────────────
+
+    async def _update_trailing_stop(self, trade: OpenTrade, mark: float, real_map: dict):
         """
-        FIX DEFINITIVO 'position not exist':
-        Usa real_map del ciclo actual — sin llamada extra a BingX.
-        Si BE falla, re-pone el SL original para no dejar posición sin protección.
+        Trailing Stop Dinámico — lógica completa:
+
+        1. Watermark: rastrea el máximo (LONG) o mínimo (SHORT) de mark visto.
+        2. Activación: solo cuando precio va TRAIL_ACTIVATION_MULT * ATR a favor.
+        3. new_sl = watermark ± TRAIL_ATR_MULT * ATR
+        4. SL solo se mueve en dirección favorable (nunca retrocede).
+        5. _valid_sl_price garantiza que BingX no rechace la orden (error 110412).
+        6. Solo llama a BingX si la mejora es ≥ TRAIL_UPDATE_THRESHOLD * ATR.
+        7. Notifica Telegram: activación + profit garantizado (trail_sl cruza entry).
         """
-        try:
-            # Verificar con real_map ya disponible
-            if real_map is not None and trade.symbol not in real_map:
-                log.info("[%s] BE skip — no en real_map", trade.symbol)
-                await self.remove_trade(trade.symbol, 0.0)
+        if trade.symbol not in real_map:
+            return
+
+        atr = trade.atr if trade.atr > 0 else mark * 0.005
+
+        # Inicializar watermark la primera vez (al precio de entrada)
+        if trade.trail_high == 0.0:
+            trade.trail_high = trade.entry
+
+        # ── Actualizar watermark (solo en dirección favorable) ────────────────
+        if trade.direction == "LONG":
+            if mark > trade.trail_high:
+                trade.trail_high = mark
+            new_sl = trade.trail_high - atr * C.TRAIL_ATR_MULT
+        else:  # SHORT
+            if mark < trade.trail_high:
+                trade.trail_high = mark
+            new_sl = trade.trail_high + atr * C.TRAIL_ATR_MULT
+
+        # ── Activación ────────────────────────────────────────────────────────
+        if not trade.trail_active:
+            activation_px = (
+                trade.entry + atr * C.TRAIL_ACTIVATION_MULT
+                if trade.direction == "LONG"
+                else trade.entry - atr * C.TRAIL_ACTIVATION_MULT
+            )
+            activated = (
+                (trade.direction == "LONG"  and mark >= activation_px) or
+                (trade.direction == "SHORT" and mark <= activation_px)
+            )
+            if not activated:
+                # Precio todavía no llegó al umbral — no hacer nada
                 return
 
-            # FIX 109420: cancel_all_orders falla si no hay órdenes abiertas.
-            # Ignorar el error y continuar siempre al STOP_MARKET.
+            trade.trail_active = True
+            trade.be_moved     = True  # compatibilidad con campo existente
+            log.info("[%s] 🎯 Trail ACTIVADO mark=%.6f activation=%.6f trail_sl=%.6f",
+                     trade.symbol, mark, activation_px, new_sl)
+            await tg.notify_trail_activated(trade.symbol, trade.direction, mark, new_sl)
+
+        # ── El SL solo puede mejorar ──────────────────────────────────────────
+        # LONG: SL debe subir (nunca bajar). SHORT: SL debe bajar (nunca subir).
+        if trade.direction == "LONG"  and new_sl <= trade.sl:
+            return
+        if trade.direction == "SHORT" and new_sl >= trade.sl:
+            return
+
+        # ── Umbral mínimo para evitar spam de API ─────────────────────────────
+        if abs(new_sl - trade.sl) < atr * C.TRAIL_UPDATE_THRESHOLD:
+            return
+
+        # ── Validar precio (previene error 110412 definitivamente) ────────────
+        validated_sl = self._valid_sl_price(trade.direction, new_sl, mark)
+
+        # Re-verificar mejora tras ajuste de validación
+        if trade.direction == "LONG"  and validated_sl <= trade.sl:
+            return
+        if trade.direction == "SHORT" and validated_sl >= trade.sl:
+            return
+
+        # ── Notificar profit garantizado (primera vez que SL cruza entry) ─────
+        guaranteed = (
+            (trade.direction == "LONG"  and validated_sl >= trade.entry) or
+            (trade.direction == "SHORT" and validated_sl <= trade.entry)
+        )
+        if guaranteed and not trade.trail_notified:
+            trade.trail_notified = True
+            await tg.notify_trail_be_locked(
+                trade.symbol, trade.direction, validated_sl, trade.entry
+            )
+
+        # ── Enviar a BingX ────────────────────────────────────────────────────
+        old_sl     = trade.sl
+        side_close = "SELL" if trade.direction == "LONG" else "BUY"
+
+        try:
+            # Cancelar SL anterior (ignora error si no hay órdenes abiertas)
             try:
                 await self.client.cancel_all_orders(trade.symbol)
             except Exception as ce:
                 log.debug("[%s] cancel_all_orders ignorado: %s", trade.symbol, ce)
             await asyncio.sleep(0.3)
 
-            side_close = "SELL" if trade.direction == "LONG" else "BUY"
             resp = await self.client.place_stop_market_order(
-                trade.symbol, side_close, trade.qty, trade.entry,
+                trade.symbol, side_close, trade.qty, validated_sl,
                 trade.direction, order_type="STOP_MARKET",
             )
+
             if resp.get("code", -1) == 0:
-                trade.be_moved = True
-                log.info("[%s] SL → breakeven @ %.6f", trade.symbol, trade.entry)
+                trade.sl = validated_sl
+                log.info(
+                    "[%s] ✅ Trail SL %.6f → %.6f  (mark=%.6f high=%.6f)",
+                    trade.symbol, old_sl, validated_sl, mark, trade.trail_high,
+                )
             else:
-                log.warning("[%s] BE fallo: %s — colocando SL", trade.symbol, resp)
-                await asyncio.sleep(0.2)
-                # Fallback: SL original, o -3%/+3% si la posición no tenía SL
-                sl_price = trade.sl if trade.sl > 0 else (
-                    trade.entry * 0.97 if trade.direction == "LONG" else trade.entry * 1.03
-                )
-                sl_resp = await self.client.place_stop_market_order(
-                    trade.symbol, side_close, trade.qty, sl_price,
-                    trade.direction, order_type="STOP_MARKET",
-                )
-                if sl_resp.get("code", -1) == 0:
-                    log.info("[%s] SL colocado @ %.6f", trade.symbol, sl_price)
-                else:
-                    log.error("[%s] SL NO colocado: %s — POSICIÓN SIN PROTECCIÓN",
-                              trade.symbol, sl_resp)
+                log.warning("[%s] Trail SL rechazado por BingX: %s", trade.symbol, resp)
+
         except Exception as e:
-            log.error("[%s] _move_to_breakeven error: %s", trade.symbol, e)
+            log.error("[%s] _update_trailing_stop error: %s", trade.symbol, e)
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 

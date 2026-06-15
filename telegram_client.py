@@ -1,7 +1,8 @@
 """
-QF×JP Bot v6.4 — Telegram Client
+QF×JP Bot v6.5 — Telegram Client
 Envía notificaciones al canal configurado.
 Todas las funciones son fire-and-forget (no bloquean el bot).
+Añadido: notify_trail_activated, notify_trail_be_locked
 """
 import asyncio
 import logging
@@ -116,5 +117,44 @@ async def notify_error(context: str, error: str) -> None:
     msg = (
         f"🚨 *ERROR* — `{context}`\n"
         f"`{error[:300]}`"
+    )
+    await send(msg)
+
+
+# ── Trailing Stop ─────────────────────────────────────────────────────────────
+
+async def notify_trail_activated(
+    symbol: str, direction: str, activation_price: float, trail_sl: float
+) -> None:
+    """
+    Trail stop activado — precio cruzó el umbral de activación.
+    Se envía UNA sola vez por trade.
+    """
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    msg = (
+        f"🎯 *TRAIL ACTIVADO* — {symbol} {dir_icon}\n"
+        f"Mark: `{activation_price:.6f}`\n"
+        f"Trail SL inicial: `{trail_sl:.6f}`\n"
+        f"_SL seguirá el precio automáticamente_"
+    )
+    await send(msg)
+
+
+async def notify_trail_be_locked(
+    symbol: str, direction: str, trail_sl: float, entry: float
+) -> None:
+    """
+    Trail SL ha cruzado el entry price — profit mínimo garantizado.
+    Se envía UNA sola vez por trade.
+    """
+    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    if direction == "LONG":
+        comparison = f"Trail SL `{trail_sl:.6f}` > Entry `{entry:.6f}`"
+    else:
+        comparison = f"Trail SL `{trail_sl:.6f}` < Entry `{entry:.6f}`"
+    msg = (
+        f"🔒 *PROFIT GARANTIZADO* — {symbol} {dir_icon}\n"
+        f"{comparison}\n"
+        f"_¡Mínimo asegurado sin riesgo de pérdida!_"
     )
     await send(msg)

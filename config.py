@@ -1,10 +1,11 @@
 """
-QF×JP Bot v6.5 — Config ANTI-LIQUIDACIÓN
+QF×JP Bot v6.5 — Config ANTI-LIQUIDACIÓN + TRAILING STOP
 Fixes críticos basados en análisis de pérdidas:
   - Notional cap 200 USDT (era ilimitado → liquidaciones de -85, -104, -278 USDT)
   - SL_ATR_MULT 2.0 (era 1.2 → stop hunts en VANA, ILV, BANANA)
   - Daily loss limit 2% (era 5% → hyper perdió 278 USDT en un día)
   - MAX_OPEN_TRADES 3 (era 5-6 → acumula posiciones perdedoras)
+  - Trailing Stop Dinámico (reemplaza BE fijo → convierte ganadores pequeños en grandes)
 """
 import os
 from dotenv import load_dotenv
@@ -85,7 +86,23 @@ CB_BARS     = _int("CB_BARS",       10)
 
 # ── Gestión de posiciones ─────────────────────────────────────────────────────
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # mover BE antes
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # legacy — ya no se usa
+
+# ── Trailing Stop Dinámico ────────────────────────────────────────────────────
+# TRAIL_ACTIVATION_MULT: cuántos ATR tiene que ir a favor para activar el trail
+# TRAIL_ATR_MULT:        distancia del SL al watermark (máximo/mínimo visto)
+# TRAIL_UPDATE_THRESHOLD: mejora mínima (en ATR) para llamar a BingX
+#   → evita spam de API mientras el precio se mueve lateralmente
+#
+# Ejemplo con ATR=0.020, LONG @ 1.000:
+#   Activación: precio ≥ 1.020 (1 ATR arriba)
+#   Trail SL inicial: 1.020 - 1.5*0.020 = 0.990
+#   Si precio sube a 1.060: trail_sl = 1.060 - 0.030 = 1.030 ← profit garantizado
+#   Si precio sube a 1.100: trail_sl = 1.100 - 0.030 = 1.070
+#   Actualiza BingX solo si mejora ≥ 0.4*0.020 = 0.008 (umbral)
+TRAIL_ACTIVATION_MULT  = _float("TRAIL_ACTIVATION_MULT",  1.0)
+TRAIL_ATR_MULT         = _float("TRAIL_ATR_MULT",          1.5)
+TRAIL_UPDATE_THRESHOLD = _float("TRAIL_UPDATE_THRESHOLD",  0.4)  # en unidades de ATR
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
 DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 2.0)  # era 5% → 2% del capital
