@@ -1,11 +1,10 @@
 """
-QF×JP Bot v6.5 — Risk Manager ANTI-LIQUIDACIÓN
-Fixes:
-  - daily_loss_limit usa DAILY_LOSS_PCT (era 5%, ahora 2%)
-  - Notional cap duro MAX_NOTIONAL_USDT
-  - Cooldown 2h por símbolo tras pérdida
-  - Límite 2 trades por símbolo al día
-  - open_count sincronizado solo desde BingX real
+QF×JP Bot v6.6 — Risk Manager ANTI-LIQUIDACIÓN (joyful-art)
+Fixes vs v6.5:
+  - NUEVO: add_realized_pnl(pnl) — suma PnL realizado de un cierre PARCIAL
+    sin tocar _open_count ni cooldown del símbolo (usado por
+    position_manager.partial_close() del Guardian v1.2)
+  (resto sin cambios: daily_loss_limit, notional cap, cooldown 2h, Kelly)
 """
 import asyncio
 import logging
@@ -94,6 +93,20 @@ class RiskManager:
             log.info("Trade cerrado — pnl=%.4f daily_pnl=%.4f open=%d",
                      pnl, self._daily_pnl, self._open_count)
 
+    async def add_realized_pnl(self, pnl: float = 0.0):
+        """
+        Suma PnL realizado de un CIERRE PARCIAL al daily_pnl, sin tocar
+        _open_count, _daily_trades, ni cooldown/contador por símbolo —
+        la posición sigue abierta (solo cambió la qty).
+
+        Usado por position_manager.partial_close() (Guardian v1.2).
+        """
+        async with self._lock:
+            self._check_reset()
+            self._daily_pnl += pnl
+            log.info("PnL parcial registrado — pnl=%.4f daily_pnl=%.4f (posición sigue abierta)",
+                     pnl, self._daily_pnl)
+
     async def update_open_count(self, real_count: int):
         """Sincroniza con BingX real — fuente de verdad."""
         async with self._lock:
@@ -119,7 +132,6 @@ class RiskManager:
         qty       = (risk_usdt * C.LEVERAGE) / (sl_dist * entry) if sl_dist * entry > 0 else 0.0
 
         # ── CAP DURO ANTI-LIQUIDACIÓN ─────────────────────────────────────────
-        # ILV -43%, ADA -52%, PI -35% → posiciones demasiado grandes
         notional = qty * entry
         cap = C.MAX_NOTIONAL_USDT
         if notional > cap:
