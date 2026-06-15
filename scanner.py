@@ -166,8 +166,8 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     return sig
 
 
-async def scan_loop(client, risk, pos_mgr):
-    log.info("Scanner v6.5 | Modo=%s | Interval=%ds | Batch=20",
+async def scan_loop(client, risk, pos_mgr, complement=None):
+    log.info("Scanner v6.6 | Modo=%s | Interval=%ds | Batch=20",
              C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
@@ -178,10 +178,15 @@ async def scan_loop(client, risk, pos_mgr):
 
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                new = await client.get_all_symbols()
-                if new:
-                    symbols = new
-                    log.info("Símbolos activos: %d", len(symbols))
+                all_syms = await client.get_all_symbols()
+                if all_syms:
+                    # Si complement activo: usar solo símbolos exclusivos de joyful-art
+                    if complement and complement.get_exclusive_symbols():
+                        symbols = complement.get_exclusive_symbols()
+                        log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
+                    else:
+                        symbols = all_syms
+                        log.info("Símbolos activos: %d", len(symbols))
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:

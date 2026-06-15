@@ -17,6 +17,8 @@ from risk_manager import RiskManager
 from position_manager import PositionManager
 from scanner import scan_loop
 import telegram_client as tg
+from copier_client import MasterClient
+from complement_engine import ComplementEngine
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,9 +28,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("main")
 
-client:  BingXClient    = None
-risk:    RiskManager    = None
-pos_mgr: PositionManager = None
+client:     BingXClient       = None
+risk:       RiskManager       = None
+pos_mgr:    PositionManager   = None
+master:     MasterClient      = None
+complement: ComplementEngine   = None
 
 
 async def _run_scanner():
@@ -50,6 +54,20 @@ async def _run_monitor():
         log.info("Monitor desactivado en modo SIGNAL")
 
 
+async def _run_complement():
+    """Complement engine: copy, guardian, hedge, símbolos exclusivos."""
+    import os
+    if os.getenv("COMPLEMENT_MODE", "") == "DISABLED":
+        log.info("Complement engine desactivado")
+        return
+    if C.MODE == "LIVE":
+        try:
+            await complement.run_loop()
+        except Exception as e:
+            log.critical("Complement crash: %s", e, exc_info=True)
+            await tg.notify_error("complement_crash", str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global client, risk, pos_mgr
@@ -63,9 +81,11 @@ async def lifespan(app: FastAPI):
     log.info("  SL mult: %.1f | Max open: %d", C.SL_ATR_MULT, C.MAX_OPEN_TRADES)
     log.info("═" * 50)
 
-    client  = BingXClient()
-    risk    = RiskManager()
-    pos_mgr = PositionManager(client, risk)
+    client     = BingXClient()
+    risk       = RiskManager()
+    pos_mgr    = PositionManager(client, risk)
+    master     = MasterClient()
+    complement = ComplementEngine(client, risk, pos_mgr, master)
 
     if not C.BINGX_API_KEY or not C.BINGX_SECRET_KEY:
         log.error("BINGX_API_KEY / BINGX_SECRET_KEY no configurados")
@@ -89,14 +109,18 @@ async def lifespan(app: FastAPI):
 
     await tg.notify_status(risk.status(), balance, 0)
 
-    scanner_task = asyncio.create_task(_run_scanner())
-    monitor_task = asyncio.create_task(_run_monitor())
-    log.info("Loops iniciados")
+    scanner_task    = asyncio.create_task(_run_scanner())
+    monitor_task    = asyncio.create_task(_run_monitor())
+    complement_task = asyncio.create_task(_run_complement())
+    log.info("Loops iniciados (scanner + monitor + complement)")
 
     yield
 
     scanner_task.cancel()
     monitor_task.cancel()
+    complement_task.cancel()
+    if master:
+        await master.close()
     if client:
         await client.close()
     log.info("Bot detenido.")
