@@ -1,6 +1,7 @@
 """
-QF×JP Bot v7.0 — Main
-FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info en /status
+QF×JP Bot v7.1 — Main
+FastAPI con lifespan moderno + reconciliación al arrancar + trailing stop info
++ daily loss real (PnL no realizado incluido) en /status
 """
 import asyncio
 import logging
@@ -37,7 +38,7 @@ complement: ComplementEngine   = None
 
 async def _run_scanner():
     try:
-        await scan_loop(client, risk, pos_mgr)
+        await scan_loop(client, risk, pos_mgr, complement)
     except Exception as e:
         log.critical("Scanner crash: %s", e, exc_info=True)
         await tg.notify_error("scanner_crash", str(e))
@@ -72,7 +73,7 @@ async def lifespan(app: FastAPI):
     global client, risk, pos_mgr, master, complement
 
     log.info("═" * 54)
-    log.info("  QF×JP Bot v7.0 — TRAILING STOP + ANTI-LIQUIDACIÓN")
+    log.info("  QF×JP Bot v7.1 — TRAILING STOP + DAILY LOSS REAL")
     log.info("  Modo: %s | Capital: %.2f USDT", C.MODE, C.CAPITAL)
     log.info("  Leverage: %dx | Min tier: %s", C.LEVERAGE, C.MIN_TIER)
     log.info("  Max notional: %.0f USDT | Daily loss: %.1f%%",
@@ -126,7 +127,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="QF×JP Bot v7.0",
+    title="QF×JP Bot v7.1",
     docs_url=None,
     redoc_url=None,
     lifespan=lifespan,
@@ -135,7 +136,7 @@ app = FastAPI(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "7.0", "mode": C.MODE}
+    return {"status": "ok", "version": "7.1", "mode": C.MODE}
 
 
 @app.get("/status")
@@ -146,12 +147,19 @@ async def status():
         balance = await client.get_balance()
     except Exception:
         balance = -1.0
+
+    # FIX v7.1: PnL no realizado real, incluido en el status de riesgo
+    try:
+        unrealized = await pos_mgr.get_unrealized_pnl() if pos_mgr else 0.0
+    except Exception:
+        unrealized = 0.0
+
     tracked = pos_mgr.get_tracked() if pos_mgr else {}
     return {
-        "version": "7.0",
+        "version": "7.1",
         "mode":    C.MODE,
         "balance": round(balance, 2),
-        "risk":    risk.status(),
+        "risk":    risk.status(unrealized_pnl=unrealized),
         "trades":  {
             sym: {
                 "direction":       t.direction,

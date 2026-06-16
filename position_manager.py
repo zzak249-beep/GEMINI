@@ -1,17 +1,33 @@
 """
-QF×JP Bot v7.2 — Position Manager TRAILING STOP DINÁMICO + PARTIAL CLOSE
+QF×JP Bot v7.1 — Position Manager TRAILING STOP DINÁMICO (FIX 110412 loop)
 ═══════════════════════════════════════════════════════════════════════════════
-NUEVO vs v7.1:
-  ✅ partial_close(symbol, pct): cierra un % de la posición (toma de
-     ganancia parcial) y mueve el SL del resto a breakeven. Usado por
-     el Guardian v1.2 cuando detecta divergencia CVD fuerte en una
-     posición propia que va en ganancia.
-  ✅ get_pnl_pct(symbol, mark): PnL% direccional de una posición propia
-     trackeada (helper para el guardian).
+FIXES vs v7.0:
+  ✅ Loop infinito 110412 en pares de bajo precio (CATI-USDT, etc.):
+     - Margen de _sl_valid ampliado 0.2% → 0.5% (cubre spread/tick/latencia)
+     - Re-fetch de mark price justo antes de enviar el STOP_MARKET en
+       _update_trail (la misma técnica que ya usaba _activate_trail)
+     - Nuevo campo last_failed_sl: si el new_sl calculado es ~igual al que
+       falló en el ciclo anterior y sigue siendo inválido, se descarta en
+       silencio (log.debug) en vez de reintentar y volver a fallar igual
 
-(Todo lo de v7.1 sin cambios: fix loop 110412, _sl_valid margen 0.5%,
- re-fetch mark antes de enviar, last_failed_sl anti-spam, trailing,
- place-then-cancel, reconcile, etc.)
+  (resto de v7.0 sin cambios: place-then-cancel, qty sync, BE activation,
+   reconcile, notificaciones throttled)
+
+NUEVO — Trailing Stop dinámico (sin cambios funcionales vs v7.0):
+  • Se activa a BREAKEVEN_ATR_MULT ATR de beneficio (default 1.0)
+  • El SL sigue el peak del precio a TRAIL_DISTANCE_ATR ATR de distancia
+  • Estrategia place-then-cancel: máxima seguridad, nunca sin protección
+  • Solo mueve SL a favor (LONG → arriba, SHORT → abajo), nunca en contra
+  • Qty sincronizada con BingX real (maneja cierres parciales de TP1/TP2)
+  • Notificaciones Telegram throttled: solo cada 1 ATR de mejora
+
+EJEMPLO con ATR=0.010, entry=1.000 USDT, LONG:
+  t=0:   Entrada | SL=0.980 (2 ATR) | TP1=1.020 | TP2=1.040
+  t=1:   mark=1.010 → TRAIL ACTIVA → SL@entry=1.000 (breakeven)
+  t=2:   mark=1.025 → peak=1.025 → SL=1.010 (+1% locked)
+  t=3:   mark=1.040 → peak=1.040 → SL=1.025 (+2.5% locked)
+  t=4:   mark=1.035 → sin cambio (no nuevo peak)
+  t=5:   mark=1.060 → peak=1.060 → SL=1.045 (+4.5% locked!)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -44,7 +60,10 @@ def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
     - SHORT BUY STOP: sl_price debe ser > mark (se dispara cuando sube)
     Evita el error 110412 "Stop Loss price should be greater/less than current price"
 
-    Margen 0.5% (v7.1): cubre spread/tick/latencia en pares de precio bajo.
+    FIX v7.1: margen ampliado de 0.2% → 0.5%. En pares de precio bajo
+    (CATI-USDT, etc.) un margen de 0.2% no cubre el spread + latencia
+    entre el cálculo y la ejecución de la orden, lo que provocaba que
+    BingX rechazara repetidamente el mismo new_sl.
     """
     if sl_price <= 0:
         return False
@@ -77,11 +96,8 @@ class OpenTrade:
     peak_price:       float = 0.0    # mejor precio visto en dirección favorable
     trail_order_id:   str   = ""     # orderId del STOP_MARKET activo en BingX
 
-    # ── Anti-loop de retries idénticos ───────────────────────────────────────
+    # ── FIX v7.1: anti-loop de retries idénticos ─────────────────────────────
     last_failed_sl:   float = 0.0    # último new_sl que fue inválido/rechazado
-
-    # ── v7.2: tracking de cierre parcial por guardian ────────────────────────
-    partial_closed:   bool  = False  # True si ya se ejecutó un cierre parcial
 
 
 # ── Manager ───────────────────────────────────────────────────────────────────
@@ -115,25 +131,10 @@ class PositionManager:
             amt = float(pos.get("positionAmt", 0) or 0)
             if not sym or amt == 0:
                 continue
-
-            pos_side = pos.get("positionSide", "BOTH")
+            direction = "LONG" if amt > 0 else "SHORT"
+            pos_side  = pos.get("positionSide", "BOTH")
             if pos_side not in ("LONG", "SHORT", "BOTH"):
                 pos_side = "BOTH"
-
-            # ── FIX v7.2: positionSide explícito (LONG/SHORT) tiene PRIORIDAD
-            # sobre el signo de positionAmt. En cuentas con margen aislado /
-            # ciertas configuraciones, BingX devuelve positionAmt SIEMPRE
-            # positivo y la dirección real va en positionSide. Si solo
-            # mirábamos el signo de positionAmt, posiciones SHORT (ej.
-            # CATIUSDT, ACUUSDT, ARCUSDT) se reconciliaban como LONG,
-            # provocando 110412 al colocar el SL en _activate_trail
-            # (BingX espera BUY STOP > mark para SHORT, recibíamos
-            # SELL STOP < mark calculado para LONG).
-            if pos_side in ("LONG", "SHORT"):
-                direction = pos_side
-            else:
-                # positionSide == "BOTH" → único fallback fiable: signo de positionAmt
-                direction = "LONG" if amt > 0 else "SHORT"
             entry = float(pos.get("avgPrice", pos.get("entryPrice", 0)) or 0)
             qty   = abs(amt)
             sl    = entry * (0.99 if direction == "LONG" else 1.01)
@@ -213,7 +214,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.2 — trailing stop + partial close | intervalo=%ds",
+        log.info("Position monitor v7.1 — trailing stop | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -324,11 +325,13 @@ class PositionManager:
                  symbol, current_mark, trade.entry, trade.atr)
 
         # ── FIX DEFINITIVO: marcar activo AL INICIO, no al final ─────────────
+        # Antes: be_moved se ponía True solo en éxito → retry infinito en fallo
+        # Ahora: trailing_active=True impide cualquier reintento en ciclos futuros
         trade.trailing_active = True
         trade.be_moved        = True    # compat con código legacy
         trade.peak_price      = current_mark
 
-        already_cancelled = False   # evitar doble cancel_all_orders
+        already_cancelled = False   # FIX v7.1: evitar doble cancel_all_orders
 
         try:
             # Re-fetch precio fresco para detectar reversiones rápidas
@@ -344,9 +347,10 @@ class PositionManager:
 
             if _sl_valid(sl_be, mark, trade.direction):
                 # ── Caso normal: precio sigue favorable ──────────────────────
+                # Cancelar SL+TP originales (solo si el BE va a ser válido)
                 try:
                     await self.client.cancel_all_orders(symbol)
-                    already_cancelled = True
+                    already_cancelled = True    # FIX v7.1
                     await asyncio.sleep(0.3)
                 except Exception as ce:
                     log.debug("[%s] cancel_all_orders: %s", symbol, ce)
@@ -372,14 +376,19 @@ class PositionManager:
                     )
                     return
 
+                # ── SL en breakeven falló: fallback a offset de mark ──────────
                 log.warning("[%s] BE @ entry falló: %s — probando SL offset", symbol, resp)
 
             else:
+                # ── Precio revertió entre trigger y ahora: NO cancelar SL original
                 log.warning("[%s] Precio revertió (mark=%.6f, entry=%.6f, dir=%s) "
                             "— SL original sigue activo, usando offset de mark",
                             symbol, mark, trade.entry, trade.direction)
+                # No hacemos cancel_all — el SL original sigue protegiendo
 
             # ── Fallback universal: SL en mark offset ─────────────────────────
+            # FIX v7.1: re-fetch mark FRESCO antes de calcular em_sl.
+            # El mark inicial puede estar 1-2s obsoleto tras cancel_all + sleep + fallo BE.
             try:
                 t2 = await self.client.get_ticker(symbol)
                 m2 = float(t2.get("lastPrice", mark) or mark)
@@ -387,11 +396,13 @@ class PositionManager:
                     mark = m2
                     trade.peak_price = mark
             except Exception:
-                pass
+                pass    # usar mark anterior si el re-fetch falla
 
+            # Para LONG: 1.5% bajo mark | Para SHORT: 1.5% sobre mark
             em_sl = mark * 0.985 if trade.direction == "LONG" else mark * 1.015
 
             if _sl_valid(em_sl, mark, trade.direction):
+                # FIX v7.1: solo cancelar si NO cancelamos ya en el path del BE
                 if not already_cancelled:
                     try:
                         await self.client.cancel_all_orders(symbol)
@@ -428,13 +439,29 @@ class PositionManager:
 
         except Exception as e:
             log.error("[%s] _activate_trail error: %s", symbol, e)
+            # trailing_active ya es True — no volverá a reintentar
 
     # ── Actualización del trailing ────────────────────────────────────────────
 
     async def _update_trail(self, trade: OpenTrade, mark: float):
         """
         Actualiza el trailing SL cuando el precio alcanza un nuevo peak.
-        Estrategia PLACE-THEN-CANCEL (ver v7.1 para detalle completo).
+        Estrategia PLACE-THEN-CANCEL:
+          1. Calcula nuevo SL desde peak - TRAIL_DISTANCE_ATR * atr
+          2. Si es mejor que el SL actual y válido para BingX:
+             a. Re-fetch mark fresco (FIX v7.1) y re-valida
+             b. Coloca NUEVO STOP_MARKET (posición protegida durante el update)
+             c. Si OK: cancela el VIEJO (nunca queda sin SL)
+             d. Actualiza trail_sl, trail_order_id
+        El SL solo se mueve a favor del trade (LONG → arriba, SHORT → abajo).
+
+        FIX v7.1 (anti-loop 110412):
+          - Margen de _sl_valid ampliado a 0.5% (ver _sl_valid)
+          - Antes de enviar la orden, se re-fetch el mark price y se
+            revalida con el precio más reciente posible
+          - Si new_sl es ~igual al último new_sl que falló y sigue
+            siendo inválido, se descarta en debug sin loguear warning
+            repetido (evita spam de logs en pares volátiles)
         """
         symbol     = trade.symbol
         trail_dist = trade.atr * C.TRAIL_DISTANCE_ATR
@@ -442,17 +469,19 @@ class PositionManager:
         # ── Calcular nuevo peak ───────────────────────────────────────────────
         if trade.direction == "LONG":
             if mark <= trade.peak_price:
-                return
+                return   # sin nuevo máximo → sin cambio
             new_peak = mark
             new_sl   = new_peak - trail_dist
+            # Solo subir el SL (nunca bajar)
             if new_sl <= trade.trail_sl:
-                trade.peak_price = new_peak
+                trade.peak_price = new_peak   # guardar peak aunque el SL no mejore
                 return
         else:  # SHORT
             if trade.peak_price > 0 and mark >= trade.peak_price:
-                return
+                return   # sin nuevo mínimo → sin cambio
             new_peak = mark
             new_sl   = new_peak + trail_dist
+            # Solo bajar el SL (nunca subir para SHORT)
             if trade.trail_sl > 0 and new_sl >= trade.trail_sl:
                 trade.peak_price = new_peak
                 return
@@ -460,6 +489,8 @@ class PositionManager:
         # ── Validar precio SL para BingX (con mark actual) ───────────────────
         if not _sl_valid(new_sl, mark, trade.direction):
             trade.peak_price = new_peak
+            # FIX v7.1: anti-spam — si es básicamente el mismo new_sl que ya
+            # falló antes y sigue inválido, no repetir el warning/retry ruidoso
             if trade.last_failed_sl and abs(new_sl - trade.last_failed_sl) < trade.atr * 0.05:
                 log.debug("[%s] Trail: new_sl=%.6f repetido e inválido (mark=%.6f) — esperando nuevo peak",
                           symbol, new_sl, mark)
@@ -469,7 +500,10 @@ class PositionManager:
             trade.last_failed_sl = new_sl
             return
 
-        # ── Re-fetch mark fresco justo antes de enviar ───────────────────────
+        # ── FIX v7.1: re-fetch mark fresco justo antes de enviar ─────────────
+        # El mark usado para calcular new_sl puede tener 1 ciclo de antigüedad
+        # (hasta POSITION_CHECK_INTERVAL segundos). Revalidar con precio fresco
+        # evita el 110412 cuando el precio se movió en contra justo antes del envío.
         fresh_mark = mark
         try:
             t = await self.client.get_ticker(symbol)
@@ -477,7 +511,7 @@ class PositionManager:
             if fm > 0:
                 fresh_mark = fm
         except Exception:
-            pass
+            pass    # si el refresh falla, seguimos con el mark del ciclo
 
         if not _sl_valid(new_sl, fresh_mark, trade.direction):
             trade.peak_price     = new_peak
@@ -491,6 +525,7 @@ class PositionManager:
         try:
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
 
+            # 1. Colocar NUEVO SL primero (nunca sin protección)
             resp = await self.client.place_stop_market_order(
                 symbol, side_close, trade.qty, new_sl,
                 trade.direction, order_type="STOP_MARKET",
@@ -502,15 +537,17 @@ class PositionManager:
                 old_sl        = trade.trail_sl
                 profit_locked = self._calc_pnl(trade, new_sl)
 
+                # 2. Actualizar estado
                 trade.peak_price     = new_peak
                 trade.trail_sl       = new_sl
                 trade.trail_order_id = new_oid
-                trade.sl             = new_sl
-                trade.last_failed_sl = 0.0
+                trade.sl             = new_sl   # mantener .sl en sync
+                trade.last_failed_sl = 0.0      # FIX v7.1: reset tras éxito
 
                 log.info("[%s] 📈 Trail: %.6f→%.6f | peak=%.6f | mark=%.6f | PnL@SL≈%.2f USDT",
                          symbol, old_sl, new_sl, new_peak, fresh_mark, profit_locked)
 
+                # 3. Cancelar SL viejo (best-effort, el nuevo ya está activo)
                 if old_oid and old_oid != new_oid:
                     await asyncio.sleep(0.1)
                     try:
@@ -519,6 +556,7 @@ class PositionManager:
                     except Exception as ce:
                         log.debug("[%s] cancel_order viejo %s: %s", symbol, old_oid, ce)
 
+                # 4. Notificación Telegram (throttle: 1 ATR de mejora mínima)
                 last_sl = self._trail_last_notify.get(symbol, trade.entry)
                 if abs(new_sl - last_sl) >= trade.atr:
                     self._trail_last_notify[symbol] = new_sl
@@ -531,8 +569,9 @@ class PositionManager:
                     )
 
             else:
-                trade.peak_price     = new_peak
-                trade.last_failed_sl = new_sl
+                # Fallo al actualizar trail — no es crítico, el SL viejo sigue activo
+                trade.peak_price     = new_peak   # guardar peak, reintentar próximo ciclo
+                trade.last_failed_sl = new_sl     # FIX v7.1: recordar para anti-spam
                 log.warning("[%s] Trail update falló new_sl=%.6f: %s",
                             symbol, new_sl, resp)
 
@@ -540,127 +579,6 @@ class PositionManager:
             trade.peak_price     = new_peak
             trade.last_failed_sl = new_sl
             log.error("[%s] _update_trail error: %s", symbol, e)
-
-    # ── v7.2: Cierre parcial (toma de ganancia + BE en el resto) ─────────────
-
-    async def partial_close(self, symbol: str, pct: float, reason: str = "partial_close") -> bool:
-        """
-        Cierra `pct` (0.0-1.0) de la posición trackeada `symbol` a mercado,
-        y mueve el SL del remanente a breakeven (si la posición sigue
-        favorable tras el cierre parcial).
-
-        Usado por el Guardian v1.2 cuando detecta divergencia CVD fuerte
-        en una posición propia que va en ganancia: asegura parte del
-        beneficio y protege el resto sin cerrar todo.
-
-        Retorna True si el cierre parcial se ejecutó correctamente.
-        """
-        if not (0.0 < pct < 1.0):
-            log.warning("[%s] partial_close: pct fuera de rango (%.2f)", symbol, pct)
-            return False
-
-        async with self._lock:
-            trade = self._trades.get(symbol)
-        if not trade:
-            log.warning("[%s] partial_close: no registrado", symbol)
-            return False
-
-        if trade.partial_closed:
-            log.debug("[%s] partial_close: ya ejecutado previamente — skip", symbol)
-            return False
-
-        close_qty = trade.qty * pct
-        if close_qty <= 0:
-            return False
-
-        try:
-            # 1. Cerrar pct de la posición a mercado
-            close_resp = await self.client.close_position_market(
-                symbol, close_qty, trade.direction
-            )
-            if isinstance(close_resp, dict) and close_resp.get("code", -1) not in (0, None):
-                log.error("[%s] partial_close: cierre parcial falló: %s", symbol, close_resp)
-                return False
-
-            try:
-                ticker = await self.client.get_ticker(symbol)
-                close_price = float(ticker.get("lastPrice", trade.entry) or trade.entry)
-            except Exception:
-                close_price = trade.entry
-
-            realized_pnl = self._calc_pnl(trade, close_price) * pct
-
-            # 2. Actualizar qty restante
-            remaining_qty = trade.qty - close_qty
-            trade.qty = remaining_qty
-            trade.partial_closed = True
-
-            log.info("[%s] 💰 Partial close (%.0f%%) @ %.6f — qty %.6f→%.6f | PnL parcial≈%.2f USDT (%s)",
-                     symbol, pct * 100, close_price, close_qty + remaining_qty, remaining_qty,
-                     realized_pnl, reason)
-
-            # 3. Mover SL del remanente a breakeven (si sigue siendo válido)
-            sl_be = trade.entry
-            if _sl_valid(sl_be, close_price, trade.direction) and remaining_qty > 0:
-                side_close = "SELL" if trade.direction == "LONG" else "BUY"
-                try:
-                    if trade.trail_order_id:
-                        await self.client.cancel_order(symbol, trade.trail_order_id)
-                        await asyncio.sleep(0.2)
-                    else:
-                        await self.client.cancel_all_orders(symbol)
-                        await asyncio.sleep(0.2)
-                except Exception as ce:
-                    log.debug("[%s] partial_close: cancel SL viejo: %s", symbol, ce)
-
-                resp = await self.client.place_stop_market_order(
-                    symbol, side_close, remaining_qty, sl_be,
-                    trade.direction, order_type="STOP_MARKET",
-                )
-                if resp.get("code", -1) == 0:
-                    trade.trail_sl       = sl_be
-                    trade.trail_order_id = _extract_order_id(resp)
-                    trade.sl             = sl_be
-                    trade.trailing_active = True
-                    trade.be_moved       = True
-                    log.info("[%s] partial_close: SL remanente → breakeven %.6f", symbol, sl_be)
-                else:
-                    log.warning("[%s] partial_close: SL breakeven remanente falló: %s", symbol, resp)
-
-            await tg.send(
-                f"💰 *CIERRE PARCIAL* ({pct*100:.0f}%) — `{symbol}` "
-                f"{'🟢' if trade.direction == 'LONG' else '🔴'}\n"
-                f"Precio: `{close_price:.6f}` | PnL parcial: `{realized_pnl:+.2f} USDT`\n"
-                f"Remanente: `{remaining_qty:.6f}` con SL → breakeven\n"
-                f"_Motivo: {reason}_"
-            )
-
-            # Registrar el PnL realizado del tramo cerrado en risk_manager,
-            # sin afectar open_count (la posición sigue abierta con qty restante)
-            # ni el cooldown del símbolo.
-            await self.risk.add_realized_pnl(realized_pnl)
-
-            return True
-
-        except Exception as e:
-            log.error("[%s] partial_close error: %s", symbol, e)
-            return False
-
-    # ── v7.2: PnL% direccional de una posición propia trackeada ──────────────
-
-    def get_pnl_pct(self, symbol: str, mark: float) -> float | None:
-        """
-        PnL% direccional de la posición propia `symbol` dado el mark actual.
-        Positivo = a favor, negativo = en contra. None si no está trackeada
-        o faltan datos.
-        """
-        trade = self._trades.get(symbol)
-        if not trade or trade.entry <= 0 or mark <= 0:
-            return None
-        raw_pct = (mark - trade.entry) / trade.entry * 100.0
-        if trade.direction == "SHORT":
-            raw_pct = -raw_pct
-        return raw_pct
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
 
@@ -698,3 +616,43 @@ class PositionManager:
 
     def is_trading(self, symbol: str) -> bool:
         return symbol in self._trades
+
+    async def get_unrealized_pnl(self) -> float:
+        """
+        FIX v7.1: suma el PnL no realizado de TODAS las posiciones trackeadas,
+        usando el mark price actual de BingX. Se usa para alimentar
+        risk.can_trade(unrealized_pnl=...) y así el límite de pérdida diaria
+        contempla el drawdown real de la cuenta, no solo lo ya cerrado.
+        Si falla la consulta a BingX, retorna 0.0 (fail-safe: no bloquea
+        operaciones por un error de red, pero tampoco las habilita de más).
+        """
+        async with self._lock:
+            tracked = dict(self._trades)
+        if not tracked:
+            return 0.0
+
+        try:
+            real_positions = await self.client.get_open_positions()
+        except Exception as e:
+            log.warning("get_unrealized_pnl: get_open_positions failed: %s", e)
+            return 0.0
+
+        real_map: dict[str, dict] = {
+            p["symbol"]: p for p in real_positions
+            if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
+        }
+
+        total = 0.0
+        for symbol, trade in tracked.items():
+            pos = real_map.get(symbol)
+            if not pos:
+                continue
+            try:
+                mark = float(pos.get("markPrice", 0) or 0)
+            except Exception:
+                continue
+            if mark <= 0:
+                continue
+            total += self._calc_pnl(trade, mark)
+
+        return round(total, 4)
