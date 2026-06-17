@@ -41,14 +41,14 @@ MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 3)    # era 5-6 → 3 máximo
 MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 10)  # era 20 → 10 máximo
 
 # ── Umbrales de señal ─────────────────────────────────────────────────────────
-MIN_SCORE  = _float("MIN_SCORE",  52.0)   # bajado: mercado lateral necesita más señales
-FUEL_SCORE = _float("FUEL_SCORE", 62.0)   # bajado
-SUP_SCORE  = _float("SUP_SCORE",  78.0)
-MIN_TIER   = os.getenv("MIN_TIER", "STD").upper()   # bajado a STD para generar trades
+MIN_SCORE  = _float("MIN_SCORE",  58.0)   # era 50 → más estricto
+FUEL_SCORE = _float("FUEL_SCORE", 65.0)   # era 62
+SUP_SCORE  = _float("SUP_SCORE",  80.0)
+MIN_TIER   = os.getenv("MIN_TIER", "FUEL").upper()  # era STD → solo FUEL o SUP
 
 # ── Entrada ───────────────────────────────────────────────────────────────────
-REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", False)  # desactivado — filtraba demasiado
-HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 1)    # 1 TF suficiente — mercado lateral
+REQUIRE_TL_BREAK = _bool("REQUIRE_TL_BREAK", True)
+HTF_MIN_ALIGNED  = _int("HTF_MIN_ALIGNED", 2)    # era 1 → 2 TFs confirmados
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
 SCAN_INTERVAL   = _int("SCAN_INTERVAL", 60)
@@ -85,10 +85,19 @@ CB_BARS     = _int("CB_BARS",       10)
 
 # ── Gestión de posiciones ─────────────────────────────────────────────────────
 POSITION_CHECK_INTERVAL = _int("POSITION_CHECK_INTERVAL", 30)
-BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.5)  # mover BE antes
+BREAKEVEN_ATR_MULT      = _float("BREAKEVEN_ATR_MULT", 1.0)   # mover BE antes (bajado de 1.5)
+
+# ── Trailing Stop ─────────────────────────────────────────────────────────────
+TRAIL_DISTANCE_ATR = _float("TRAIL_DISTANCE_ATR", 1.5)  # distancia del trailing SL en ATRs
+
+# ── Tiempo máximo de exposición (v6.6 fix de mayor impacto) ───────────────────
+# 3/3 liquidaciones analizadas ocurrieron en trades abiertos 1h17m-29h.
+# Esta estrategia espera resolución en 5-15 min — si supera este límite,
+# cierre forzado por mercado independientemente de PnL.
+MAX_HOLD_MINUTES = _int("MAX_HOLD_MINUTES", 45)
 
 # ── Límite de pérdida diaria ──────────────────────────────────────────────────
-DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 4.0)  # 4% — 2% era demasiado restrictivo con 200 USDT
+DAILY_LOSS_PCT = _float("DAILY_LOSS_PCT", 4.0)  # subido de 2% — era demasiado restrictivo
 
 # ── Notional máximo por trade ─────────────────────────────────────────────────
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 200.0)  # NUNCA subir sin justificación
