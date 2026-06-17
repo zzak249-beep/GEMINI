@@ -1,42 +1,15 @@
 """
-QF×JP Bot v7.2 — Scanner
-═══════════════════════════════════════════════════════════════════════════════
-FIXES v7.2 (diagnóstico: 0 trades abiertos):
-
-  FIX 1 — CB_COOLDOWN 600→300s:
-    10 minutos de cooldown por circuit breaker era excesivo. Con un mercado
-    volátil los símbolos quedaban bloqueados la mayor parte del ciclo.
-    Reducido a 5 minutos.
-
-  FIX 2 — OBI boost umbral 0.1→0.15:
-    El boost se aplicaba con cualquier desequilibrio >10% en el order book.
-    Con 15% solo aplica cuando hay presión direccional real.
-
-  FIX 3 — Log de razón de bloqueo en SIGNAL mode:
-    En modo SIGNAL nunca llamábamos can_trade(), así que si MIN_TIER
-    bloqueaba todo, no se logueaba nada útil. Ahora en SIGNAL mode
-    también se loguea el tier_ok check.
-
-  FIX 4 — Chequeo explícito de tier antes de analyze (early exit):
-    Si la señal no pasa tier_ok() se loguea con INFO para diagnóstico,
-    no solo se descarta silenciosamente.
-
-  FIX 5 — TOP_N_SYMBOLS respetado en renewed-love:
-    Si TOP_N_SYMBOLS > 0, limitar los símbolos usados al top-N por volumen
-    (ya ordenados por bingx_client). Así renewed-love usa top-200 y
-    joyful-art usa sus 50 exclusivos sin conflicto.
-
-  MANTIENE (de v6.6/v7.1):
-    - can_trade() con unrealized_pnl
-    - OBI boost
-    - Funding rate como filtro de sesgo
-    - Batch 20, pausa 0.2s
-    - CB blacklist
-═══════════════════════════════════════════════════════════════════════════════
+QF×JP Bot v6.5 — Scanner CORREGIDO
+Fixes:
+  - symbol_allowed check (cooldown + límite/día)
+  - OBI boost desde order book
+  - Funding rate como filtro de sesgo
+  - Batch 20, pausa 0.2s
 """
 import asyncio
 import logging
 import time
+from collections import deque, defaultdict
 from typing import Optional
 
 import config as C
@@ -49,8 +22,7 @@ import telegram_client as tg
 log = logging.getLogger("scanner")
 
 _cb_blacklist: dict[str, float] = {}
-# FIX v7.2: CB_COOLDOWN reducido de 600s a 300s (5 min)
-CB_COOLDOWN = 300
+CB_COOLDOWN = 600
 
 
 async def _fetch_all(client: BingXClient, symbol: str):
@@ -108,42 +80,34 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
     if sig.direction == "NONE":
         return None
 
-    # FIX v7.2: OBI boost con umbral 0.1→0.15 (presión más significativa)
-    if abs(obi) > 0.15:
+    # OBI boost
+    if abs(obi) > 0.1:
         boost = 0.0
-        if sig.direction == "SHORT" and obi < -0.15:
+        if sig.direction == "SHORT" and obi < -0.1:
             boost = abs(obi) * 5
-        elif sig.direction == "LONG" and obi > 0.15:
+        elif sig.direction == "LONG" and obi > 0.1:
             boost = obi * 5
         if boost > 0:
-            old_score = sig.score
             sig.score = min(sig.score + boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
-            log.debug("[%s] OBI boost: %.1f→%.1f (obi=%.3f)", symbol, old_score, sig.score, obi)
 
     if sig.circuit_breaker:
         _cb_blacklist[symbol] = now
-        log.info("[%s] Circuit Breaker — cooldown %ds", symbol, CB_COOLDOWN)
         await tg.notify_circuit_breaker(symbol)
         return None
 
-    # FIX v7.2: loguear cuando tier_ok falla (antes silencioso)
     if not risk.tier_ok(sig.tier):
-        log.debug("[%s] tier_ok FAIL: tier=%s score=%.1f min_tier=%s",
-                  symbol, sig.tier, sig.score, C.MIN_TIER)
         return None
 
-    log.info("[%s] ✅ Señal %s tier=%s score=%.1f fr=%.4f obi=%.3f",
-             symbol, sig.direction, sig.tier, sig.score, fr, obi)
+    log.info("[%s] Señal %s tier=%s score=%.1f fr=%.4f",
+             symbol, sig.direction, sig.tier, sig.score, fr)
 
     if C.MODE == "SIGNAL":
         await tg.notify_signal(sig)
         return sig
 
     # ── LIVE ──────────────────────────────────────────────────────────────────
-    # Incluir PnL no realizado en el chequeo de riesgo diario (FIX v7.1)
-    unrealized = await pos_mgr.get_unrealized_pnl()
-    can, reason = await risk.can_trade(unrealized_pnl=unrealized)
+    can, reason = await risk.can_trade()
     if not can:
         log.info("[%s] Bloqueado por risk: %s", symbol, reason)
         return None
@@ -161,7 +125,7 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         return None
 
     if balance < 5.0:
-        log.warning("[%s] Balance=%.4f — usando CAPITAL=%.2f", symbol, balance, C.CAPITAL)
+        log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
         balance = C.CAPITAL
 
     qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier)
@@ -197,15 +161,16 @@ async def _process_symbol(symbol, client, risk, pos_mgr) -> Optional[Signal]:
         symbol=symbol, direction=sig.direction,
         entry=sig.entry, sl=sig.sl, tp1=sig.tp1, tp2=sig.tp2,
         qty=qty, atr=sig.atr, order_id=order_id,
+        tier=sig.tier, score=sig.score,
     )
     await pos_mgr.register_trade(trade)
     await tg.notify_trade_opened(sig, qty, order_id)
     return sig
 
 
-async def scan_loop(client, risk, pos_mgr, complement=None):
-    log.info("Scanner v7.2 | Modo=%s | Interval=%ds | Batch=20 | CB_COOLDOWN=%ds",
-             C.MODE, C.SCAN_INTERVAL, CB_COOLDOWN)
+async def scan_loop(client, risk, pos_mgr):
+    log.info("Scanner v6.5 | Modo=%s | Interval=%ds | Batch=20",
+             C.MODE, C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
 
@@ -215,21 +180,10 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
 
         if iteration == 1 or iteration % 10 == 0 or not symbols:
             try:
-                all_syms = await client.get_all_symbols()
-                if all_syms:
-                    if complement and complement.get_exclusive_symbols():
-                        # joyful-art: solo sus exclusivos (top-50 por volumen)
-                        symbols = complement.get_exclusive_symbols()
-                        log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
-                    elif C.TOP_N_SYMBOLS > 0:
-                        # FIX v7.2: renewed-love limita a top-N por volumen
-                        # (all_syms ya viene ordenado por volumen descendente de bingx_client)
-                        symbols = all_syms[:C.TOP_N_SYMBOLS]
-                        log.info("Top-%d símbolos por volumen (de %d disponibles)",
-                                 C.TOP_N_SYMBOLS, len(all_syms))
-                    else:
-                        symbols = all_syms
-                        log.info("Símbolos activos: %d", len(symbols))
+                new = await client.get_all_symbols()
+                if new:
+                    symbols = new
+                    log.info("Símbolos activos: %d", len(symbols))
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
@@ -244,19 +198,13 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
 
         if iteration % 20 == 0:
             try:
-                balance    = await client.get_balance()
-                unrealized = await pos_mgr.get_unrealized_pnl()
-                await tg.notify_status(
-                    risk.status(unrealized_pnl=unrealized), balance, len(symbols)
-                )
+                balance = await client.get_balance()
+                await tg.notify_status(risk.status(), balance, len(symbols))
             except Exception:
                 pass
 
         BATCH = 20
         signals_found = 0
-        tier_blocked  = 0
-        cb_blocked    = 0
-
         for i in range(0, len(symbols), BATCH):
             batch   = symbols[i:i+BATCH]
             results = await asyncio.gather(
@@ -269,9 +217,71 @@ async def scan_loop(client, risk, pos_mgr, complement=None):
             await asyncio.sleep(0.2)
 
         elapsed = time.time() - start
-        cb_active = len([k for k, v in _cb_blacklist.items()
-                         if time.time() - v < CB_COOLDOWN])
-        log.info("Iter %d | %d símbolos | %d señales | CB_activos=%d | %.1fs",
-                 iteration, len(symbols), signals_found, cb_active, elapsed)
+        log.info("Iter %d | %d símbolos | %d señales | %.1fs",
+                 iteration, len(symbols), signals_found, elapsed)
 
         await asyncio.sleep(max(0.0, C.SCAN_INTERVAL - elapsed))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v6.6 — Trade log en memoria para /stats (win-rate por símbolo/tier/hora)
+# ══════════════════════════════════════════════════════════════════════════
+_trade_log: deque = deque(maxlen=200)
+
+
+def log_closed_trade(symbol: str, tier: str, score: float, direction: str,
+                      pnl: float, reason: str, hold_minutes: float) -> None:
+    """
+    Callback invocado por PositionManager.remove_trade en cada cierre real.
+    No persiste entre redeploys — es estadística de sesión.
+    """
+    _trade_log.append({
+        "symbol":       symbol,
+        "tier":         tier or "?",
+        "score":        score,
+        "direction":    direction,
+        "pnl":          pnl,
+        "won":          pnl > 0,
+        "reason":       reason,
+        "hold_minutes": round(hold_minutes, 1),
+        "closed_at":    time.time(),
+        "hour_utc":     time.gmtime().tm_hour,
+    })
+
+
+def get_stats() -> dict:
+    """Win-rate agregado por símbolo, tier y hora UTC de los últimos 200 trades."""
+    trades = list(_trade_log)
+    if not trades:
+        return {"trades": 0}
+
+    def _agg(key_fn):
+        groups: dict = defaultdict(list)
+        for t in trades:
+            groups[key_fn(t)].append(t)
+        out = {}
+        for k, ts in groups.items():
+            wins = sum(1 for t in ts if t["won"])
+            out[k] = {
+                "trades":  len(ts),
+                "wins":    wins,
+                "winrate": round(wins / len(ts), 3),
+                "pnl":     round(sum(t["pnl"] for t in ts), 4),
+            }
+        return out
+
+    wins      = sum(1 for t in trades if t["won"])
+    total_pnl = sum(t["pnl"] for t in trades)
+
+    return {
+        "trades":     len(trades),
+        "wins":       wins,
+        "losses":     len(trades) - wins,
+        "winrate":    round(wins / len(trades), 3),
+        "total_pnl":  round(total_pnl, 4),
+        "avg_pnl":    round(total_pnl / len(trades), 4),
+        "by_symbol":  _agg(lambda t: t["symbol"]),
+        "by_tier":    _agg(lambda t: t["tier"]),
+        "by_hour":    _agg(lambda t: t["hour_utc"]),
+        "by_reason":  _agg(lambda t: t["reason"]),
+    }
