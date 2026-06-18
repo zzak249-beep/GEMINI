@@ -1,8 +1,7 @@
 """
-QF×JP Bot v6.5 — Telegram Client
+QF×JP Bot v6.4 — Telegram Client
 Envía notificaciones al canal configurado.
 Todas las funciones son fire-and-forget (no bloquean el bot).
-Añadido: notify_trail_activated, notify_trail_be_locked
 """
 import asyncio
 import logging
@@ -99,14 +98,20 @@ async def notify_circuit_breaker(symbol: str) -> None:
 
 
 async def notify_status(status: dict, balance: float, n_symbols: int) -> None:
-    """Status periódico del bot."""
+    """Status periódico del bot — incluye PnL no realizado (v7.1)."""
+    pnl_total = status.get("daily_pnl_total", status.get("daily_pnl", 0))
+    pnl_real  = status.get("daily_pnl", 0)
+    pnl_unrealized = status.get("daily_pnl_no_real", 0)
+    limit     = status.get("daily_limit", 0)
+    pnl_icon  = "💚" if pnl_total >= 0 else "💔"
     msg = (
         f"📊 *STATUS QF×JP Bot*\n"
         f"Modo: `{status.get('mode', '?')}`\n"
         f"Balance: `{balance:.2f} USDT`\n"
         f"Trades abiertos: `{status.get('open_trades', 0)}/{status.get('max_open', 0)}`\n"
         f"Trades hoy: `{status.get('daily_trades', 0)}/{status.get('max_daily', 0)}`\n"
-        f"PnL diario: `{status.get('daily_pnl', 0):+.4f} USDT`\n"
+        f"{pnl_icon} PnL cerrado: `{pnl_real:+.4f}` | No realizado: `{pnl_unrealized:+.4f}` | Total: `{pnl_total:+.4f} USDT`\n"
+        f"Límite diario: `{limit:.2f} USDT`\n"
         f"Símbolos escaneados: `{n_symbols}`"
     )
     await send(msg)
@@ -121,40 +126,28 @@ async def notify_error(context: str, error: str) -> None:
     await send(msg)
 
 
-# ── Trailing Stop ─────────────────────────────────────────────────────────────
-
-async def notify_trail_activated(
-    symbol: str, direction: str, activation_price: float, trail_sl: float
+async def notify_diagnostics(
+    iteration: int,
+    n_symbols: int,
+    n_direccionales: int,
+    avg_score: float,
+    max_score: float,
+    max_symbol: str,
+    max_dir: str,
+    top_reasons: list,
 ) -> None:
     """
-    Trail stop activado — precio cruzó el umbral de activación.
-    Se envía UNA sola vez por trade.
+    FIX v7.2 — Diagnóstico de 0 señales.
+    Se envía cada 5 iteraciones SOLO cuando no se abrió ningún trade,
+    para ver desde el móvil exactamente qué puerta está bloqueando todo
+    (TL break, alineación HTF, tier insuficiente, etc.) sin entrar a Railway.
     """
-    dir_icon = "🟢" if direction == "LONG" else "🔴"
+    reasons_str = "\n".join(f"  • `{k}`: {v}" for k, v in top_reasons) if top_reasons else "  • (sin datos)"
     msg = (
-        f"🎯 *TRAIL ACTIVADO* — {symbol} {dir_icon}\n"
-        f"Mark: `{activation_price:.6f}`\n"
-        f"Trail SL inicial: `{trail_sl:.6f}`\n"
-        f"_SL seguirá el precio automáticamente_"
-    )
-    await send(msg)
-
-
-async def notify_trail_be_locked(
-    symbol: str, direction: str, trail_sl: float, entry: float
-) -> None:
-    """
-    Trail SL ha cruzado el entry price — profit mínimo garantizado.
-    Se envía UNA sola vez por trade.
-    """
-    dir_icon = "🟢" if direction == "LONG" else "🔴"
-    if direction == "LONG":
-        comparison = f"Trail SL `{trail_sl:.6f}` > Entry `{entry:.6f}`"
-    else:
-        comparison = f"Trail SL `{trail_sl:.6f}` < Entry `{entry:.6f}`"
-    msg = (
-        f"🔒 *PROFIT GARANTIZADO* — {symbol} {dir_icon}\n"
-        f"{comparison}\n"
-        f"_¡Mínimo asegurado sin riesgo de pérdida!_"
+        f"🔍 *DIAGNÓSTICO* — Iter {iteration}\n"
+        f"Símbolos: `{n_symbols}` | Con dirección: `{n_direccionales}`\n"
+        f"Score prom: `{avg_score:.1f}` | Score máx: `{max_score:.1f}` "
+        f"({max_symbol} {max_dir})\n"
+        f"Top razones de rechazo:\n{reasons_str}"
     )
     await send(msg)

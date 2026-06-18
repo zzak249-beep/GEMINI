@@ -149,6 +149,14 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
         diag["counts"]["symbol_blocked"] += 1
         return None
 
+    # Correlation Guard — evita apilar varios LONG o SHORT simultáneos
+    # que se mueven juntos (caso FHEU+XNY)
+    dir_ok, dir_reason = risk.direction_allowed(sig.direction)
+    if not dir_ok:
+        log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
+        diag["counts"]["correlation_blocked"] += 1
+        return None
+
     try:
         balance = await client.get_balance()
     except Exception as e:
@@ -181,15 +189,6 @@ async def _process_symbol(symbol, client, risk, pos_mgr, diag: dict) -> Optional
     if entry_resp.get("code", -1) != 0:
         log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
         await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
-        # FIX: si BingX rechaza por error de firma (100001) para ESTE símbolo,
-        # no sabemos aún la causa raíz exacta — pero insistir cada iteración
-        # con el mismo resultado es ruido inútil. Blacklist temporal (10 min,
-        # mismo cooldown que el circuit breaker) para dar margen a investigar
-        # sin que el bot siga golpeando el mismo error en bucle.
-        if entry_resp.get("code") == 100001:
-            _cb_blacklist[symbol] = time.time()
-            log.warning("[%s] code=100001 (firma) — blacklist %ds para evitar reintentos ciegos",
-                        symbol, CB_COOLDOWN)
         return None
 
     order_id = str(
