@@ -1,7 +1,29 @@
 """
-QF×JP Bot v7.2 — Position Manager TRAILING STOP DINÁMICO (FIX cuenta compartida)
+QF×JP Bot v7.3 — Position Manager TRAILING STOP DINÁMICO (FIX reintento protección)
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.2:
+FIX v7.3:
+  ✅ POSICIONES DESNUDAS PERMANENTES (caso INJ-USDT, ZEC-USDT, LAB-USDT en
+     joyful-art — mismo patrón confirmado en BSB/WLD de renewed-love):
+     _activate_trail() marca trailing_active=True AL INICIO (fix del loop
+     110412 de v7.0, necesario y correcto). Pero si AMBOS intentos de SL
+     fallaban ahí dentro (breakeven Y emergencia por offset de mark), el
+     trade quedaba con trailing_active=True para siempre y trail_order_id
+     vacío — SIN ninguna orden de protección real en BingX. Como
+     _update_trail() solo actúa cuando hay un NUEVO peak favorable, una
+     posición que se queda en pérdida justo después del fallo nunca volvía
+     a intentar protegerse — quedaba desnuda indefinidamente mientras el
+     bot la seguía contando como "trailing activo" internamente.
+
+     Fix: en _check_all_positions(), si trailing_active=True pero
+     trail_order_id está vacío, se reintenta _activate_trail() en cada
+     ciclo (en vez de pasar a _update_trail(), que no hace nada sin una
+     base) hasta lograr colocar una orden real. Las validaciones de precio
+     ya mejoradas en v7.1 (margen 0.5%, refetch de mark fresco) hacen que
+     el reintento normalmente tenga éxito rápido en vez de repetir el loop
+     110412 original. Notificaciones por Telegram limitadas al primer
+     intento y luego cada 10 reintentos para no saturar si el fallo persiste.
+
+FIXES vs v7.0 (sin cambios):
   ✅ open_count YA NO cuenta toda la cuenta BingX — solo las posiciones que
      ESTE bot trackea. Antes, con renewed-love + joyful-art + GEMMI
      compartiendo la misma cuenta/API, cada bot veía las posiciones de
@@ -35,6 +57,21 @@ EJEMPLO con ATR=0.010, entry=1.000 USDT, LONG:
   t=3:   mark=1.040 → peak=1.040 → SL=1.025 (+2.5% locked)
   t=4:   mark=1.035 → sin cambio (no nuevo peak)
   t=5:   mark=1.060 → peak=1.060 → SL=1.045 (+4.5% locked!)
+
+⚠️ PENDIENTE (no incluido en este fix, requiere más archivos):
+  - reconcile_on_startup() → _place_emergency_sl_all() coloca SOLO SL,
+    nunca restaura TP1/TP2 (calculados pero nunca usados ahí). Cada
+    redeploy con posiciones abiertas deja esas posiciones sin TP hasta
+    que el trailing las tome (y el trailing tampoco coloca TP, solo SL).
+    Esto probablemente explica XRP/SOL con SL pero sin TP. Para arreglarlo
+    necesito ver bingx_client.py y confirmar el método/order_type correcto
+    para colocar una TAKE_PROFIT_MARKET (no quiero inventar una firma de
+    función que no existe).
+  - Caso HYPE-USDT (TP presente, SL ausente, -20% sin protección): no se
+    explica con este archivo — el trailing nunca se activa en una posición
+    perdedora. El bug está en el archivo que coloca la orden de entrada +
+    SL/TP inicial (no incluido en position_manager.py). Necesito ese
+    archivo para diagnosticarlo.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -117,6 +154,10 @@ class OpenTrade:
 
     # ── FIX v7.1: anti-loop de retries idénticos ─────────────────────────────
     last_failed_sl:   float = 0.0    # último new_sl que fue inválido/rechazado
+
+    # ── FIX v7.3: reintentos de activación cuando ambos intentos de SL fallan ──
+    activation_attempts: int = 0     # veces que se reintentó _activate_trail()
+                                      # sin lograr colocar una orden real
 
     # ── Time Stop (previene FHEU/SXT/LDO: horas open sin progresar) ─────────
     opened_at:        float = 0.0    # timestamp apertura (0 = usar tiempo actual)
@@ -221,6 +262,10 @@ class PositionManager:
         órdenes huérfanas para solo 5 posiciones reales (~15 por símbolo).
         Ahora cancela TODO lo pendiente del símbolo antes de colocar la
         SL nueva — igual que ya hacía correctamente _activate_trail().
+
+        NOTA (ver cabecera "PENDIENTE" del módulo): esta función solo coloca
+        SL, no restaura TP1/TP2 aunque ya estén calculados en el objeto
+        OpenTrade. Pendiente de bingx_client.py para implementarlo bien.
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -288,7 +333,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.1 — trailing stop | intervalo=%ds",
+        log.info("Position monitor v7.3 — trailing stop + retry protección | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -398,6 +443,27 @@ class PositionManager:
                 )
                 if should_activate:
                     await self._activate_trail(trade, mark)
+            elif not trade.trail_order_id:
+                # ── FIX v7.3: posición SIN protección real en BingX ────────────
+                # trailing_active=True se marcó al inicio de _activate_trail()
+                # (fix necesario del loop 110412 de v7.0), pero si AMBOS
+                # intentos de SL fallaron ahí dentro (breakeven y emergencia),
+                # trail_order_id se quedó vacío. _update_trail() de abajo solo
+                # actúa si hay un NUEVO peak favorable — si el precio se queda
+                # en pérdida tras el fallo, nunca se reintentaba nada. Caso
+                # confirmado: INJ-USDT, ZEC-USDT, LAB-USDT en joyful-art.
+                # Fix: reintentar _activate_trail() cada ciclo hasta lograr
+                # una orden real. Las validaciones de v7.1 (margen 0.5% +
+                # refetch de mark fresco) hacen que el reintento normalmente
+                # tenga éxito rápido.
+                trade.activation_attempts += 1
+                if trade.activation_attempts == 1 or trade.activation_attempts % 10 == 0:
+                    log.warning(
+                        "[%s] ⚠️ trailing_active=True pero SIN SL real en BingX "
+                        "(intento #%d) — reintentando activación",
+                        symbol, trade.activation_attempts,
+                    )
+                await self._activate_trail(trade, mark)
             else:
                 await self._update_trail(trade, mark)
 
@@ -405,13 +471,16 @@ class PositionManager:
 
     async def _activate_trail(self, trade: OpenTrade, current_mark: float):
         """
-        Activa el trailing stop por primera vez:
+        Activa el trailing stop por primera vez (o reintenta si v7.3 detectó
+        que quedó sin orden real tras un fallo anterior):
         1. Re-fetch precio fresco (fix race condition)
         2. Marca trailing_active=True ANTES de cualquier operación
            → ESTO es el fix definitivo del loop infinito 110412
         3. Valida el precio SL antes de cancelar nada
         4. Solo si precio válido: cancel_all → place BE SL
         5. Si falla: coloca SL de emergencia desde mark actual
+        6. Si AMBOS fallan: el caller (_check_all_positions) reintentará en
+           el próximo ciclo gracias al fix v7.3 — no se queda atascado.
         """
         symbol = trade.symbol
         log.info("[%s] Trail activation — mark=%.6f entry=%.6f atr=%.6f",
@@ -419,7 +488,9 @@ class PositionManager:
 
         # ── FIX DEFINITIVO: marcar activo AL INICIO, no al final ─────────────
         # Antes: be_moved se ponía True solo en éxito → retry infinito en fallo
-        # Ahora: trailing_active=True impide cualquier reintento en ciclos futuros
+        # Ahora: trailing_active=True impide cualquier reintento INMEDIATO en
+        # este mismo ciclo, pero v7.3 sí reintenta en ciclos siguientes si
+        # trail_order_id sigue vacío (ver _check_all_positions).
         trade.trailing_active = True
         trade.be_moved        = True    # compat con código legacy
         trade.peak_price      = current_mark
@@ -546,18 +617,28 @@ class PositionManager:
                     await self.remove_trade(symbol, pnl)
                 else:
                     log.error("[%s] Trail activation: SL emergencia FALLIDO: %s — "
-                              "posición sin protección, monitorizar manual", symbol, em_resp)
-                    await tg.notify_error(
-                        f"trail_activation({symbol})",
-                        f"SL emergencia fallido — POSICIÓN SIN PROTECCIÓN\n{em_resp}"
-                    )
+                              "posición sin protección, reintentará en próximo "
+                              "ciclo (FIX v7.3)", symbol, em_resp)
+                    # FIX v7.3: throttle — antes esto se mandaba en CADA fallo.
+                    # Con el reintento automático por ciclo (ver
+                    # _check_all_positions), un fallo persistente saturaría
+                    # Telegram. Ahora solo el primer intento y luego cada 10.
+                    if trade.activation_attempts <= 1 or trade.activation_attempts % 10 == 0:
+                        await tg.notify_error(
+                            f"trail_activation({symbol})",
+                            f"SL emergencia fallido (intento #{trade.activation_attempts}) "
+                            f"— POSICIÓN SIN PROTECCIÓN, reintentando cada ciclo\n{em_resp}"
+                        )
             else:
                 log.error("[%s] Trail activation: no se puede calcular SL válido "
-                          "para mark=%.6f dir=%s", symbol, mark, trade.direction)
+                          "para mark=%.6f dir=%s — reintentará en próximo ciclo",
+                          symbol, mark, trade.direction)
 
         except Exception as e:
-            log.error("[%s] _activate_trail error: %s", symbol, e)
-            # trailing_active ya es True — no volverá a reintentar
+            log.error("[%s] _activate_trail error: %s — reintentará en próximo ciclo "
+                      "(FIX v7.3, trail_order_id sigue vacío)", symbol, e)
+            # trailing_active ya es True, pero como trail_order_id sigue vacío
+            # (no se llegó a colocar ninguna orden), v7.3 reintentará solo.
 
     # ── Actualización del trailing ────────────────────────────────────────────
 
