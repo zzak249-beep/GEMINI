@@ -1,34 +1,74 @@
 """
-QF×JP Bot v7.3 — Position Manager TRAILING STOP DINÁMICO (FIX reintento protección)
+QF×JP Bot v7.6 — Position Manager TRAILING STOP DINÁMICO (FIX dirección real)
 ═══════════════════════════════════════════════════════════════════════════════
-FIX v7.3:
-  ✅ POSICIONES DESNUDAS PERMANENTES (caso INJ-USDT, ZEC-USDT, LAB-USDT en
-     joyful-art — mismo patrón confirmado en BSB/WLD de renewed-love):
-     _activate_trail() marca trailing_active=True AL INICIO (fix del loop
-     110412 de v7.0, necesario y correcto). Pero si AMBOS intentos de SL
-     fallaban ahí dentro (breakeven Y emergencia por offset de mark), el
-     trade quedaba con trailing_active=True para siempre y trail_order_id
-     vacío — SIN ninguna orden de protección real en BingX. Como
-     _update_trail() solo actúa cuando hay un NUEVO peak favorable, una
-     posición que se queda en pérdida justo después del fallo nunca volvía
-     a intentar protegerse — quedaba desnuda indefinidamente mientras el
-     bot la seguía contando como "trailing activo" internamente.
+FIX v7.6 — CRÍTICO: auto-corrección de trade.direction contra BingX real,
+  en cada ciclo del monitor (ver _check_all_positions). reconcile_on_startup()
+  ya priorizaba positionSide sobre el signo de positionAmt al reconciliar,
+  pero nada volvía a verificar esto después — si trade.direction se quedó
+  mal por cualquier vía, se quedaba mal para siempre, invirtiendo
+  side_close en _activate_trail()/_update_trail(), _calc_pnl(), el EMA
+  exit y el time stop. Caso confirmado: BTWUSDT en renewed-love, 130+
+  reintentos de SL fallidos durante horas (110424 "order size must be
+  less than the available amount" — el patrón exacto de una orden de
+  cierre construida como si fuera apertura). Complementa el fix de
+  bingx_client.py v7.10 (que protege el punto de envío de la orden) —
+  este corrige la fuente, para que todo lo que depende de trade.direction
+  esté bien, no solo la orden de protección.
 
-     Fix: en _check_all_positions(), si trailing_active=True pero
-     trail_order_id está vacío, se reintenta _activate_trail() en cada
-     ciclo (en vez de pasar a _update_trail(), que no hace nada sin una
-     base) hasta lograr colocar una orden real. Las validaciones de precio
-     ya mejoradas en v7.1 (margen 0.5%, refetch de mark fresco) hacen que
-     el reintento normalmente tenga éxito rápido en vez de repetir el loop
-     110412 original. Notificaciones por Telegram limitadas al primer
-     intento y luego cada 10 reintentos para no saturar si el fallo persiste.
+FIX v7.5 — time_stop/EMA exit desactivados de facto por redeploys frecuentes:
+  reconcile_on_startup() corre en CADA redeploy y no sabe cuánto lleva
+  realmente abierta una posición ya existente (BingX no expone el
+  timestamp de apertura original en /v2/user/positions). Antes, eso
+  dejaba opened_at=0.0 hasta el primer ciclo de monitor, que lo fijaba a
+  "ahora" — dando una ventana de MAX_HOLD_MINUTES COMPLETA Y FRESCA en
+  cada redeploy. Con redeploys más frecuentes que MAX_HOLD_MINUTES
+  (sesión de desarrollo activa, muchos redeploys por hora), cualquier
+  posición que sobreviviera entre dos redeploys consecutivos nunca
+  llegaba a cumplir el tiempo para que time_stop o EMA exit dispararan.
+  Caso real: ETH-USDT abierto 07:31, sobrevivió un redeploy a las 9:34,
+  cerró recién a las 15:24 — casi 8h sin que nada disparara.
+  Fix: en reconcile, opened_at se fija conservadoramente a "ya se gastó
+  la mitad del presupuesto de MAX_HOLD_MINUTES" en vez de "recién abierto".
 
-FIXES vs v7.0 (sin cambios):
+FIX v7.4 — EMA EXIT independiente (más rápido que time_stop):
+  Investigado: para el rango de timeframe de este bot (TIMEFRAME=3m,
+  holds típicos bajo MAX_HOLD_MINUTES), el estándar de facto en scalping
+  cripto es usar una EMA corta (5-13 períodos, converge en EMA9 como el
+  más citado) como línea de salida dinámica — mientras el precio cierra
+  velas del lado correcto de la EMA, la micro-tendencia sigue intacta;
+  un CIERRE de vela (no una mecha) del lado contrario señala que la
+  tendencia murió.
+
+  Antes, la única forma de salir de un trade que no progresa era
+  _check_time_stop() esperando hasta MAX_HOLD_MINUTES completos (60min
+  por defecto) — mucho más lento que detectar la muerte de la tendencia
+  por EMA. _check_ema_exit() es un chequeo NUEVO E INDEPENDIENTE:
+    - Mismo alcance que time_stop: solo aplica si el trailing NO se ha
+      activado todavía (si ya va ganando, el trailing se encarga — no
+      cerramos un ganador por una sola vela en contra).
+    - Guarda mínima de EMA_EXIT_MIN_HOLD_MIN (6min por defecto, ~2 velas
+      de 3m) antes de evaluar — evita whipsaw inmediato justo tras entrar
+      con el precio rondando la EMA.
+    - Usa klines[-2] (última vela CERRADA), nunca la vela en curso —
+      algunas APIs devuelven la vela actual sin cerrar como último
+      elemento, evaluarla daría señales prematuras.
+    - Desactivado por defecto (EMA_EXIT_ENABLED=False) — activar solo
+      tras confirmar en logs que el comportamiento es el esperado.
+
+FIX v7.3 (sin cambios):
   ✅ open_count YA NO cuenta toda la cuenta BingX — solo las posiciones que
      ESTE bot trackea. Antes, con renewed-love + joyful-art + GEMMI
      compartiendo la misma cuenta/API, cada bot veía las posiciones de
      los OTROS bots reflejadas en su propio MAX_OPEN_TRADES, causando
      bloqueos (o desbloqueos) por actividad ajena al bot.
+
+FIX v7.3 — posiciones desnudas permanentes (sin cambios):
+  ✅ Si trailing_active=True pero trail_order_id está vacío (ambos
+     intentos de SL fallaron en _activate_trail), el monitor reintenta
+     _activate_trail() cada ciclo en vez de quedarse esperando un nuevo
+     peak favorable que nunca iba a llegar en una posición perdedora.
+     Throttle de logs/Telegram cada 10 reintentos. Caso confirmado:
+     INJ-USDT, ZEC-USDT, LAB-USDT en joyful-art.
 
 FIXES vs v7.0 (sin cambios):
   ✅ Loop infinito 110412 en pares de bajo precio (CATI-USDT, etc.):
@@ -57,21 +97,6 @@ EJEMPLO con ATR=0.010, entry=1.000 USDT, LONG:
   t=3:   mark=1.040 → peak=1.040 → SL=1.025 (+2.5% locked)
   t=4:   mark=1.035 → sin cambio (no nuevo peak)
   t=5:   mark=1.060 → peak=1.060 → SL=1.045 (+4.5% locked!)
-
-⚠️ PENDIENTE (no incluido en este fix, requiere más archivos):
-  - reconcile_on_startup() → _place_emergency_sl_all() coloca SOLO SL,
-    nunca restaura TP1/TP2 (calculados pero nunca usados ahí). Cada
-    redeploy con posiciones abiertas deja esas posiciones sin TP hasta
-    que el trailing las tome (y el trailing tampoco coloca TP, solo SL).
-    Esto probablemente explica XRP/SOL con SL pero sin TP. Para arreglarlo
-    necesito ver bingx_client.py y confirmar el método/order_type correcto
-    para colocar una TAKE_PROFIT_MARKET (no quiero inventar una firma de
-    función que no existe).
-  - Caso HYPE-USDT (TP presente, SL ausente, -20% sin protección): no se
-    explica con este archivo — el trailing nunca se activa en una posición
-    perdedora. El bug está en el archivo que coloca la orden de entrada +
-    SL/TP inicial (no incluido en position_manager.py). Necesito ese
-    archivo para diagnosticarlo.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -129,6 +154,23 @@ def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
         return sl_price > mark * 1.005
 
 
+def _ema(values: list[float], period: int) -> list[float]:
+    """
+    EMA simple sin dependencias externas (igual de mínima que los demás
+    helpers de este archivo). Usada solo por _check_ema_exit() — para el
+    cálculo de STC/indicadores del scanner, ver stc_asymmetry.py (módulo
+    separado a propósito: position_manager.py no debe depender de un
+    filtro experimental del lado del scanner).
+    """
+    if not values:
+        return []
+    k = 2.0 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(out[-1] + k * (v - out[-1]))
+    return out
+
+
 # ── Dataclass ─────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -159,7 +201,7 @@ class OpenTrade:
     activation_attempts: int = 0     # veces que se reintentó _activate_trail()
                                       # sin lograr colocar una orden real
 
-    # ── Time Stop (previene FHEU/SXT/LDO: horas open sin progresar) ─────────
+    # ── Time Stop / EMA Exit (previene FHEU/SXT/LDO: horas open sin progresar) ─
     opened_at:        float = 0.0    # timestamp apertura (0 = usar tiempo actual)
 
 
@@ -240,6 +282,22 @@ class PositionManager:
                     position_side=pos_side,
                     trail_sl=sl,          # SL inicial = SL de emergencia
                     peak_price=entry,     # peak inicial = entry
+                    # ── FIX v7.5 ──────────────────────────────────────────────
+                    # NO asumir que la posición "acaba de abrir". Este endpoint
+                    # de BingX no expone el timestamp de apertura original, así
+                    # que antes opened_at se quedaba en 0.0 y _check_time_stop()
+                    # lo fijaba a "ahora" en el primer ciclo — dando una ventana
+                    # de MAX_HOLD_MINUTES COMPLETA y fresca en CADA redeploy.
+                    # Con redeploys más frecuentes que MAX_HOLD_MINUTES (sesión
+                    # de desarrollo activa), esto dejaba el time_stop y el EMA
+                    # exit efectivamente desactivados para siempre en cualquier
+                    # posición que sobreviviera entre dos redeploys. Caso real:
+                    # ETH-USDT abierto 07:31, sobrevivió un redeploy a las 9:34,
+                    # cerró recién a las 15:24 — casi 8h sin que nada disparara.
+                    # Fix: asumir conservadoramente que ya se gastó la MITAD del
+                    # presupuesto de tiempo — ni pánico inmediato (cierre falso
+                    # de un trade que progresaba bien) ni ventana infinita.
+                    opened_at=time.time() - (getattr(C, 'MAX_HOLD_MINUTES', 60) * 60 * 0.5),
                 )
             count += 1
             log.info("[%s] Reconciliado: %s qty=%.4f @ %.6f", sym, direction, qty, entry)
@@ -262,10 +320,6 @@ class PositionManager:
         órdenes huérfanas para solo 5 posiciones reales (~15 por símbolo).
         Ahora cancela TODO lo pendiente del símbolo antes de colocar la
         SL nueva — igual que ya hacía correctamente _activate_trail().
-
-        NOTA (ver cabecera "PENDIENTE" del módulo): esta función solo coloca
-        SL, no restaura TP1/TP2 aunque ya estén calculados en el objeto
-        OpenTrade. Pendiente de bingx_client.py para implementarlo bien.
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -309,7 +363,7 @@ class PositionManager:
     # ── Registro ──────────────────────────────────────────────────────────────
 
     async def register_trade(self, trade: OpenTrade):
-        # Marcar timestamp de apertura para el time-stop
+        # Marcar timestamp de apertura para el time-stop / EMA exit
         if trade.opened_at == 0.0:
             trade.opened_at = time.time()
         async with self._lock:
@@ -333,7 +387,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.3 — trailing stop + retry protección | intervalo=%ds",
+        log.info("Position monitor v7.6 — trailing stop + EMA exit + auto-corrección de dirección | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -392,6 +446,40 @@ class PositionManager:
 
             pos = real_map[symbol]
 
+            # ── FIX v7.6 CRÍTICO: auto-corregir trade.direction si no coincide
+            # con la verdad de BingX ───────────────────────────────────────────
+            # reconcile_on_startup() ya prioriza positionSide sobre el signo de
+            # positionAmt en hedge mode al RECONCILIAR — pero nada volvía a
+            # verificar esto después, en cada ciclo del monitor. Si
+            # trade.direction se quedó mal por cualquier vía (registro inicial,
+            # una reconciliación anterior a este fix, lo que sea), se quedaba
+            # mal PARA SIEMPRE — cada side_close calculado en _activate_trail()/
+            # _update_trail() salía invertido sin que nada lo detectara.
+            # Caso confirmado: BTWUSDT en renewed-love, 130+ reintentos de SL
+            # fallidos durante horas, error 110424 "order size must be less
+            # than the available amount" — el patrón exacto de una orden de
+            # cierre construida con la dirección al revés (BingX la trata como
+            # abrir posición nueva, necesita margen fresco, en vez de cerrar la
+            # existente). bingx_client.py v7.10 ya protege el punto de envío de
+            # la orden con la misma verificación — esto corrige la FUENTE: si
+            # trade.direction está mal, _calc_pnl(), el EMA exit y el time stop
+            # también calculaban mal, no solo la orden de protección.
+            real_amt = float(pos.get("positionAmt", 0) or 0)
+            real_ps  = pos.get("positionSide", "")
+            real_direction = (
+                real_ps if real_ps in ("LONG", "SHORT")
+                else ("LONG" if real_amt > 0 else "SHORT")
+            )
+            if real_direction != trade.direction:
+                log.warning(
+                    "[%s] ⚠️ DIRECCIÓN CORREGIDA: tracker tenía %s, BingX confirma "
+                    "%s (positionSide=%s, positionAmt=%.6f). Actualizando — esta "
+                    "es la causa raíz del bug que dejó BTWUSDT sin protección "
+                    "durante horas.", symbol, trade.direction, real_direction,
+                    real_ps, real_amt,
+                )
+                trade.direction = real_direction
+
             # ── Mark price ────────────────────────────────────────────────────
             try:
                 mark = float(pos.get("markPrice", 0) or 0)
@@ -427,6 +515,13 @@ class PositionManager:
             # que bajaban lentamente sin llegar al SL (demasiado ancho a 2.0 ATR).
             # Si MAX_HOLD_MINUTES sin progreso mínimo Y trailing no activo → cierre.
             if await self._check_time_stop(trade, mark, symbol):
+                continue
+
+            # ── EMA EXIT (FIX v7.4) ───────────────────────────────────────────
+            # Independiente del time_stop — detecta muerte de tendencia mucho
+            # más rápido (cierre de vela cruzando la EMA corta) en vez de
+            # esperar hasta MAX_HOLD_MINUTES completos. Ver _check_ema_exit().
+            if await self._check_ema_exit(trade, symbol):
                 continue
 
             # ── Trailing Stop ─────────────────────────────────────────────────
@@ -808,6 +903,10 @@ class PositionManager:
         - Si ha pasado y el precio no avanzó TIME_STOP_MIN_PROGRESS_ATR*ATR → cierra
 
         Retorna True si cerró (el caller debe hacer `continue`).
+
+        Ver también _check_ema_exit() (FIX v7.4) — chequeo independiente,
+        normalmente mucho más rápido que este, que detecta muerte de
+        tendencia por cierre de vela cruzando una EMA corta.
         """
         if trade.trailing_active:
             return False  # el trailing se encarga
@@ -835,6 +934,82 @@ class PositionManager:
         await tg.notify_time_stop(symbol, trade.direction, trade.entry, mark,
                                    int(elapsed_min), progress)
         await self.close_position_emergency(symbol, reason="time_stop")
+        return True
+
+    # ── EMA Exit (FIX v7.4) ─────────────────────────────────────────────────────
+
+    async def _check_ema_exit(self, trade: OpenTrade, symbol: str) -> bool:
+        """
+        Salida por EMA corta — independiente de _check_time_stop() y del
+        trailing. Investigado: para el rango de timeframe de este bot
+        (TIMEFRAME=3m), el estándar de facto en scalping cripto es usar
+        una EMA corta (5-13 períodos, EMA9 el más citado) como línea de
+        salida dinámica. Mientras el precio cierra velas del lado correcto
+        de la EMA, la micro-tendencia sigue intacta; un CIERRE de vela
+        (no una mecha) del lado contrario señala que la tendencia murió —
+        mucho más rápido que esperar los MAX_HOLD_MINUTES completos del
+        time_stop.
+
+        Mismo alcance que _check_time_stop(): solo aplica si el trailing
+        NO se ha activado todavía. Si ya va ganando y el trailing está
+        activo, el trailing se encarga de dejar correr el beneficio — no
+        queremos cerrar un ganador solo porque una vela cerró del lado
+        contrario.
+
+        Guarda EMA_EXIT_MIN_HOLD_MIN (6min/~2 velas de 3m por defecto)
+        antes de evaluar, para no salir en el primer whipsaw justo tras
+        la entrada con el precio rondando la EMA.
+
+        Usa klines[-2] (última vela CERRADA) — klines[-1] puede ser la
+        vela en curso todavía sin cerrar dependiendo de la API, evaluarla
+        daría señales prematuras basadas en datos incompletos.
+
+        Desactivado por defecto (EMA_EXIT_ENABLED=False). Retorna True si
+        cerró (el caller debe hacer `continue`).
+        """
+        if not getattr(C, 'EMA_EXIT_ENABLED', False):
+            return False
+        if trade.trailing_active:
+            return False  # el trailing se encarga, igual que time_stop
+
+        min_hold_min = getattr(C, 'EMA_EXIT_MIN_HOLD_MIN', 6)
+        if trade.opened_at > 0:
+            elapsed_min = (time.time() - trade.opened_at) / 60.0
+            if elapsed_min < min_hold_min:
+                return False
+
+        period = getattr(C, 'EMA_EXIT_PERIOD', 9)
+        try:
+            klines = await self.client.get_klines(symbol, C.TIMEFRAME, period + 30)
+        except Exception as e:
+            log.debug("[%s] EMA exit klines error: %s", symbol, e)
+            return False
+
+        if len(klines) < period + 2:
+            return False
+
+        closes = [c[4] for c in klines]
+        ema    = _ema(closes, period)
+        if len(ema) < 2:
+            return False
+
+        # Última vela CERRADA — ver docstring sobre por qué -2, no -1
+        last_closed_close = closes[-2]
+        last_closed_ema    = ema[-2]
+
+        exit_triggered = (
+            (trade.direction == "LONG"  and last_closed_close < last_closed_ema) or
+            (trade.direction == "SHORT" and last_closed_close > last_closed_ema)
+        )
+        if not exit_triggered:
+            return False
+
+        log.warning(
+            "[%s] 📉 EMA(%d) EXIT — última vela cerrada %.6f %s EMA %.6f (%s). Cerrando.",
+            symbol, period, last_closed_close,
+            "<" if trade.direction == "LONG" else ">", last_closed_ema, trade.direction,
+        )
+        await self.close_position_emergency(symbol, reason=f"ema{period}_exit")
         return True
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
