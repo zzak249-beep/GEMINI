@@ -54,6 +54,7 @@ import logging
 import time
 import math
 from datetime import date
+from typing import Optional
 
 import config as C
 from volatility_regime import vol_engine
@@ -80,8 +81,19 @@ class RiskManager:
         self._MAX_PER_SYMBOL   = 2        # máx 2 trades por par al día
         # FIX v7.1: último PnL no realizado conocido (para status/logging)
         self._last_unrealized  = 0.0
-        # Correlation Guard: timestamps de apertura por dirección
-        self._direction_ts: dict[str, list] = {"LONG": [], "SHORT": []}
+        # Correlation Guard: reservas por dirección, una por token único.
+        # FIX: antes esto era una lista de timestamps y release_direction_
+        # reservation() asumía que liberar = quitar el último elemento. Con
+        # batches de hasta 20 símbolos en paralelo (asyncio.gather), entre
+        # que un símbolo reserva y libera (varios `await` de por medio:
+        # balance, orden, etc.) otro símbolo puede reservar y liberar antes
+        # — el pop() por posición entonces borraba la reserva ajena y la
+        # propia quedaba viva para siempre, inflando el contador del guard
+        # poco a poco. Ahora cada reserva tiene un token único devuelto por
+        # direction_allowed(), y release_direction_reservation(token) borra
+        # exactamente esa entrada, sin importar el orden de liberación.
+        self._direction_reservations: dict[str, dict[int, float]] = {"LONG": {}, "SHORT": {}}
+        self._reservation_seq: int = 0
 
     # ── Reset diario ──────────────────────────────────────────────────────────
 
@@ -190,7 +202,7 @@ class RiskManager:
             return False, f"max_trades_symbol({symbol},{cnt}/{self._MAX_PER_SYMBOL})"
         return True, ""
 
-    def direction_allowed(self, direction: str) -> tuple[bool, str]:
+    def direction_allowed(self, direction: str) -> tuple[bool, str, Optional[int]]:
         """
         Correlation Guard — evita apilar el mismo riesgo de mercado.
         Caso real: FHEU+XNY, dos LONG abiertos casi a la vez que cerraron
@@ -207,28 +219,45 @@ class RiskManager:
         justo el escenario que este guard debía prevenir. Ahora reserva
         el timestamp INMEDIATAMENTE si pasa el check.
 
-        Si el trade finalmente no se concreta, llamar a
-        release_direction_reservation(direction) para liberar el cupo.
+        FIX (esta revisión): la reserva ahora se identifica con un token
+        único (int) devuelto como tercer valor de la tupla — ver docstring
+        de __init__ para el porqué. El caller DEBE guardar este token y
+        pasarlo a release_direction_reservation() si el trade no se concreta.
+        Devuelve (allowed, reason, token) — token es None si allowed=False.
         """
         now = time.time()
-        ts_list = self._direction_ts.get(direction, [])
-        # Purgar timestamps fuera de la ventana
-        ts_list = [t for t in ts_list if now - t < C.CORRELATION_WINDOW_SEC]
-        if len(ts_list) >= C.MAX_SAME_DIRECTION:
-            self._direction_ts[direction] = ts_list
-            mins = int(C.CORRELATION_WINDOW_SEC / 60)
-            return False, f"correlation_guard({direction},{len(ts_list)}/{C.MAX_SAME_DIRECTION} en {mins}min)"
-        # FIX: reservar de inmediato — no esperar a on_trade_opened()
-        ts_list.append(now)
-        self._direction_ts[direction] = ts_list
-        return True, ""
+        reservations = self._direction_reservations.setdefault(direction, {})
+        # Purgar reservas fuera de la ventana
+        expired = [tok for tok, ts in reservations.items()
+                   if now - ts >= C.CORRELATION_WINDOW_SEC]
+        for tok in expired:
+            del reservations[tok]
 
-    def release_direction_reservation(self, direction: str):
-        """Libera una reserva de dirección cuando el trade no se concreta."""
-        ts_list = self._direction_ts.get(direction, [])
-        if ts_list:
-            ts_list.pop()  # quita la más reciente (la que reservamos ahora)
-            self._direction_ts[direction] = ts_list
+        if len(reservations) >= C.MAX_SAME_DIRECTION:
+            mins = int(C.CORRELATION_WINDOW_SEC / 60)
+            return (False,
+                    f"correlation_guard({direction},{len(reservations)}/{C.MAX_SAME_DIRECTION} en {mins}min)",
+                    None)
+
+        self._reservation_seq += 1
+        token = self._reservation_seq
+        reservations[token] = now
+        return True, "", token
+
+    def release_direction_reservation(self, direction: str, token: Optional[int] = None):
+        """
+        Libera una reserva de dirección cuando el trade no se concreta.
+
+        FIX: recibe el token devuelto por direction_allowed() y borra
+        exactamente esa entrada — ya no asume "la última de la lista"
+        (ver docstring de __init__). Si no se pasa token (compat con
+        callers viejos), no hace nada en vez de adivinar cuál borrar.
+        """
+        if token is None:
+            log.warning("release_direction_reservation(%s) sin token — "
+                        "no se libera nada (caller desactualizado)", direction)
+            return
+        self._direction_reservations.get(direction, {}).pop(token, None)
 
     def tier_ok(self, tier: str) -> bool:
         order = {"NONE": 0, "STD": 1, "FUEL": 2, "SUP": 3}
