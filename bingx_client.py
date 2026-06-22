@@ -61,6 +61,16 @@ import config as C
 
 log = logging.getLogger("bingx")
 
+# Prefijos de símbolos NO-cripto disponibles en BingX perpetuos
+# (metales preciosos, forex, índices, commodities). complement_engine.py
+# los usa para excluirlos del escaneo de cripto puro.
+NON_CRYPTO_PREFIXES: tuple[str, ...] = (
+    "XAU", "XAG", "XPT",            # metales
+    "EUR", "GBP", "JPY", "AUD",     # forex
+    "US30", "US500", "NAS100",       # índices
+    "OIL", "NGAS",                   # commodities
+)
+
 
 class BingXClient:
     def __init__(self):
