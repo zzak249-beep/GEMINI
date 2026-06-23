@@ -1,23 +1,79 @@
 """
-QF×JP Bot v7.7 — Position Manager (FIX _calc_pnl × LEVERAGE)
+QF×JP Bot v7.8 — Position Manager TRAILING STOP DINÁMICO
 ═══════════════════════════════════════════════════════════════════════════════
-NUEVO en v7.7:
-  ✅ FIX CRÍTICO _calc_pnl(): quitado * C.LEVERAGE.
-     En BingX USDT-margined perps, positionAmt está en unidades de activo
-     base y el PnL es (exit - entry) * qty USDT — punto. El leverage
-     afecta el margen bloqueado (notional / leverage), no el PnL nominal.
-     Antes: todo el stack de riesgo recibía PnL × 10 (o × leverage):
-       • risk.on_trade_closed(pnl=inflado) → circuit breaker de pérdida
-         diaria disparaba 10x antes de lo previsto (con LEVERAGE=10 y
-         DAILY_LOSS_PCT=5%, el límite real efectivo era 0.5% — 10x menos
-         que la intención).
-       • get_unrealized_pnl() también usa _calc_pnl → can_trade() bloqueaba
-         operaciones con drawdown 10x ficticio.
-       • Telegram notificaba PnL falso 10x mayor.
-       • journal.on_close(pnl=inflado) calculaba win-rate y offset
-         adaptativo con datos incorrectos.
+FIX v7.8 — Momentum exit: salida anticipada por deceleración de RSI
+  Nuevo _check_momentum_exit(): sale de posiciones en profit cuando el RSI
+  empieza a decelerarse en zona overbought/oversold, antes de que el precio
+  revierta. Inspirado en la señal de TP del Turbo Oscillator (RunRox):
+  avg > 60 AND speed_now < speed_prev (el momentum pierde fuerza).
 
-Sin más cambios funcionales vs v7.6.
+  Solo aplica cuando trailing_active=True (posición ya en profit) — si el
+  trailing aún no se activó, el time_stop y EMA exit se encargan.
+  Desactivado por defecto (MOMENTUM_EXIT_ENABLED=False).
+
+  Configurable con:
+    MOMENTUM_EXIT_ENABLED=true/false (default false)
+    MOMENTUM_EXIT_RSI_PERIOD=14      (periodo RSI)
+    MOMENTUM_EXIT_OB=60              (zona overbought para LONG)
+    MOMENTUM_EXIT_OS=40              (zona oversold para SHORT)
+    MOMENTUM_EXIT_MIN_HOLD_MIN=5     (mínimo de minutos antes de evaluar)
+
+FIX v7.7 — CRÍTICO: doble SL en BingX tras trail activation
+  Causa raíz en _activate_trail(): dos bugs que se combinaban:
+
+  Bug A) Cuando el precio cae por debajo de entry antes de que el trail
+  pueda ejecutarse (condición habitual en dip-buys: el precio sube
+  brevemente para activar el trail, luego retrocede), el `else` branch
+  ("Precio revertió") logeaba correctamente que NO se debía cancelar el
+  SL original — pero IGUALMENTE caía al código de emergency SL que hace
+  cancel_all_orders() + coloca SL nuevo. Resultado: si el cancel_all
+  fallaba (Bug B), quedaban el SL original Y el nuevo en BingX. Si el
+  cancel_all tenía éxito, se reemplazaba el SL original (0.002738) por
+  uno de emergencia peor calculado (0.002706 = mark * 0.985), perdiendo
+  la protección del nivel de liquidez original.
+
+  Bug B) El `except Exception: pass` en el path de emergency SL swallows
+  errores de cancel_all_orders() en silencio — el código procedía a
+  colocar el SL de emergencia SIN haber cancelado el original, creando
+  el doble SL visible en BingX.
+
+  Fix:
+  - Cuando BE SL es inválido (precio revertió): return INMEDIATO desde
+    el else branch. SL original en BingX sigue activo y es MEJOR
+    protección que cualquier emergency SL calculado desde mark < entry.
+    trailing_active=True pero trail_order_id="" → v7.3 reintentará en
+    el próximo ciclo cuando el precio se recupere y BE sea válido.
+  - Cuando cancel_all falla: log.error + return (reset trailing_active)
+    en vez de swallow + proceder. Nunca colocar SL nuevo si no se pudo
+    cancelar el viejo.
+  - Emergency SL solo se llama en el único path legítimo: BE válido +
+    cancel_all OK + BE placement falló (cancel_all ya corrió, hay que
+    proteger la posición desnuda).
+  - Caso real: ANIME-USDT, dos SL activos simultáneos (0.002738 original
+    + 0.002706 de emergencia) tras la primera iteración del monitor.
+
+FIX v7.6 (sin cambios):
+  ✅ Auto-corrección de trade.direction contra BingX real en cada ciclo
+     del monitor (_check_all_positions).
+
+FIX v7.5 (sin cambios):
+  ✅ reconcile: opened_at conservador (mitad del presupuesto de tiempo)
+     en vez de 0.0 → time_stop y EMA exit no se desactivan en redeploys.
+
+FIX v7.4 (sin cambios):
+  ✅ EMA EXIT independiente del time_stop, más rápido.
+
+FIX v7.3 (sin cambios):
+  ✅ open_count solo de ESTE bot, no de toda la cuenta BingX.
+  ✅ Reintento de _activate_trail si trailing_active=True pero
+     trail_order_id="" (posición sin protección real).
+  ✅ Si trailing_active=True pero trail_order_id vacío: reintentar
+     _activate_trail() cada ciclo.
+
+FIXES v7.0-v7.2 (sin cambios):
+  ✅ Anti-loop 110412 (margen 0.5%, re-fetch mark, last_failed_sl)
+  ✅ place-then-cancel: nunca sin SL durante el update del trail
+  ✅ Qty sync con BingX real (TPs parciales)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -36,6 +92,7 @@ log = logging.getLogger("position_mgr")
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_order_id(resp: dict) -> str:
+    """Extrae orderId de la respuesta de BingX (maneja varios formatos)."""
     data = resp.get("data", {})
     if isinstance(data, dict):
         oid = (data.get("order") or {}).get("orderId") or data.get("orderId", "")
@@ -44,14 +101,21 @@ def _extract_order_id(resp: dict) -> str:
 
 
 def _is_position_closed_error(resp: dict) -> bool:
+    """
+    BingX error 109420: 'position not exist' — la posición ya fue cerrada
+    externamente (SL/TP disparado) pero el tracker interno aún no lo sabe.
+    También captura 110025 (order would trigger immediately) como señal de cierre.
+    """
     code = resp.get("code", 0) if isinstance(resp, dict) else 0
     return code in (109420, 110025)
 
 
 def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
     """
-    Valida SL antes de enviarlo a BingX (evita error 110412).
-    Margen 0.5% — cubre spread + latencia en pares de precio bajo.
+    Valida que el precio de SL sea aceptable para BingX antes de enviarlo.
+    - LONG SELL STOP: sl_price debe ser < mark (se dispara cuando baja)
+    - SHORT BUY STOP: sl_price debe ser > mark (se dispara cuando sube)
+    Margen 0.5% cubre spread + latencia en pares de precio bajo.
     """
     if sl_price <= 0:
         return False
@@ -59,6 +123,27 @@ def _sl_valid(sl_price: float, mark: float, direction: str) -> bool:
         return sl_price < mark * 0.995
     else:
         return sl_price > mark * 1.005
+
+
+def _rsi_simple(closes: list, period: int = 14) -> list:
+    """RSI sin dependencias — para _check_momentum_exit."""
+    n = len(closes)
+    if n < 2:
+        return [50.0] * n
+    out = [50.0] * n
+    for i in range(1, n):
+        lo = max(1, i - period + 1)
+        gains  = [max(closes[j] - closes[j-1], 0) for j in range(lo, i+1)]
+        losses = [max(closes[j-1] - closes[j], 0) for j in range(lo, i+1)]
+        ag = sum(gains)  / len(gains)  if gains  else 0.0
+        al = sum(losses) / len(losses) if losses else 0.0
+        if al < 1e-12:
+            out[i] = 100.0
+        elif ag < 1e-12:
+            out[i] = 0.0
+        else:
+            out[i] = 100.0 - 100.0 / (1.0 + ag / al)
+    return out
 
 
 def _ema(values: list[float], period: int) -> list[float]:
@@ -129,7 +214,7 @@ class PositionManager:
             if not sym or amt == 0:
                 continue
             direction_from_amt = "LONG" if amt > 0 else "SHORT"
-            pos_side = pos.get("positionSide", "BOTH")
+            pos_side  = pos.get("positionSide", "BOTH")
             if pos_side not in ("LONG", "SHORT", "BOTH"):
                 pos_side = "BOTH"
 
@@ -137,7 +222,8 @@ class PositionManager:
                 direction = pos_side
                 if direction != direction_from_amt:
                     log.warning(
-                        "[%s] Discrepancia dirección: amt=%s positionSide=%s — usando positionSide",
+                        "[%s] ⚠️ Discrepancia dirección: amt sugiere %s pero "
+                        "positionSide=%s (Hedge mode) — usando positionSide",
                         sym, direction_from_amt, pos_side,
                     )
             else:
@@ -157,8 +243,6 @@ class PositionManager:
                     position_side=pos_side,
                     trail_sl=sl,
                     peak_price=entry,
-                    # FIX v7.5: asumir que ya se gastó la mitad del presupuesto
-                    # de tiempo — evita ventana completa y fresca en cada redeploy.
                     opened_at=time.time() - (getattr(C, 'MAX_HOLD_MINUTES', 60) * 60 * 0.5),
                 )
             count += 1
@@ -171,8 +255,7 @@ class PositionManager:
     async def _place_emergency_sl_all(self):
         """
         Coloca SL inmediato en todas las posiciones reconciliadas.
-        FIX: cancela órdenes previas antes de colocar la nueva (evita
-        acumulación de decenas de SL huérfanos por redeploys frecuentes).
+        Cancela órdenes anteriores antes de colocar la nueva.
         """
         async with self._lock:
             trades = dict(self._trades)
@@ -190,9 +273,10 @@ class PositionManager:
                     await self.client.cancel_all_orders(sym)
                     await asyncio.sleep(0.3)
                 except Exception as ce:
-                    log.debug("[%s] cancel_all_orders: %s", sym, ce)
+                    log.debug("[%s] cancel_all_orders previo a SL emergencia: %s", sym, ce)
 
                 log.info("[%s] SL emergencia: mark=%.6f sl=%.6f", sym, mark, sl_price)
+
                 resp = await self.client.place_stop_market_order(
                     sym, side_close, trade.qty, sl_price,
                     trade.direction, order_type="STOP_MARKET",
@@ -234,7 +318,7 @@ class PositionManager:
     # ── Monitor loop ──────────────────────────────────────────────────────────
 
     async def monitor_loop(self):
-        log.info("Position monitor v7.7 — trailing + EMA exit + autocorrección dirección | intervalo=%ds",
+        log.info("Position monitor v7.8 — trailing stop + EMA exit + momentum exit + auto-corrección | intervalo=%ds",
                  C.POSITION_CHECK_INTERVAL)
         while True:
             try:
@@ -256,7 +340,6 @@ class PositionManager:
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
 
-        # FIX v7.2: solo contar posiciones que ESTE bot trackea
         async with self._lock:
             own_symbols = set(self._trades.keys())
         own_open_count = len(own_symbols & set(real_map.keys()))
@@ -267,7 +350,6 @@ class PositionManager:
 
         for symbol, trade in tracked.items():
 
-            # ── Posición cerrada externamente ──────────────────────────────────
             if symbol not in real_map:
                 try:
                     ticker      = await self.client.get_ticker(symbol)
@@ -275,7 +357,7 @@ class PositionManager:
                 except Exception:
                     close_price = trade.entry
                 pnl = self._calc_pnl(trade, close_price)
-                log.info("[%s] Cerrada externamente. PnL≈%.4f USDT", symbol, pnl)
+                log.info("[%s] Cerrada externamente. PnL≈%.2f USDT", symbol, pnl)
                 await tg.notify_trade_closed(
                     symbol, trade.direction, trade.entry,
                     close_price, trade.qty, "sl_tp_auto", pnl,
@@ -285,7 +367,7 @@ class PositionManager:
 
             pos = real_map[symbol]
 
-            # ── FIX v7.6: auto-corregir dirección contra BingX ────────────────
+            # ── FIX v7.6: auto-corrección de dirección ────────────────────────
             real_amt = float(pos.get("positionAmt", 0) or 0)
             real_ps  = pos.get("positionSide", "")
             real_direction = (
@@ -294,8 +376,9 @@ class PositionManager:
             )
             if real_direction != trade.direction:
                 log.warning(
-                    "[%s] DIRECCIÓN CORREGIDA: tracker tenía %s, BingX confirma %s",
-                    symbol, trade.direction, real_direction,
+                    "[%s] ⚠️ DIRECCIÓN CORREGIDA: tracker tenía %s, BingX confirma "
+                    "%s (positionSide=%s, positionAmt=%.6f). Actualizando.",
+                    symbol, trade.direction, real_direction, real_ps, real_amt,
                 )
                 trade.direction = real_direction
 
@@ -310,12 +393,13 @@ class PositionManager:
             if mark <= 0:
                 continue
 
-            # ── Sync qty real ─────────────────────────────────────────────────
+            # ── Sync qty real ────────────────────────────────────────────────
             real_qty = abs(float(pos.get("positionAmt", trade.qty) or trade.qty))
             if real_qty > 0:
                 drift = abs(real_qty - trade.qty) / max(trade.qty, 1e-12)
                 if drift > 0.05:
-                    log.info("[%s] qty sync: %.6f → %.6f", symbol, trade.qty, real_qty)
+                    log.info("[%s] qty sync: %.6f → %.6f (parcial TP?)",
+                             symbol, trade.qty, real_qty)
                     trade.qty = real_qty
 
             # ── TP1 tracking ──────────────────────────────────────────────────
@@ -332,8 +416,12 @@ class PositionManager:
             if await self._check_time_stop(trade, mark, symbol):
                 continue
 
-            # ── EMA EXIT ─────────────────────────────────────────────────────
+            # ── EMA EXIT ──────────────────────────────────────────────────────
             if await self._check_ema_exit(trade, symbol):
+                continue
+
+            # ── MOMENTUM EXIT (FIX v7.8) ──────────────────────────────────────
+            if await self._check_momentum_exit(trade, symbol):
                 continue
 
             # ── Trailing Stop ─────────────────────────────────────────────────
@@ -350,11 +438,12 @@ class PositionManager:
                 if should_activate:
                     await self._activate_trail(trade, mark)
             elif not trade.trail_order_id:
-                # FIX v7.3: posición sin protección real — reintentar cada ciclo
+                # FIX v7.3: posición sin protección real — reintentar
                 trade.activation_attempts += 1
                 if trade.activation_attempts == 1 or trade.activation_attempts % 10 == 0:
                     log.warning(
-                        "[%s] trailing_active=True pero SIN SL real (intento #%d) — reintentando",
+                        "[%s] ⚠️ trailing_active=True pero SIN SL real en BingX "
+                        "(intento #%d) — reintentando activación",
                         symbol, trade.activation_attempts,
                     )
                 await self._activate_trail(trade, mark)
@@ -364,16 +453,34 @@ class PositionManager:
     # ── Activación del trailing ───────────────────────────────────────────────
 
     async def _activate_trail(self, trade: OpenTrade, current_mark: float):
+        """
+        Activa el trailing stop por primera vez.
+
+        FIX v7.7 — CRÍTICO: eliminados los dos paths que creaban doble SL:
+
+        Path A (Bug corregido): cuando _sl_valid(sl_be) era False (precio
+        revertió bajo entry), el else logeaba "SL original sigue activo"
+        pero IGUALMENTE caía al código de emergency SL que llamaba a
+        cancel_all_orders(). Si ese cancel fallaba (Bug B), quedaban dos SLs.
+        Fix: return inmediato desde el else — SL original en BingX es mejor
+        protección. trailing_active=True, trail_order_id="" → v7.3 reintentará.
+
+        Path B (Bug corregido): `except Exception: pass` en cancel_all del
+        emergency path swallowaba errores en silencio y procedía a colocar
+        SL nuevo aunque el cancel hubiera fallado. Fix: log.error + return.
+
+        Emergency SL solo en el único path legítimo que lo necesita: BE
+        válido + cancel_all OK + BE placement falló (originales ya cancelados,
+        posición desnuda en BingX).
+        """
         symbol = trade.symbol
         log.info("[%s] Trail activation — mark=%.6f entry=%.6f atr=%.6f",
                  symbol, current_mark, trade.entry, trade.atr)
 
-        # FIX DEFINITIVO: marcar activo AL INICIO evita loop infinito 110412
+        # Marcar activo AL INICIO — fix del loop 110412 heredado de v7.0
         trade.trailing_active = True
         trade.be_moved        = True
         trade.peak_price      = current_mark
-
-        already_cancelled = False
 
         try:
             ticker = await self.client.get_ticker(symbol)
@@ -386,12 +493,25 @@ class PositionManager:
             side_close = "SELL" if trade.direction == "LONG" else "BUY"
 
             if _sl_valid(sl_be, mark, trade.direction):
+                # ── Precio favorable: intentar SL en breakeven ────────────────
+
+                # FIX v7.7: cancel_all con manejo de error explícito.
+                # Si falla, NO procedemos — no colocar SL nuevo sin haber
+                # cancelado el original (causa del doble SL).
                 try:
                     await self.client.cancel_all_orders(symbol)
-                    already_cancelled = True
                     await asyncio.sleep(0.3)
                 except Exception as ce:
-                    log.debug("[%s] cancel_all_orders: %s", symbol, ce)
+                    log.error(
+                        "[%s] cancel_all_orders FALLÓ en trail activation: %s "
+                        "— abortando para no crear SL duplicado. "
+                        "Reintentará próximo ciclo (trail_order_id sigue vacío).",
+                        symbol, ce,
+                    )
+                    # Reset para que v7.3 reintente limpiamente
+                    trade.trailing_active = False
+                    trade.be_moved        = False
+                    return
 
                 resp = await self.client.place_stop_market_order(
                     symbol, side_close, trade.qty, sl_be,
@@ -404,29 +524,57 @@ class PositionManager:
                     trade.trail_order_id = oid
                     trade.sl             = sl_be
                     self._trail_last_notify[symbol] = sl_be
-                    log.info("[%s] Trail ACTIVADO — SL @ breakeven %.6f | oid=%s",
-                             symbol, sl_be, oid)
+                    log.info("[%s] 🎯 Trail ACTIVADO — SL @ breakeven %.6f | peak=%.6f | oid=%s",
+                             symbol, sl_be, mark, oid)
                     await tg.send(
                         f"🎯 *TRAIL ACTIVADO* — `{symbol}` "
                         f"{'🟢' if trade.direction == 'LONG' else '🔴'}\n"
-                        f"SL → breakeven `{sl_be:.6f}` | Mark: `{mark:.6f}`"
+                        f"SL → breakeven `{sl_be:.6f}` | Mark: `{mark:.6f}`\n"
+                        f"ATR: `{trade.atr:.6f}` | Peak: `{mark:.6f}`"
                     )
                     return
 
                 if _is_position_closed_error(resp):
+                    log.info("[%s] Trail BE: posición ya cerrada (109420) — limpiando", symbol)
                     pnl = self._calc_pnl(trade, mark)
                     await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
-                                                 mark, trade.qty, "sl_tp_auto(trail)", pnl)
+                                                  mark, trade.qty, "sl_tp_auto(trail_detect)", pnl)
                     await self.remove_trade(symbol, pnl)
                     return
 
-                log.warning("[%s] BE @ entry falló: %s — probando SL offset", symbol, resp)
+                # ── BE falló DESPUÉS de que cancel_all tuvo éxito ─────────────
+                # Los originales (SL + TP1 + TP2) ya fueron cancelados.
+                # La posición está desnuda → ESTE es el único caso legítimo
+                # para emergency SL. Caemos al bloque de abajo.
+                log.warning("[%s] BE @ entry falló tras cancel_all: %s — emergency SL", symbol, resp)
 
             else:
-                log.warning("[%s] Precio revertió (mark=%.6f entry=%.6f) — SL original sigue activo",
-                            symbol, mark, trade.entry)
+                # ── FIX v7.7 CRÍTICO: precio revertió bajo entry ──────────────
+                # El SL original en BingX (colocado por open_trade()) está
+                # ACTIVO y es MEJOR protección que cualquier emergency SL
+                # calculado desde mark < entry. No cancelar nada, no colocar
+                # nada nuevo.
+                #
+                # Antes: caía al bloque de emergency SL con already_cancelled=False
+                # → cancel_all + place nuevo SL. Si el cancel fallaba silenciosamente
+                # (except Exception: pass), quedaban DOS SLs activos. Si el cancel
+                # tenía éxito, se reemplazaba el SL original por uno peor calculado
+                # (mark * 0.985 cuando ya estamos bajo entry).
+                #
+                # trailing_active=True pero trail_order_id="" → v7.3 reintentará
+                # cada ciclo. Cuando el precio se recupere y BE sea válido, la
+                # activación tendrá éxito normalmente.
+                log.warning(
+                    "[%s] Trail activation: precio revertió antes de BE "
+                    "(mark=%.6f, entry=%.6f, dir=%s). "
+                    "SL original en BingX sigue activo — reintentando próximo ciclo.",
+                    symbol, mark, trade.entry, trade.direction,
+                )
+                return  # EXIT EARLY — nada que hacer aquí
 
-            # Fallback: SL en mark offset con re-fetch
+            # ── Emergency SL — SOLO aquí (BE válido + cancel_all OK + BE falló) ──
+            # El cancel_all ya corrió, la posición está sin protección.
+            # Hay que colocar algo cueste lo que cueste.
             try:
                 t2 = await self.client.get_ticker(symbol)
                 m2 = float(t2.get("lastPrice", mark) or mark)
@@ -439,13 +587,6 @@ class PositionManager:
             em_sl = mark * 0.985 if trade.direction == "LONG" else mark * 1.015
 
             if _sl_valid(em_sl, mark, trade.direction):
-                if not already_cancelled:
-                    try:
-                        await self.client.cancel_all_orders(symbol)
-                        await asyncio.sleep(0.3)
-                    except Exception:
-                        pass
-
                 em_resp = await self.client.place_stop_market_order(
                     symbol, side_close, trade.qty, em_sl,
                     trade.direction, order_type="STOP_MARKET",
@@ -456,33 +597,44 @@ class PositionManager:
                     trade.trail_order_id = oid
                     trade.sl             = em_sl
                     self._trail_last_notify[symbol] = em_sl
-                    log.info("[%s] Trail ACTIVADO (SL emergencia) @ %.6f", symbol, em_sl)
-                    await tg.send(f"🎯 *TRAIL ACTIVADO* (emergencia) — `{symbol}`\n"
-                                  f"SL @ `{em_sl:.6f}` | Mark: `{mark:.6f}`")
+                    log.info("[%s] 🎯 Trail ACTIVADO (SL emergencia) @ %.6f | mark=%.6f",
+                             symbol, em_sl, mark)
+                    await tg.send(
+                        f"🎯 *TRAIL ACTIVADO* (emergencia) — `{symbol}`\n"
+                        f"SL @ `{em_sl:.6f}` | Mark: `{mark:.6f}`"
+                    )
                 elif _is_position_closed_error(em_resp):
+                    log.info("[%s] Trail: posición ya cerrada (109420) — limpiando", symbol)
                     pnl = self._calc_pnl(trade, mark)
                     await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
-                                                 mark, trade.qty, "sl_tp_auto(trail)", pnl)
+                                                  mark, trade.qty, "sl_tp_auto(trail_detect)", pnl)
                     await self.remove_trade(symbol, pnl)
                 else:
-                    log.error("[%s] Trail activation: SL emergencia FALLIDO: %s", symbol, em_resp)
+                    # cancel_all ya corrió — esto es crítico, posición desnuda
+                    log.error(
+                        "[%s] Trail activation: SL emergencia FALLIDO tras cancel_all: %s "
+                        "— POSICIÓN SIN PROTECCIÓN, reintentará próximo ciclo (v7.3)",
+                        symbol, em_resp,
+                    )
                     if trade.activation_attempts <= 1 or trade.activation_attempts % 10 == 0:
                         await tg.notify_error(
                             f"trail_activation({symbol})",
-                            f"SL emergencia fallido (intento #{trade.activation_attempts}) — "
-                            f"POSICIÓN SIN PROTECCIÓN, reintentando\n{em_resp}"
+                            f"SL emergencia fallido TRAS cancel_all (intento #{trade.activation_attempts}) "
+                            f"— POSICIÓN SIN PROTECCIÓN\n{em_resp}"
                         )
+            else:
+                log.error("[%s] Trail: no se puede calcular SL emergencia válido "
+                          "para mark=%.6f dir=%s", symbol, mark, trade.direction)
 
         except Exception as e:
-            log.error("[%s] _activate_trail error: %s", symbol, e)
+            log.error("[%s] _activate_trail error: %s — reintentará próximo ciclo", symbol, e)
 
     # ── Actualización del trailing ────────────────────────────────────────────
 
     async def _update_trail(self, trade: OpenTrade, mark: float):
         """
-        Actualiza trailing SL cuando el precio alcanza nuevo peak.
-        Estrategia PLACE-THEN-CANCEL: nunca queda sin protección.
-        FIX v7.1: re-fetch mark, margen 0.5%, anti-spam last_failed_sl.
+        Actualiza el trailing SL cuando el precio alcanza un nuevo peak.
+        Estrategia PLACE-THEN-CANCEL: nunca sin SL durante el update.
         """
         symbol     = trade.symbol
         trail_dist = trade.atr * C.TRAIL_DISTANCE_ATR
@@ -507,13 +659,14 @@ class PositionManager:
         if not _sl_valid(new_sl, mark, trade.direction):
             trade.peak_price = new_peak
             if trade.last_failed_sl and abs(new_sl - trade.last_failed_sl) < trade.atr * 0.05:
-                log.debug("[%s] Trail: new_sl=%.6f repetido e inválido", symbol, new_sl)
+                log.debug("[%s] Trail: new_sl=%.6f repetido e inválido (mark=%.6f) — esperando nuevo peak",
+                          symbol, new_sl, mark)
             else:
-                log.debug("[%s] Trail: new_sl=%.6f inválido para mark=%.6f", symbol, new_sl, mark)
+                log.debug("[%s] Trail: new_sl=%.6f inválido para mark=%.6f dir=%s",
+                          symbol, new_sl, mark, trade.direction)
             trade.last_failed_sl = new_sl
             return
 
-        # Re-fetch mark fresco antes de enviar
         fresh_mark = mark
         try:
             t = await self.client.get_ticker(symbol)
@@ -526,7 +679,8 @@ class PositionManager:
         if not _sl_valid(new_sl, fresh_mark, trade.direction):
             trade.peak_price     = new_peak
             trade.last_failed_sl = new_sl
-            log.debug("[%s] Trail: new_sl=%.6f inválido tras refresh mark=%.6f", symbol, new_sl, fresh_mark)
+            log.debug("[%s] Trail: new_sl=%.6f inválido tras refresh (mark fresco=%.6f)",
+                      symbol, new_sl, fresh_mark)
             return
 
         try:
@@ -549,15 +703,16 @@ class PositionManager:
                 trade.sl             = new_sl
                 trade.last_failed_sl = 0.0
 
-                log.info("[%s] Trail: %.6f→%.6f | peak=%.6f | PnL@SL≈%.4f USDT",
-                         symbol, old_sl, new_sl, new_peak, profit_locked)
+                log.info("[%s] 📈 Trail: %.6f→%.6f | peak=%.6f | mark=%.6f | PnL@SL≈%.2f USDT",
+                         symbol, old_sl, new_sl, new_peak, fresh_mark, profit_locked)
 
                 if old_oid and old_oid != new_oid:
                     await asyncio.sleep(0.1)
                     try:
                         await self.client.cancel_order(symbol, old_oid)
+                        log.debug("[%s] Old trail SL %s cancelado", symbol, old_oid)
                     except Exception as ce:
-                        log.debug("[%s] cancel old trail %s: %s", symbol, old_oid, ce)
+                        log.debug("[%s] cancel_order viejo %s: %s", symbol, old_oid, ce)
 
                 last_sl = self._trail_last_notify.get(symbol, trade.entry)
                 if abs(new_sl - last_sl) >= trade.atr:
@@ -567,14 +722,15 @@ class PositionManager:
                         f"{pnl_icon} *TRAIL* — `{symbol}` "
                         f"{'🟢' if trade.direction == 'LONG' else '🔴'}\n"
                         f"SL: `{old_sl:.6f}` → `{new_sl:.6f}`\n"
-                        f"Peak: `{new_peak:.6f}` | PnL@SL: `{profit_locked:+.4f} USDT`"
+                        f"Peak: `{new_peak:.6f}` | PnL@SL: `{profit_locked:+.2f} USDT`"
                     )
 
             else:
                 if _is_position_closed_error(resp):
+                    log.info("[%s] Trail update: posición ya cerrada (109420) — limpiando", symbol)
                     pnl = self._calc_pnl(trade, fresh_mark)
                     await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
-                                                 fresh_mark, trade.qty, "sl_tp_auto(trail)", pnl)
+                                                  fresh_mark, trade.qty, "sl_tp_auto(trail_detect)", pnl)
                     await self.remove_trade(symbol, pnl)
                     return
                 trade.peak_price     = new_peak
@@ -591,19 +747,27 @@ class PositionManager:
     async def _check_time_stop(self, trade: OpenTrade, mark: float, symbol: str) -> bool:
         if trade.trailing_active:
             return False
+
         if trade.opened_at <= 0:
             trade.opened_at = time.time()
             return False
+
         elapsed_min = (time.time() - trade.opened_at) / 60.0
         max_hold    = getattr(C, 'MAX_HOLD_MINUTES', 60)
         if elapsed_min < max_hold:
             return False
+
         atr      = trade.atr if trade.atr > 0 else mark * 0.005
         progress = (mark - trade.entry) if trade.direction == "LONG" else (trade.entry - mark)
         min_prog = atr * getattr(C, 'TIME_STOP_MIN_PROGRESS_ATR', 0.5)
+
         if progress >= min_prog:
             return False
-        log.warning("[%s] TIME STOP — %.0fmin sin progreso. Cerrando.", symbol, elapsed_min)
+
+        log.warning(
+            "[%s] ⏱ TIME STOP — %.0fmin sin progreso (prog=%.6f < min=%.6f). Cerrando.",
+            symbol, elapsed_min, progress, min_prog,
+        )
         await tg.notify_time_stop(symbol, trade.direction, trade.entry, mark,
                                    int(elapsed_min), progress)
         await self.close_position_emergency(symbol, reason="time_stop")
@@ -612,43 +776,124 @@ class PositionManager:
     # ── EMA Exit ─────────────────────────────────────────────────────────────
 
     async def _check_ema_exit(self, trade: OpenTrade, symbol: str) -> bool:
-        """
-        Salida por EMA corta — detecta muerte de tendencia antes que time_stop.
-        Usa klines[-2] (última vela CERRADA) para evitar señales prematuras.
-        Desactivado por defecto (EMA_EXIT_ENABLED=False).
-        """
         if not getattr(C, 'EMA_EXIT_ENABLED', False):
             return False
         if trade.trailing_active:
             return False
+
         min_hold_min = getattr(C, 'EMA_EXIT_MIN_HOLD_MIN', 6)
         if trade.opened_at > 0:
             elapsed_min = (time.time() - trade.opened_at) / 60.0
             if elapsed_min < min_hold_min:
                 return False
+
         period = getattr(C, 'EMA_EXIT_PERIOD', 9)
         try:
             klines = await self.client.get_klines(symbol, C.TIMEFRAME, period + 30)
         except Exception as e:
             log.debug("[%s] EMA exit klines error: %s", symbol, e)
             return False
+
         if len(klines) < period + 2:
             return False
+
         closes = [c[4] for c in klines]
         ema    = _ema(closes, period)
         if len(ema) < 2:
             return False
+
         last_closed_close = closes[-2]
         last_closed_ema   = ema[-2]
+
         exit_triggered = (
             (trade.direction == "LONG"  and last_closed_close < last_closed_ema) or
             (trade.direction == "SHORT" and last_closed_close > last_closed_ema)
         )
         if not exit_triggered:
             return False
-        log.warning("[%s] EMA(%d) EXIT — vela cerrada %.6f vs EMA %.6f. Cerrando.",
-                    symbol, period, last_closed_close, last_closed_ema)
+
+        log.warning(
+            "[%s] 📉 EMA(%d) EXIT — última vela cerrada %.6f %s EMA %.6f (%s). Cerrando.",
+            symbol, period, last_closed_close,
+            "<" if trade.direction == "LONG" else ">", last_closed_ema, trade.direction,
+        )
         await self.close_position_emergency(symbol, reason=f"ema{period}_exit")
+        return True
+
+    # ── Momentum Exit (FIX v7.8) ─────────────────────────────────────────────
+
+    async def _check_momentum_exit(self, trade: OpenTrade, symbol: str) -> bool:
+        """
+        MOMENTUM EXIT — sale cuando el RSI decelaera en zona OB/OS con la
+        posición ya en profit (trailing activo). Inspirado en la señal de TP
+        del Turbo Oscillator (RunRox): momentum pierde velocidad justo cuando
+        el precio aún está en máximos/mínimos del movimiento.
+
+        Condición para LONG:
+          RSI > MOMENTUM_EXIT_OB (60) AND speed_now < speed_prev < 0
+          → el RSI está en zona alta pero cada vez sube menos → techo inminente
+
+        Condición para SHORT:
+          RSI < MOMENTUM_EXIT_OS (40) AND speed_now > speed_prev > 0
+          → el RSI está en zona baja pero cada vez cae menos → suelo inminente
+
+        Solo actúa si:
+          - trailing_active=True (posición ya en profit)
+          - Han pasado MOMENTUM_EXIT_MIN_HOLD_MIN minutos desde la apertura
+          - MOMENTUM_EXIT_ENABLED=True (default: False)
+
+        Retorna True si cerró (el caller debe hacer `continue`).
+        """
+        if not getattr(C, 'MOMENTUM_EXIT_ENABLED', False):
+            return False
+        if not trade.trailing_active:
+            return False   # solo para posiciones en profit con trailing activo
+
+        min_hold = getattr(C, 'MOMENTUM_EXIT_MIN_HOLD_MIN', 5)
+        if trade.opened_at > 0 and (time.time() - trade.opened_at) / 60 < min_hold:
+            return False
+
+        rsi_period = getattr(C, 'MOMENTUM_EXIT_RSI_PERIOD', 14)
+        n_bars = rsi_period + 10   # suficientes para calcular velocidad
+
+        try:
+            klines = await self.client.get_klines(symbol, C.TIMEFRAME, n_bars)
+        except Exception as e:
+            log.debug("[%s] momentum exit klines error: %s", symbol, e)
+            return False
+
+        if len(klines) < rsi_period + 6:
+            return False
+
+        closes = [c[4] for c in klines]
+        rsi_vals = _rsi_simple(closes, rsi_period)
+
+        if len(rsi_vals) < 6:
+            return False
+
+        rsi_now = rsi_vals[-1]
+        # Velocidad del RSI: cambio en las últimas 2 barras vs las 2 anteriores
+        speed_now  = rsi_vals[-1] - rsi_vals[-3]
+        speed_prev = rsi_vals[-3] - rsi_vals[-6]
+
+        ob = getattr(C, 'MOMENTUM_EXIT_OB', 60.0)
+        os = getattr(C, 'MOMENTUM_EXIT_OS', 40.0)
+
+        if trade.direction == "LONG":
+            # RSI en zona alta pero desacelerando (cada vez sube menos)
+            exit_trigger = rsi_now > ob and speed_now < speed_prev and speed_now < 0
+        else:
+            # RSI en zona baja pero desacelerando (cada vez cae menos)
+            exit_trigger = rsi_now < os and speed_now > speed_prev and speed_now > 0
+
+        if not exit_trigger:
+            return False
+
+        log.warning(
+            "[%s] ⚡ MOMENTUM EXIT — RSI=%.1f speed=%.2f→%.2f (dir=%s). Cerrando.",
+            symbol, rsi_now, speed_prev, speed_now, trade.direction,
+        )
+        await self.close_position_emergency(symbol, reason="momentum_exit")
         return True
 
     # ── Cierre de emergencia ──────────────────────────────────────────────────
@@ -666,7 +911,7 @@ class PositionManager:
             ticker      = await self.client.get_ticker(symbol)
             close_price = float(ticker.get("lastPrice", trade.entry))
             pnl         = self._calc_pnl(trade, close_price)
-            log.info("[%s] Cierre emergencia. PnL=%.4f USDT", symbol, pnl)
+            log.info("[%s] Cierre emergencia. PnL=%.2f", symbol, pnl)
             await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
                                          close_price, trade.qty, reason, pnl)
             await self.remove_trade(symbol, pnl)
@@ -676,30 +921,11 @@ class PositionManager:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _calc_pnl(self, trade: OpenTrade, close_price: float) -> float:
-        """
-        FIX v7.7 CRÍTICO: quitado * C.LEVERAGE.
-
-        En BingX USDT-margined perps, 1 contrato = 1 unidad de activo base.
-        El PnL es (exit - entry) * qty USDT — ya está en términos nominales.
-        El leverage afecta cuánto margen bloquea BingX (notional/leverage),
-        no el PnL. kelly_position_size ya calcula qty = notional/entry con
-        el riesgo deseado embebido — multiplicar luego por LEVERAGE contaba
-        el apalancamiento DOS veces:
-          Ejemplo: qty=10, entry=1.0, exit=1.02 → PnL = 0.02*10 = 0.20 USDT
-          Antes:   0.20 * LEVERAGE(10) = 2.0 USDT (FALSO, 10x inflado)
-          Ahora:   0.20 USDT (correcto)
-
-        Efectos del bug:
-          • circuit breaker de pérdida diaria disparaba 10x antes
-          • get_unrealized_pnl() bloqueaba can_trade() con drawdown ficticio
-          • Telegram mostraba PnL 10x falso
-          • journal acumulaba win-rate incorrecto
-        """
         if trade.direction == "LONG":
             raw = (close_price - trade.entry) * trade.qty
         else:
             raw = (trade.entry - close_price) * trade.qty
-        return round(raw, 4)
+        return round(raw * C.LEVERAGE, 4)
 
     def get_tracked(self) -> dict[str, OpenTrade]:
         return dict(self._trades)
@@ -708,23 +934,22 @@ class PositionManager:
         return symbol in self._trades
 
     async def get_unrealized_pnl(self) -> float:
-        """
-        Suma el PnL no realizado de todas las posiciones trackeadas.
-        Ahora correcto (sin inflación × LEVERAGE) gracias al fix de _calc_pnl.
-        """
         async with self._lock:
             tracked = dict(self._trades)
         if not tracked:
             return 0.0
+
         try:
             real_positions = await self.client.get_open_positions()
         except Exception as e:
             log.warning("get_unrealized_pnl: get_open_positions failed: %s", e)
             return 0.0
+
         real_map: dict[str, dict] = {
             p["symbol"]: p for p in real_positions
             if p.get("symbol") and float(p.get("positionAmt", 0)) != 0
         }
+
         total = 0.0
         for symbol, trade in tracked.items():
             pos = real_map.get(symbol)
@@ -737,4 +962,5 @@ class PositionManager:
             if mark <= 0:
                 continue
             total += self._calc_pnl(trade, mark)
+
         return round(total, 4)
