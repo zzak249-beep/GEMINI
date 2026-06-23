@@ -531,6 +531,7 @@ async def _process_symbol(
     dir_token        = None
     btc_corr         = 0.0
     btc_reserved     = False
+    btc_token        = None
 
     try:
         sym_ok, sym_reason = risk.symbol_allowed(symbol)
@@ -560,7 +561,7 @@ async def _process_symbol(
             btc_guard.max_same   = getattr(C, 'BTC_CORR_MAX_SAME', 3)
             btc_reserved = abs(btc_corr) >= btc_guard.threshold
             if btc_reserved:
-                btc_ok, btc_reason = btc_guard.allowed(sig.direction, btc_corr)
+                btc_ok, btc_reason, btc_token = btc_guard.allowed(sig.direction, btc_corr)
                 if not btc_ok:
                     log.info("[%s] 🔗 %s", symbol, btc_reason)
                     diag["counts"]["btc_correlation_blocked"] += 1
@@ -664,7 +665,7 @@ async def _process_symbol(
             if dir_reserved:
                 risk.release_direction_reservation(sig.direction, dir_token)
             if btc_reserved:
-                btc_guard.release(sig.direction, btc_corr)
+                btc_guard.release(sig.direction, btc_corr, btc_token)
 
 
 def _new_diag() -> dict:
