@@ -75,6 +75,13 @@ from btc_correlation import compute_correlation, btc_guard
 from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
 from price_action_framework import price_action_filter
 from trend_magic_rmi import trend_magic_rmi_filter
+
+# v8.1: Market Structure ChoCh — import opcional para no crashear si falta
+try:
+    from market_structure import ms_filter as _ms_filter
+    _MS_AVAILABLE = True
+except ImportError:
+    _MS_AVAILABLE = False
 from ws_market_data import ws_cache
 import telegram_client as tg
 
@@ -480,6 +487,25 @@ async def _process_symbol(
     # try/finally que libera la reserva. Solo importa si de verdad se va a
     # abrir una posición real, así que solo se calcula y reserva en LIVE.
 
+    # ── 5f. Market Structure ChoCh (v8.1) ────────────────────────────────────
+    # Usa k4h ya fetcheadas — sin coste de API extra.
+    # ChoCh ↑: precio > pivot high 4H → estructura alcista (boost LONG +4)
+    # ChoCh ↓: precio < pivot low  4H → estructura bajista (boost SHORT +4)
+    # Señal contra la estructura        → penalización -4
+    # Complementa slope filter (EMAs) con pivots estructurales (más rápido).
+    # Activar con MS_ENABLED=true en Railway (default false = validar primero).
+    if getattr(C, 'MS_ENABLED', False) and _MS_AVAILABLE:
+        ms_boost, ms_reason, _ = _ms_filter(
+            k4h, sig.direction,
+            ms_len=getattr(C, 'MS_LEN', 10),
+        )
+        if ms_boost != 0:
+            sig.score = max(0.0, min(sig.score + ms_boost, 100.0))
+            sig.tier  = score_to_tier(sig.score)
+            filter_tags["market_structure"] = ms_reason
+            diag["counts"][f"ms_{ms_boost:+.0f}"] += 1
+            log.debug("[%s] 📐 MS ChoCh: %s → score=%.1f", symbol, ms_reason, sig.score)
+
     # ── 6b. Auto-blacklist por símbolo + Streak Breaker global ───────────────
     # Aprendido de pérdidas reales, no requiere mantenimiento manual.
     if journal:
@@ -496,8 +522,45 @@ async def _process_symbol(
     # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset
+
+    # ── NUEVO: Penalización counter-trend ─────────────────────────────────
+    # Cuando el HTF no está completamente alineado con la señal (solo 2/3
+    # timeframes vs 3/3), la señal va contra el flujo dominante y necesita
+    # más evidencia para justificarse. Cada timeframe que falta suma una
+    # penalización configurable al umbral mínimo.
+    # Caso real evitado: LONG en mercado 4h bajista con solo 15m/1h alcistas
+    # → demasiado ruido contratendencia → loss. Con esta regla, ese LONG
+    # habría necesitado score >= MIN_SCORE + COUNTER_TREND_PENALTY para pasar.
+    htf_score_val = getattr(sig, 'htf_score', 0.5)
+    # Reconstruir htf_aligned a partir del sig.htf_score (0-1 escalado):
+    # Usamos una proxy simple: si htf_score < 0.4 es mayoritariamente
+    # contra-tendencia, si > 0.6 es mayoritariamente a favor.
+    _counter_penalty = getattr(C, 'COUNTER_TREND_PENALTY', 8.0)
+    _htf_s = float(sig.htf_score) if hasattr(sig, 'htf_score') else 0.5
+    if sig.direction == "LONG" and _htf_s < 0.45:
+        effective_min += _counter_penalty
+        diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
+        log.debug("[%s] Penalización counter-trend LONG: htf=%.2f → min_score=%.1f",
+                  symbol, _htf_s, effective_min)
+    elif sig.direction == "SHORT" and _htf_s > 0.55:
+        effective_min += _counter_penalty
+        diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
+        log.debug("[%s] Penalización counter-trend SHORT: htf=%.2f → min_score=%.1f",
+                  symbol, _htf_s, effective_min)
+
     if sig.score < effective_min:
         diag["counts"]["score_bajo"] += 1
+        return None
+
+    # ── NUEVO: Convicción mínima ──────────────────────────────────────────
+    # El campo conviction (0-20) de indicators.py cuenta evidencias
+    # independientes a favor de la señal. Con MIN_CONVICTION=5 filtramos
+    # señales donde solo 1-4 indicadores confirman, reduciendo entradas
+    # en señales "técnicamente válidas" pero sin confluencia real.
+    _min_conviction = getattr(C, 'MIN_CONVICTION', 5)
+    if hasattr(sig, 'conviction') and sig.conviction < _min_conviction:
+        log.debug("[%s] Convicción insuficiente: %d/%d", symbol, sig.conviction, _min_conviction)
+        diag["counts"]["conviction_bajo"] += 1
         return None
 
     if not risk.tier_ok(sig.tier):
