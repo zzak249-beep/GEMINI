@@ -227,103 +227,129 @@ def score_stc_asymmetry(klines: list, direction: str = "LONG") -> float:
 
 
 # ── Funciones requeridas por scanner.py ──────────────────────────────────────
-# scanner.py hace: from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
-# Estas funciones deben existir con exactamente estos nombres.
+# scanner.py hace:
+#   from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
+# Y las llama así:
+#   boost, reason, block = stc_asymmetry_filter(k1m, direction,
+#       stc_length=10, stc_fast=23, stc_slow=50, stc_factor=0.5,
+#       stc_oversold=25, stc_overbought=75, asym_window=20, ...)
+#
+# La interfaz DEBE devolver tupla (float, str, bool) y aceptar todos esos kwargs.
+# Los params de STC se usan (stc_length, stc_fast, stc_slow, stc_factor).
+# Los params de asimetría de precio (asym_*) son del módulo original y se ignoran
+# en esta implementación — usamos el STC 80-27-50 como filtro de régimen.
 
-def stc_asymmetry_filter(klines: list, direction: str = "LONG") -> dict:
+def stc_asymmetry_filter(
+    klines:              list,
+    direction:           str   = "LONG",
+    # Params STC — usados para calcular el STC
+    stc_length:          int   = 80,
+    stc_fast:            int   = 27,
+    stc_slow:            int   = 50,
+    stc_factor:          float = 0.5,
+    stc_oversold:        float = 25.0,
+    stc_overbought:      float = 75.0,
+    # Params de asimetría — ignorados, compat con scanner.py v7.7
+    asym_window:         int   = 20,
+    asym_veto_threshold: float = 1.5,
+    asym_boost_per_x:    float = 3.0,
+    asym_boost_max:      float = 12.0,
+    **kwargs,
+) -> tuple:
     """
-    Filtro STC asimétrico para scanner.py.
+    Filtro STC asimétrico compatible con scanner.py v7.7.
 
-    Interfaz compatible con la versión anterior:
-      result = stc_asymmetry_filter(klines, direction)
-      score  += result["score_boost"]
-      if result["blocks"]: return None, "stc_block"
+    scanner.py espera: (boost: float, reason: str, block: bool)
 
-    Cambio vs v1.x: usa params 80-27-50 en vez de 10-12-26.
-    El STC ahora actúa como filtro de régimen de 4H, no como oscilador rápido.
+    Params de STC: usa los que pasa el scanner (stc_length, stc_fast, stc_slow)
+    o los defaults 80-27-50 si no se pasan explícitamente.
+
+    Los params asym_* del scanner original se ignoran — esta implementación
+    usa el STC como filtro de régimen en vez de la asimetría de precio.
+
+    Thresholds: stc_oversold/stc_overbought del scanner se usan como umbrales
+    BEAR/BULL (equivalen a 25/75 por defecto, que coinciden con los nuestros).
     """
-    sig = get_stc_signal(klines, direction)
-    return {
-        "score_boost":  sig["score_boost"],
-        "blocks":       sig["blocks_direction"],
-        "regime":       sig["regime"],
-        "stc":          sig["stc"],
-        "label":        sig["label"],
-        # Compat con campos que scanner.py pueda leer directamente
-        "bull":         sig["regime"] == "BULL",
-        "bear":         sig["regime"] == "BEAR",
-        "neutral":      sig["regime"] == "NEUTRAL",
-    }
+    sig = get_stc_signal(
+        klines, direction,
+        length=stc_length,
+        fast=stc_fast,
+        slow=stc_slow,
+        factor=stc_factor,
+        bull_thr=stc_overbought,
+        bear_thr=stc_oversold,
+    )
+    boost  = sig["score_boost"]
+    block  = sig["blocks_direction"]
+    reason = sig["label"]
+    return boost, reason, block
 
 
-def stc_volume_slope_filter(klines: list, direction: str = "LONG",
-                             vol_ma_period: int = 20) -> dict:
+def stc_volume_slope_filter(
+    klines:           list,
+    direction:        str   = "LONG",
+    # Slope params — del scanner.py
+    slope_adj:        float = 0.0,
+    slope_block:      bool  = False,
+    # Params STC
+    stc_length:       int   = 80,
+    stc_fast:         int   = 27,
+    stc_slow:         int   = 50,
+    stc_factor:       float = 0.5,
+    stc_oversold:     float = 25.0,
+    stc_overbought:   float = 75.0,
+    # Params de volumen
+    vol_window:       int   = 20,
+    vol_recent_n:     int   = 3,
+    vol_min_ratio:    float = 1.3,
+    vol_boost_max:    float = 8.0,
+    # Params de slope boost
+    slope_boost_mult: float = 0.5,
+    **kwargs,
+) -> tuple:
     """
-    Filtro combinado STC + confirmación de volumen para scanner.py.
+    Filtro STC + volumen compatible con scanner.py v7.7.
 
-    Añade un boost adicional cuando el volumen de la última vela está
-    por encima de su media — confirma que el movimiento tiene liquidez real.
-    El STC sigue siendo el filtro principal de régimen.
+    scanner.py espera: (boost: float, reason: str, block: bool)
 
-    Interfaz compatible:
-      result = stc_volume_slope_filter(klines, direction)
-      score  += result["score_boost"]
-      if result["blocks"]: return None, "stc_vol_block"
+    Combina el STC de régimen con confirmación de volumen y el slope_adj
+    ya calculado por multi_tf_slope_alignment.
     """
-    if not klines:
-        return {"score_boost": 0.0, "blocks": False, "label": "no_data"}
+    # Si el slope ya bloquea, no aportar nada adicional
+    if slope_block:
+        return 0.0, "slope_block_heredado", False
 
-    # Base: STC asimétrico
-    base = stc_asymmetry_filter(klines, direction)
-    boost = base["score_boost"]
+    # Base: STC de régimen
+    base_boost, base_reason, base_block = stc_asymmetry_filter(
+        klines, direction,
+        stc_length=stc_length, stc_fast=stc_fast, stc_slow=stc_slow,
+        stc_factor=stc_factor, stc_oversold=stc_oversold, stc_overbought=stc_overbought,
+    )
 
-    # Confirmación de volumen (sin importar librerías)
+    if base_block:
+        return 0.0, base_reason, True
+
+    boost = base_boost
+
+    # Confirmación de volumen
     try:
-        volumes = [c[5] for c in klines if len(c) > 5 and c[5] > 0]
-        if len(volumes) >= vol_ma_period + 1:
-            vol_now = volumes[-1]
-            vol_ma  = sum(volumes[-vol_ma_period - 1:-1]) / vol_ma_period
-            if vol_ma > 0:
-                vol_ratio = vol_now / vol_ma
-                if vol_ratio > 1.5:
-                    # Volumen alto — confirma momentum
-                    vol_boost = 3.0 if not base["blocks"] else 0.0
-                    boost += vol_boost
-                elif vol_ratio < 0.7:
-                    # Volumen bajo — señal débil
+        vols = [k[5] for k in klines if len(k) > 5 and k[5] > 0]
+        if len(vols) >= vol_window + vol_recent_n:
+            recent_vol = sum(vols[-vol_recent_n:]) / vol_recent_n
+            avg_vol    = sum(vols[-vol_window - vol_recent_n:-vol_recent_n]) / vol_window
+            if avg_vol > 0:
+                ratio = recent_vol / avg_vol
+                if ratio >= vol_min_ratio:
+                    vol_boost = min((ratio - 1.0) * 4.0, vol_boost_max)
+                    boost = min(boost + vol_boost, 100.0)
+                elif ratio < 0.7:
                     boost -= 2.0
     except Exception:
-        pass   # si falla el cálculo de volumen, usar solo el STC
+        pass
 
-    label = f"{base['label']} vol_adj={boost - base['score_boost']:+.0f}"
+    # Slope alignment bonus
+    if slope_adj > 0:
+        boost = min(boost + slope_adj * slope_boost_mult, 100.0)
 
-    return {
-        "score_boost": round(boost, 1),
-        "blocks":      base["blocks"],
-        "regime":      base["regime"],
-        "stc":         base["stc"],
-        "label":       label,
-        "bull":        base["bull"],
-        "bear":        base["bear"],
-        "neutral":     base["neutral"],
-    }
-
-
-# ── Test rápido ───────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    import math
-    # Generar una serie sintética con tendencia alcista
-    closes = [100 + i * 0.5 + math.sin(i / 10) * 2 for i in range(200)]
-    fake_klines = [[i, c - 0.5, c + 1, c - 1, c, 1000] for i, c in enumerate(closes)]
-    result = get_stc_signal(fake_klines, direction="LONG")
-    print("Test LONG en tendencia alcista:")
-    for k, v in result.items():
-        print(f"  {k}: {v}")
-
-    closes_down = [200 - i * 0.5 + math.sin(i / 10) * 2 for i in range(200)]
-    fake_klines_down = [[i, c - 0.5, c + 1, c - 1, c, 1000] for i, c in enumerate(closes_down)]
-    result2 = get_stc_signal(fake_klines_down, direction="LONG")
-    print("\nTest LONG en tendencia bajista:")
-    for k, v in result2.items():
-        print(f"  {k}: {v}")
+    reason = f"{base_reason} vol+slope_adj={slope_adj:+.0f}"
+    return round(boost, 1), reason, False
