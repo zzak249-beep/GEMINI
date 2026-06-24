@@ -609,6 +609,16 @@ class PositionManager:
                     await tg.notify_trade_closed(symbol, trade.direction, trade.entry,
                                                   mark, trade.qty, "sl_tp_auto(trail_detect)", pnl)
                     await self.remove_trade(symbol, pnl)
+                elif self.client.is_api_disabled_error(em_resp):
+                    # Error 109400: BingX deshabilita órdenes durante volatilidad extrema.
+                    # Es TEMPORAL (1-5 min). No es un bug — el bot reintentará en el
+                    # próximo ciclo vía trail_order_id="". No enviar alerta Telegram.
+                    log.warning(
+                        "[%s] Trail activation: BingX API DESHABILITADA (109400) — "
+                        "volatilidad extrema. Reintentará en próximo ciclo (FIX v7.3). "
+                        "Posición temporalmente sin SL pero en profit (mark=%.6f entry=%.6f).",
+                        symbol, mark, trade.entry,
+                    )
                 else:
                     # cancel_all ya corrió — esto es crítico, posición desnuda
                     log.error(
@@ -706,13 +716,51 @@ class PositionManager:
                 log.info("[%s] 📈 Trail: %.6f→%.6f | peak=%.6f | mark=%.6f | PnL@SL≈%.2f USDT",
                          symbol, old_sl, new_sl, new_peak, fresh_mark, profit_locked)
 
+                # FIX v7.9 CANCEL RETRY: el cancel del SL viejo era best-effort
+                # con un solo intento silencioso. Si falla repetidamente, cada
+                # update del trail deja una orden huérfana — en producción se
+                # acumularon 70 órdenes activas para 9 posiciones (10-11 por par).
+                # Fix: 2 reintentos con backoff. Si los dos fallan: cancel_all_orders
+                # (nuclear pero necesario — cancela todo el par y el nuevo SL
+                # se recolocará en el próximo ciclo por el mecanismo v7.3).
                 if old_oid and old_oid != new_oid:
-                    await asyncio.sleep(0.1)
-                    try:
-                        await self.client.cancel_order(symbol, old_oid)
-                        log.debug("[%s] Old trail SL %s cancelado", symbol, old_oid)
-                    except Exception as ce:
-                        log.debug("[%s] cancel_order viejo %s: %s", symbol, old_oid, ce)
+                    await asyncio.sleep(0.15)
+                    cancelled = False
+                    for attempt in range(2):
+                        try:
+                            cr = await self.client.cancel_order(symbol, old_oid)
+                            if isinstance(cr, dict) and cr.get("code", -1) == 0:
+                                log.debug("[%s] Old trail SL %s cancelado (intento %d)",
+                                          symbol, old_oid, attempt + 1)
+                                cancelled = True
+                                break
+                            log.debug("[%s] cancel_order intento %d falló: %s",
+                                      symbol, attempt + 1, cr)
+                        except Exception as ce:
+                            log.debug("[%s] cancel_order intento %d excepción: %s",
+                                      symbol, attempt + 1, ce)
+                        if attempt == 0:
+                            await asyncio.sleep(0.5)
+
+                    if not cancelled:
+                        # Fallback: cancelar TODAS las órdenes del par y marcar
+                        # trail_order_id vacío para que v7.3 recoloque en el
+                        # próximo ciclo. Es seguro: el nuevo SL ya está activo
+                        # en BingX (se colocó primero), el cancel_all solo borra
+                        # órdenes viejas acumuladas.
+                        log.warning(
+                            "[%s] ⚠️ cancel_order viejo FALLIDO x2 — usando cancel_all "
+                            "para limpiar órdenes huérfanas (oid=%s). "
+                            "trail_order_id se resetea → v7.3 recolocará SL próximo ciclo.",
+                            symbol, old_oid,
+                        )
+                        try:
+                            await self.client.cancel_all_orders(symbol)
+                            await asyncio.sleep(0.3)
+                            trade.trail_order_id = ""  # v7.3 recolocará
+                        except Exception as ca:
+                            log.error("[%s] cancel_all_orders fallback también falló: %s",
+                                      symbol, ca)
 
                 last_sl = self._trail_last_notify.get(symbol, trade.entry)
                 if abs(new_sl - last_sl) >= trade.atr:
