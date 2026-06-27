@@ -1,59 +1,20 @@
 """
 QF×JP Bot v7.7 — Scanner COMPLETO
 ═══════════════════════════════════════════════════════════════════════════════
+MODIFICACIONES JOYFUL-ART (SHORT-only mode):
+  ✅ SHORT_ONLY: bloquea todos los LONG si C.SHORT_ONLY=True
+  ✅ LATERAL_ADX_MAX: solo opera si ADX < umbral (mercado lateral)
+  ✅ IBS Pullback filter (paso 5h): nuevo mínimo + IBS > 0.85
+  ✅ BB Short filter (paso 5i): close > upper_BB × (1 + pct)
+
 FIX v7.7:
-  ✅ Cada señal acumula filter_tags{} con los filtros de confirmación que
-     dispararon (stc_asym, stc_vol_slope, price_action) y se pasa a
-     journal.on_open(). Permite a trade_journal.py v7.8 medir, con datos
-     reales, si cada filtro nuevo aporta win rate o solo añade ruido —
-     ver _filter_breakdown() en trade_journal.py.
-
+  ✅ filter_tags{} para journal.on_open()
 FIX v7.6:
-  ✅ Nuevo filtro opcional Price Action Framework (Large Bodies / Wicks
-     Into Levels / Grindy Staircase / Choppy Range) — ver
-     price_action_framework.py. Reutiliza k3m, sin llamada extra a la
-     API. Desactivado por defecto (PRICE_ACTION_ENABLED=False). Solo
-     para test en MODE=SIGNAL por ahora, no comprometido a ningún bot
-     en vivo todavía.
-
+  ✅ Price Action Framework opcional
 FIX v7.5:
-  ✅ Nuevo filtro opcional STC + Asimetría de precio (1m) — ver
-     stc_asymmetry.py para el detalle completo y el aviso de que la
-     fórmula de asimetría está sin verificar contra el Pine real.
-     Desactivado por defecto (STC_ASYM_ENABLED=False).
-
+  ✅ STC + Asimetría (1m)
 FIX v7.4:
-  ✅ place_limit_entry() ahora recibe sl_price/tp1_price/tp2_price — son
-     obligatorios desde bingx_client.py v7.7, que coloca SL+TP1+TP2 en
-     cuanto la entrada límite se llena.
-
-NUEVO en v7.3 (todas las mejoras del roadmap de anticipación):
-
-  1. SESSION FILTER — evita operar en horas de bajo volumen (00:00-08:00 UTC)
-     donde las pérdidas se concentran. Variables: TRADE_START_UTC / TRADE_END_UTC
-
-  2. FUNDING RATE EXTREMO como señal:
-     - FR > FR_EXTREME_THR: longs sobrecomprados → bloquea LONG, boosta SHORT +8
-     - FR < -FR_EXTREME_THR: shorts sobrecomprados → bloquea SHORT, boosta LONG +8
-     Anticipa la reversión ANTES de que el precio lo muestre.
-
-  3. OPEN INTEREST DELTA como filtro de confirmación:
-     - OI subiendo en dirección de señal = tendencia respaldada por posiciones reales
-     - OI bajando = cierre de posiciones, trampa probable → bloquea la señal
-     Cache de OI por símbolo con decay de 2 minutos.
-
-  4. TRADE JOURNAL integrado:
-     - on_open() al registrar cada trade
-     - Aplica adaptive offset sobre MIN_SCORE según win rate reciente
-
-  5. LIMIT ORDERS con fallback a market:
-     - Si LIMIT_ORDERS_ENABLED=true: intenta entrada límite al mark price
-     - Si no se llena en LIMIT_TIMEOUT_SECS: usa market (sin dejar posición
-       sin protección)
-     Ahorra ~60% en comisiones cuando el mercado coopera.
-
-  6. CORRELATION GUARD (ya existente, sin cambios)
-  7. DIAGNÓSTICO Telegram cada 5 iter sin señales (ya existente, sin cambios)
+  ✅ place_limit_entry() con sl/tp obligatorios
 ═══════════════════════════════════════════════════════════════════════════════
 """
 import asyncio
@@ -75,20 +36,23 @@ from btc_correlation import compute_correlation, btc_guard
 from stc_asymmetry import stc_asymmetry_filter, stc_volume_slope_filter
 from price_action_framework import price_action_filter
 from trend_magic_rmi import trend_magic_rmi_filter
+from ibs_filter import ibs_pullback_filter
+from bb_short_filter import bb_short_filter
 
-# v8.1: Market Structure ChoCh — import opcional para no crashear si falta
+# v8.1: Market Structure ChoCh
 try:
     from market_structure import ms_filter as _ms_filter
     _MS_AVAILABLE = True
 except ImportError:
     _MS_AVAILABLE = False
 
-# v8.2: OI + Funding Cascade Signal — import opcional
+# v8.2: OI + Funding Cascade Signal
 try:
     from oi_cascade_signal import oi_cascade_engine as _oi_engine
     _OI_CASCADE_AVAILABLE = True
 except ImportError:
     _OI_CASCADE_AVAILABLE = False
+
 from ws_market_data import ws_cache
 import telegram_client as tg
 
@@ -97,20 +61,11 @@ log = logging.getLogger("scanner")
 _cb_blacklist: dict[str, float] = {}
 CB_COOLDOWN = 600
 
-# Cache de Open Interest: symbol → (oi_value, timestamp)
 _oi_cache: dict[str, tuple[float, float]] = {}
-OI_CACHE_TTL = 120  # segundos
+OI_CACHE_TTL = 120
 
 
 async def _get_k_primary(client: BingXClient, symbol: str):
-    """
-    Timeframe principal (TIMEFRAME, ej. 3m) — el más sensible a latencia,
-    usado para timing de entrada. Si WS_ENABLED y hay datos frescos en
-    caché (>=20 velas, <90s de antigüedad), los usa en vez de REST.
-
-    Comportamiento por defecto SIN CAMBIOS: WS_ENABLED=False → siempre
-    REST, exactamente igual que antes de este módulo existir.
-    """
     if getattr(C, 'WS_ENABLED', False):
         cached = ws_cache.get_latest(symbol, C.TIMEFRAME)
         if cached is not None:
@@ -126,7 +81,7 @@ async def _fetch_all(client: BingXClient, symbol: str):
         client.get_klines(symbol, C.HTF5_TIMEFRAME, 100),
         client.get_order_book(symbol, 10),
         client.get_funding_rate(symbol),
-        client.get_open_interest(symbol),   # v8.2: OI para cascade signal
+        client.get_open_interest(symbol),
         return_exceptions=True,
     )
     def _l(r): return r if isinstance(r, list) else []
@@ -147,14 +102,6 @@ def _obi(ob: dict) -> float:
 
 
 async def _get_oi_delta(client: BingXClient, symbol: str) -> float:
-    """
-    Retorna el delta normalizado del OI:
-      >0: OI creciendo (posiciones abriéndose) — tendencia confirmada
-      <0: OI bajando  (posiciones cerrándose) — trampa posible
-      0:  sin datos o sin cambio
-
-    Usa cache de 120s para no spammear la API con 683 símbolos.
-    """
     if not getattr(C, 'OI_FILTER_ENABLED', False):
         return 0.0
     now = time.time()
@@ -163,41 +110,34 @@ async def _get_oi_delta(client: BingXClient, symbol: str) -> float:
         oi = await client.get_open_interest(symbol)
         _oi_cache[symbol] = (oi, now)
         if prev_oi > 0 and (now - prev_ts) < OI_CACHE_TTL * 3:
-            return (oi - prev_oi) / prev_oi  # delta relativo
+            return (oi - prev_oi) / prev_oi
     except Exception:
         pass
     return 0.0
 
 
 def _session_allowed() -> bool:
-    """Retorna True si la hora UTC actual está dentro de la ventana de trading."""
     start = getattr(C, 'TRADE_START_UTC', 0)
     end   = getattr(C, 'TRADE_END_UTC',   24)
     if start == 0 and end == 24:
-        return True  # desactivado = operar 24h
+        return True
     h = datetime.datetime.utcnow().hour
     if start < end:
         return start <= h < end
-    else:  # wrap sobre medianoche, ej: 20:00-08:00
+    else:
         return h >= start or h < end
 
 
 def _fr_boost_block(fr: float, direction: str) -> tuple[float, bool]:
-    """
-    Funding rate extremo como señal de reversión anticipada.
-    Retorna (boost_pts, blocked).
-    """
-    thr = getattr(C, 'FR_EXTREME_THR', 0.0005)  # 0.05% por defecto
+    thr = getattr(C, 'FR_EXTREME_THR', 0.0005)
     if thr <= 0:
         return 0.0, False
     if fr > thr:
-        # Longs sobrecomprados: bloquear LONG, boostear SHORT
         if direction == "LONG":
             return 0.0, True
         if direction == "SHORT":
-            return 8.0, False  # confirmación adicional del SHORT
+            return 8.0, False
     if fr < -thr:
-        # Shorts sobrecomprados: bloquear SHORT, boostear LONG
         if direction == "SHORT":
             return 0.0, True
         if direction == "LONG":
@@ -214,7 +154,6 @@ async def _process_symbol(
         diag["counts"]["already_trading"] += 1
         return None
 
-    # ── 1. Session filter ───────────────────────────────────────────────────
     if not _session_allowed():
         diag["counts"]["session_filter"] += 1
         return None
@@ -248,14 +187,28 @@ async def _process_symbol(
         diag["counts"][sig.reason or "no_direction"] += 1
         return None
 
-    # ── VOLATILITY REGIME — ajusta SL/TP según percentil de ATR propio ───────
+    # ── SHORT-only mode ──────────────────────────────────────────────────────
+    # Bloquea todos los LONG cuando SHORT_ONLY=true en Railway.
+    # Diseñado para joyful-art en modo SHORT + lateral.
+    if getattr(C, 'SHORT_ONLY', False) and sig.direction == "LONG":
+        diag["counts"]["long_blocked"] += 1
+        return None
+
+    # ── Lateral market filter (ADX) ──────────────────────────────────────────
+    # Si ADX > LATERAL_ADX_MAX → mercado en tendencia fuerte → no operar.
+    # 0 = desactivado. Recomendado: 28-32 para mercado lateral.
+    _lat_max = getattr(C, 'LATERAL_ADX_MAX', 0.0)
+    if _lat_max > 0 and sig.adx > _lat_max:
+        diag["counts"]["trending_skip"] += 1
+        return None
+
+    # ── VOLATILITY REGIME ────────────────────────────────────────────────────
     vol_sig = vol_engine.update(symbol, sig.atr, sig.entry)
     if getattr(C, 'VOL_REGIME_ENABLED', True):
         if vol_sig.block_entry:
             diag["counts"]["vol_extreme_block"] += 1
             return None
         if vol_sig.regime != VolRegime.NORMAL:
-            # Reescalar distancias SL/TP según régimen de volatilidad
             sl_dist  = abs(sig.entry - sig.sl)  * vol_sig.sl_mult
             tp1_dist = abs(sig.tp1   - sig.entry) * vol_sig.tp_mult
             tp2_dist = abs(sig.tp2   - sig.entry) * vol_sig.tp_mult
@@ -269,7 +222,6 @@ async def _process_symbol(
                 sig.tp2 = sig.entry - tp2_dist
             diag["counts"][f"vol_{vol_sig.regime.lower()}"] += 1
 
-    # Registrar score para diagnóstico
     diag["score_n"]   += 1
     diag["score_sum"] += sig.score
     if sig.score > diag["score_max"]:
@@ -277,7 +229,6 @@ async def _process_symbol(
         diag["score_max_symbol"]  = symbol
         diag["score_max_dir"]     = sig.direction
 
-    # OBI boost
     if abs(obi) > 0.1:
         boost = 0.0
         if sig.direction == "SHORT" and obi < -0.1:
@@ -288,8 +239,7 @@ async def _process_symbol(
             sig.score = min(sig.score + boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
 
-    # ── 2. FUNDING REGIME — el edge profesional ─────────────────────────────
-    # Actualizar historia del FR y obtener boosts de régimen + timing
+    # ── FUNDING REGIME ───────────────────────────────────────────────────────
     regime_sig = regime_engine.update(symbol, fr)
     regime_boost = (
         regime_sig.short_boost if sig.direction == "SHORT"
@@ -303,11 +253,9 @@ async def _process_symbol(
                      symbol, regime_boost, regime_sig.reason, sig.score)
         diag["counts"][f"regime_{regime_sig.regime.lower()}"] += 1
         if regime_boost < -5:
-            # Señal penalizada fuertemente → descartar
             diag["counts"]["regime_block"] += 1
             return None
 
-    # ── 3. Funding Rate extremo (filtro binario original + regime) ──────────
     fr_boost, fr_blocked = _fr_boost_block(fr, sig.direction)
     if fr_blocked:
         diag["counts"]["fr_extreme_block"] += 1
@@ -323,7 +271,7 @@ async def _process_symbol(
         diag["counts"]["circuit_breaker"] += 1
         return None
 
-    # ── 4. Turn-of-Candle boost (conservador, solo LONG) ────────────────────
+    # ── Turn-of-Candle boost ─────────────────────────────────────────────────
     if getattr(C, 'CANDLE_TURN_ENABLED', True):
         ct_boost, ct_reason = candle_turn_boost(
             sig.direction,
@@ -334,12 +282,8 @@ async def _process_symbol(
             sig.score = min(sig.score + ct_boost, 100.0)
             sig.tier  = score_to_tier(sig.score)
             diag["counts"]["candle_turn_boost"] += 1
-            log.debug("[%s] %s", symbol, ct_reason)
 
-    # ── 5. Slope Multi-Timeframe — confluencia + anti-whipsaw ───────────────
-    # FIX v7.5: slope_adj/slope_block ahora con default (0.0, False) ANTES
-    # del if — el paso 5c (STC+Volumen+Slope) los necesita aunque
-    # SLOPE_FILTER_ENABLED esté desactivado, para no fallar con NameError.
+    # ── Slope Multi-Timeframe ────────────────────────────────────────────────
     slope_adj, slope_block = 0.0, False
     if getattr(C, 'SLOPE_FILTER_ENABLED', True):
         slope_adj, slope_reason, slope_block = multi_tf_slope_alignment(
@@ -356,22 +300,14 @@ async def _process_symbol(
             if slope_adj >= 10:
                 log.info("[%s] 📈 %s → score=%.1f", symbol, slope_reason, sig.score)
 
-    # ── FIX v7.7: acumula qué filtros de confirmación dispararon esta señal
-    # — se pasa al journal en on_open() para medir después si cada filtro
-    # nuevo aporta de verdad (ver trade_journal.py v7.8, _filter_breakdown).
     filter_tags: dict = {}
 
-    # ── 5b. STC + Asimetría de precio (1m) — confirmación de giro ───────────
-    # FIX v7.5: filtro nuevo, desactivado por defecto. Ver stc_asymmetry.py
-    # para el aviso completo sobre la fórmula de asimetría sin verificar
-    # contra el Pine real ("QF×JP v3.6 PREDATOR"). Activar solo después de
-    # confirmar en logs que el ratio calculado coincide con el panel.
+    # ── 5b. STC + Asimetría (1m) ─────────────────────────────────────────────
     if getattr(C, 'STC_ASYM_ENABLED', False):
         try:
             k1m = await client.get_klines(symbol, "1m", 100)
         except Exception as e:
             k1m = []
-            log.debug("[%s] k1m fetch error: %s", symbol, e)
         if len(k1m) >= 60:
             stc_boost, stc_reason, stc_block = stc_asymmetry_filter(
                 k1m, sig.direction,
@@ -387,7 +323,6 @@ async def _process_symbol(
                 asym_boost_max=getattr(C, 'ASYM_BOOST_MAX', 12.0),
             )
             if stc_block:
-                log.info("[%s] 🚫 STC/Asimetría veto: %s", symbol, stc_reason)
                 diag["counts"]["stc_asym_veto"] += 1
                 return None
             if stc_boost > 0:
@@ -395,20 +330,13 @@ async def _process_symbol(
                 sig.tier  = score_to_tier(sig.score)
                 diag["counts"]["stc_asym_boost"] += 1
                 filter_tags["stc_asym"] = stc_reason
-                log.info("[%s] 🌀 %s", symbol, stc_reason)
 
-    # ── 5c. STC + Volumen + Slope (1m) — confirmación alternativa ───────────
-    # FIX v7.5: alternativa a 5b sin ninguna fórmula adivinada — volumen es
-    # directo del kline, slope reutiliza multi_tf_slope_alignment ya
-    # calculado arriba (no se duplica el cálculo). Desactivado por defecto,
-    # independiente de STC_ASYM_ENABLED — puedes activar este, el otro, o
-    # ninguno.
+    # ── 5c. STC + Volumen + Slope ────────────────────────────────────────────
     if getattr(C, 'STC_VOL_SLOPE_ENABLED', False):
         try:
             k1m_vs = await client.get_klines(symbol, "1m", 100)
         except Exception as e:
             k1m_vs = []
-            log.debug("[%s] k1m (vol/slope) fetch error: %s", symbol, e)
         if len(k1m_vs) >= 60:
             vs_boost, vs_reason, vs_block = stc_volume_slope_filter(
                 k1m_vs, sig.direction,
@@ -426,7 +354,6 @@ async def _process_symbol(
                 slope_boost_mult=getattr(C, 'STC_SLOPE_BOOST_MULT', 0.5),
             )
             if vs_block:
-                log.info("[%s] 🚫 STC/Vol/Slope veto: %s", symbol, vs_reason)
                 diag["counts"]["stc_vol_slope_veto"] += 1
                 return None
             if vs_boost > 0:
@@ -434,12 +361,8 @@ async def _process_symbol(
                 sig.tier  = score_to_tier(sig.score)
                 diag["counts"]["stc_vol_slope_boost"] += 1
                 filter_tags["stc_vol_slope"] = vs_reason
-                log.info("[%s] 🌀 %s", symbol, vs_reason)
 
-    # ── 5d. Price Action Framework (Zero Complexity Trading) ────────────────
-    # NUEVO — solo para test en MODE=SIGNAL, no comprometido a ningún bot
-    # en vivo todavía. Reutiliza k3m (ya fetcheado), sin llamada extra a la
-    # API. Ver price_action_framework.py para el detalle de los 4 patrones.
+    # ── 5d. Price Action Framework ───────────────────────────────────────────
     if getattr(C, 'PRICE_ACTION_ENABLED', False):
         pa_boost, pa_reason, pa_block = price_action_filter(
             k3m, sig.direction,
@@ -451,7 +374,6 @@ async def _process_symbol(
             boost_amount=getattr(C, 'PA_BOOST_AMOUNT', 6.0),
         )
         if pa_block:
-            log.info("[%s] 🚫 Price Action veto: %s", symbol, pa_reason)
             diag["counts"]["price_action_veto"] += 1
             return None
         if pa_boost > 0:
@@ -459,14 +381,8 @@ async def _process_symbol(
             sig.tier  = score_to_tier(sig.score)
             diag["counts"]["price_action_boost"] += 1
             filter_tags["price_action"] = pa_reason
-            log.info("[%s] 📐 %s", symbol, pa_reason)
 
-    # ── 5e. Trend Magic + RMI Sniper — filtro de confirmación ───────────────
-    # NUEVO — ver trend_magic_rmi.py. Reutiliza k3m (ya fetcheado), sin
-    # llamada extra a la API. Desactivado por defecto (igual que el resto
-    # de filtros opcionales nuevos): activar en config tras validar en
-    # MODE=SIGNAL y revisar by_filter en el journal antes de confiar en él
-    # con dinero real.
+    # ── 5e. Trend Magic + RMI ────────────────────────────────────────────────
     if getattr(C, 'TREND_MAGIC_RMI_ENABLED', False):
         tmr_boost, tmr_reason, tmr_block = trend_magic_rmi_filter(
             k3m, sig.direction,
@@ -479,7 +395,6 @@ async def _process_symbol(
             boost_amount=getattr(C, 'TMR_BOOST_AMOUNT', 7.0),
         )
         if tmr_block:
-            log.info("[%s] 🚫 Trend Magic/RMI veto: %s", symbol, tmr_reason)
             diag["counts"]["trend_magic_rmi_veto"] += 1
             return None
         if tmr_boost > 0:
@@ -487,46 +402,8 @@ async def _process_symbol(
             sig.tier  = score_to_tier(sig.score)
             diag["counts"]["trend_magic_rmi_boost"] += 1
             filter_tags["trend_magic_rmi"] = tmr_reason
-            log.info("[%s] 🧲 %s", symbol, tmr_reason)
 
-    # ── 5g. OI + Funding Rate Cascade Signal (v8.2) ─────────────────────────
-    # Usa el mismo motor del Cascade Bot (oi_cascade_signal.py).
-    # FR extremo positivo + OI spike = longs sobreextendidos → boost SHORT
-    # FR extremo negativo + OI spike = shorts sobreextendidos → boost LONG
-    # Activar con OI_CASCADE_ENABLED=true (default false — requiere historia).
-    if getattr(C, 'OI_CASCADE_ENABLED', False) and _OI_CASCADE_AVAILABLE:
-        try:
-            _oi_engine.update(symbol, oi_raw, fr,
-                              k3m[-1][4] if k3m else 0.0, sig.atr)
-            oi_boost, oi_reason, oi_block = _oi_engine.signal_for_direction(
-                symbol, sig.direction)
-            if oi_block:
-                log.info("[%s] 🚫 OI/FR cascade block: %s", symbol, oi_reason)
-                diag["counts"]["oi_cascade_block"] += 1
-                return None
-            if oi_boost != 0:
-                sig.score = max(0.0, min(sig.score + oi_boost, 100.0))
-                sig.tier  = score_to_tier(sig.score)
-                filter_tags["oi_cascade"] = oi_reason
-                diag["counts"][f"oi_cascade_{oi_boost:+.0f}"] += 1
-                log.info("[%s] ⚡ OI/FR: %s -> score=%.1f",
-                         symbol, oi_reason, sig.score)
-        except Exception as e:
-            log.debug("[%s] oi_cascade error: %s", symbol, e)
-
-    # ── 6. BTC Correlation Guard se evalúa DENTRO del bloque LIVE (más abajo)
-    # — moverlo aquí causaba fuga de reserva si MODE=SIGNAL o si score/tier
-    # rechazaban la señal después, ya que esos `return` ocurren ANTES del
-    # try/finally que libera la reserva. Solo importa si de verdad se va a
-    # abrir una posición real, así que solo se calcula y reserva en LIVE.
-
-    # ── 5f. Market Structure ChoCh (v8.1) ────────────────────────────────────
-    # Usa k4h ya fetcheadas — sin coste de API extra.
-    # ChoCh ↑: precio > pivot high 4H → estructura alcista (boost LONG +4)
-    # ChoCh ↓: precio < pivot low  4H → estructura bajista (boost SHORT +4)
-    # Señal contra la estructura        → penalización -4
-    # Complementa slope filter (EMAs) con pivots estructurales (más rápido).
-    # Activar con MS_ENABLED=true en Railway (default false = validar primero).
+    # ── 5f. Market Structure ChoCh ───────────────────────────────────────────
     if getattr(C, 'MS_ENABLED', False) and _MS_AVAILABLE:
         ms_boost, ms_reason, _ = _ms_filter(
             k4h, sig.direction,
@@ -537,62 +414,105 @@ async def _process_symbol(
             sig.tier  = score_to_tier(sig.score)
             filter_tags["market_structure"] = ms_reason
             diag["counts"][f"ms_{ms_boost:+.0f}"] += 1
-            log.debug("[%s] 📐 MS ChoCh: %s → score=%.1f", symbol, ms_reason, sig.score)
 
-    # ── 6b. Auto-blacklist por símbolo + Streak Breaker global ───────────────
-    # Aprendido de pérdidas reales, no requiere mantenimiento manual.
+    # ── 5g. OI + Funding Rate Cascade Signal ─────────────────────────────────
+    if getattr(C, 'OI_CASCADE_ENABLED', False) and _OI_CASCADE_AVAILABLE:
+        try:
+            _oi_engine.update(symbol, oi_raw, fr,
+                              k3m[-1][4] if k3m else 0.0, sig.atr)
+            oi_boost, oi_reason, oi_block = _oi_engine.signal_for_direction(
+                symbol, sig.direction)
+            if oi_block:
+                diag["counts"]["oi_cascade_block"] += 1
+                return None
+            if oi_boost != 0:
+                sig.score = max(0.0, min(sig.score + oi_boost, 100.0))
+                sig.tier  = score_to_tier(sig.score)
+                filter_tags["oi_cascade"] = oi_reason
+                diag["counts"][f"oi_cascade_{oi_boost:+.0f}"] += 1
+        except Exception as e:
+            log.debug("[%s] oi_cascade error: %s", symbol, e)
+
+    # ── 5h. IBS Pullback SHORT ───────────────────────────────────────────────
+    # Portado de Pine "10 Bar Low Pullback": nuevo mínimo N barras + IBS > 0.85
+    # = sell the rip intrabarra en contexto bajista (below EMA).
+    # Solo actúa en SHORT. Para LONG: neutral (no veta).
+    # Activar con IBS_PULLBACK_ENABLED=true en Railway (default false).
+    if getattr(C, 'IBS_PULLBACK_ENABLED', False):
+        ibs_boost, ibs_reason, ibs_block = ibs_pullback_filter(
+            k3m, sig.direction,
+            lookback=getattr(C, 'IBS_LOOKBACK', 10),
+            ibs_threshold=getattr(C, 'IBS_THRESHOLD', 0.85),
+            ema_period=getattr(C, 'IBS_EMA_PERIOD', 50),
+            use_ema_filter=getattr(C, 'IBS_USE_EMA', True),
+            boost_amount=getattr(C, 'IBS_BOOST', 8.0),
+        )
+        if ibs_block:
+            log.info("[%s] 🚫 IBS veto (encima EMA): %s", symbol, ibs_reason)
+            diag["counts"]["ibs_veto"] += 1
+            return None
+        if ibs_boost > 0:
+            sig.score = min(sig.score + ibs_boost, 100.0)
+            sig.tier  = score_to_tier(sig.score)
+            diag["counts"]["ibs_boost"] += 1
+            filter_tags["ibs_pullback"] = ibs_reason
+            log.info("[%s] 📉 %s → score=%.1f", symbol, ibs_reason, sig.score)
+
+    # ── 5i. BB Short — sobrecompra extrema ───────────────────────────────────
+    # Portado de Pine "BB Short DCA Strategy": close > upper_BB × (1 + pct/100)
+    # Para SHORT: boost. Para LONG: veto opcional (sobrecompra extrema).
+    # DCA/pyramiding del Pine original NO implementado.
+    # Activar con BB_SHORT_ENABLED=true en Railway (default false).
+    if getattr(C, 'BB_SHORT_ENABLED', False):
+        bb_boost, bb_reason, bb_block = bb_short_filter(
+            k3m, sig.direction,
+            bb_length=getattr(C, 'BB_SHORT_LENGTH', 20),
+            bb_std=getattr(C, 'BB_SHORT_STD', 2.0),
+            signal_above_pct=getattr(C, 'BB_SHORT_ABOVE_PCT', 1.0),
+            boost_amount=getattr(C, 'BB_SHORT_BOOST', 10.0),
+            veto_long=getattr(C, 'BB_SHORT_VETO_LONG', True),
+        )
+        if bb_block:
+            log.info("[%s] 🚫 BB_short veto LONG sobrecompra: %s", symbol, bb_reason)
+            diag["counts"]["bb_short_veto_long"] += 1
+            return None
+        if bb_boost > 0:
+            sig.score = min(sig.score + bb_boost, 100.0)
+            sig.tier  = score_to_tier(sig.score)
+            diag["counts"]["bb_short_boost"] += 1
+            filter_tags["bb_short"] = bb_reason
+            log.info("[%s] 📉 %s → score=%.1f", symbol, bb_reason, sig.score)
+
+    # ── 6b. Auto-blacklist + Streak Breaker ──────────────────────────────────
     if journal:
         auto_bl, auto_bl_reason = journal.is_symbol_auto_blacklisted(symbol)
         if auto_bl:
             diag["counts"]["auto_blacklist"] += 1
             return None
-
         streak_paused, streak_reason = journal.is_streak_paused()
         if streak_paused:
             diag["counts"]["streak_breaker"] += 1
             return None
 
-    # ── 7. Adaptive threshold (feed del TradeJournal) ──────────────────────
+    # ── 7. Adaptive threshold ────────────────────────────────────────────────
     adaptive_offset = journal.get_adaptive_offset() if journal else 0.0
     effective_min   = C.MIN_SCORE + adaptive_offset
 
-    # ── NUEVO: Penalización counter-trend ─────────────────────────────────
-    # Cuando el HTF no está completamente alineado con la señal (solo 2/3
-    # timeframes vs 3/3), la señal va contra el flujo dominante y necesita
-    # más evidencia para justificarse. Cada timeframe que falta suma una
-    # penalización configurable al umbral mínimo.
-    # Caso real evitado: LONG en mercado 4h bajista con solo 15m/1h alcistas
-    # → demasiado ruido contratendencia → loss. Con esta regla, ese LONG
-    # habría necesitado score >= MIN_SCORE + COUNTER_TREND_PENALTY para pasar.
-    htf_score_val = getattr(sig, 'htf_score', 0.5)
-    # Reconstruir htf_aligned a partir del sig.htf_score (0-1 escalado):
-    # Usamos una proxy simple: si htf_score < 0.4 es mayoritariamente
-    # contra-tendencia, si > 0.6 es mayoritariamente a favor.
     _counter_penalty = getattr(C, 'COUNTER_TREND_PENALTY', 8.0)
     _htf_s = float(sig.htf_score) if hasattr(sig, 'htf_score') else 0.5
     if sig.direction == "LONG" and _htf_s < 0.45:
         effective_min += _counter_penalty
         diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
-        log.debug("[%s] Penalización counter-trend LONG: htf=%.2f → min_score=%.1f",
-                  symbol, _htf_s, effective_min)
     elif sig.direction == "SHORT" and _htf_s > 0.55:
         effective_min += _counter_penalty
         diag["counts"]["counter_trend_penalty"] = diag["counts"].get("counter_trend_penalty", 0) + 1
-        log.debug("[%s] Penalización counter-trend SHORT: htf=%.2f → min_score=%.1f",
-                  symbol, _htf_s, effective_min)
 
     if sig.score < effective_min:
         diag["counts"]["score_bajo"] += 1
         return None
 
-    # ── NUEVO: Convicción mínima ──────────────────────────────────────────
-    # El campo conviction (0-20) de indicators.py cuenta evidencias
-    # independientes a favor de la señal. Con MIN_CONVICTION=5 filtramos
-    # señales donde solo 1-4 indicadores confirman, reduciendo entradas
-    # en señales "técnicamente válidas" pero sin confluencia real.
     _min_conviction = getattr(C, 'MIN_CONVICTION', 5)
     if hasattr(sig, 'conviction') and sig.conviction < _min_conviction:
-        log.debug("[%s] Convicción insuficiente: %d/%d", symbol, sig.conviction, _min_conviction)
         diag["counts"]["conviction_bajo"] += 1
         return None
 
@@ -616,12 +536,6 @@ async def _process_symbol(
         diag["counts"]["risk_blocked"] += 1
         return None
 
-    # FIX v7.8: can_trade() YA reservó open_count/daily_trades atómicamente.
-    # A partir de aquí, CUALQUIER salida sin completar el trade DEBE liberar
-    # esa reserva (y la de dirección, si llega a hacerse) — si no, el
-    # contador queda inflado y bloquea trades válidos el resto del día.
-    # El try/finally garantiza la liberación sin tener que repetir el
-    # release en cada uno de los ~7 puntos de salida posibles.
     trade_confirmed  = False
     dir_reserved     = False
     dir_token        = None
@@ -632,12 +546,9 @@ async def _process_symbol(
     try:
         sym_ok, sym_reason = risk.symbol_allowed(symbol)
         if not sym_ok:
-            log.debug("[%s] Bloqueado por símbolo: %s", symbol, sym_reason)
             diag["counts"]["symbol_blocked"] += 1
             return None
 
-        # Correlation guard — reserva atómica si pasa (fix v7.8); el token
-        # identifica esta reserva específica para liberarla sin ambigüedad.
         dir_ok, dir_reason, dir_token = risk.direction_allowed(sig.direction)
         if not dir_ok:
             log.info("[%s] Bloqueado por correlación: %s", symbol, dir_reason)
@@ -645,11 +556,6 @@ async def _process_symbol(
             return None
         dir_reserved = True
 
-        # BTC Correlation Guard — evita apilar la MISMA apuesta sobre BTC.
-        # Caso real: SXT+LDO+FHE, 3 símbolos "distintos" LONG, todos
-        # correlacionados con BTC, cerrados juntos con -23.47 USDT.
-        # Se calcula AQUÍ (dentro del try/finally) para que la reserva
-        # quede cubierta por la liberación automática si algo falla después.
         if btc_klines and getattr(C, 'BTC_CORR_ENABLED', True) and symbol != "BTC-USDT":
             btc_corr = compute_correlation(k3m, btc_klines)
             btc_guard.threshold  = getattr(C, 'BTC_CORR_THRESHOLD', 0.5)
@@ -661,13 +567,11 @@ async def _process_symbol(
                 if not btc_ok:
                     log.info("[%s] 🔗 %s", symbol, btc_reason)
                     diag["counts"]["btc_correlation_blocked"] += 1
-                    btc_reserved = False  # allowed() no reservó si devolvió False
+                    btc_reserved = False
                     return None
 
-        # ── 4. Open Interest delta ───────────────────────────────────────────
         oi_delta = await _get_oi_delta(client, symbol)
         if getattr(C, 'OI_FILTER_ENABLED', False) and oi_delta < -0.05:
-            log.info("[%s] OI delta negativo (%.2f) — señal descartada", symbol, oi_delta)
             diag["counts"]["oi_declining"] += 1
             return None
         if oi_delta > 0.02:
@@ -681,24 +585,18 @@ async def _process_symbol(
             return None
 
         if balance < 5.0:
-            log.warning("Balance=%.4f — usando CAPITAL=%.2f", balance, C.CAPITAL)
             balance = C.CAPITAL
 
         qty = risk.kelly_position_size(balance, sig.entry, sig.sl, sig.score, sig.tier, symbol=symbol)
         if qty <= 0:
-            log.warning("[%s] qty=0, skip", symbol)
             return None
 
         log.info("[%s] qty=%.6f notional=%.2f USDT", symbol, qty, qty * sig.entry)
         await tg.notify_signal(sig)
 
-        # ── 5. Limit order con fallback a market ─────────────────────────────
         entry_resp = {}
         used_limit = False
         if getattr(C, 'LIMIT_ORDERS_ENABLED', False):
-            # FIX v7.4: se pasan sl_price/tp1_price/tp2_price — desde
-            # bingx_client.py v7.7+, place_limit_entry() los EXIGE para
-            # poder colocar la protección en cuanto la entrada se llena.
             lmt_resp = await client.place_limit_entry(
                 symbol, sig.direction, qty, sig.entry,
                 sl_price=sig.sl, tp1_price=sig.tp1, tp2_price=sig.tp2,
@@ -707,8 +605,7 @@ async def _process_symbol(
             if lmt_resp.get("code", -1) == 0:
                 entry_resp = lmt_resp
                 used_limit = True
-                log.info("[%s] Entrada LÍMITE OK ✅ (fee ahorro 60%%)", symbol)
-                await tg.notify_limit_filled(symbol, sig.direction, sig.entry, qty)
+                log.info("[%s] Entrada LÍMITE OK ✅", symbol)
 
         if not used_limit:
             try:
@@ -718,13 +615,11 @@ async def _process_symbol(
                 )
             except Exception as e:
                 log.error("[%s] open_trade error: %s", symbol, e)
-                await tg.notify_error(f"open_trade({symbol})", str(e))
                 return None
             entry_resp = results.get("entry", {})
 
         if entry_resp.get("code", -1) != 0:
             log.error("[%s] Entrada rechazada: %s", symbol, entry_resp)
-            await tg.notify_error(f"entrada_rechazada({symbol})", str(entry_resp))
             return None
 
         order_id = str(
@@ -741,7 +636,6 @@ async def _process_symbol(
         await tg.notify_trade_opened(sig, qty, order_id)
         trade_confirmed = True
 
-        # Registrar en journal
         if journal:
             journal.on_open(
                 symbol=symbol, direction=sig.direction, tier=sig.tier,
@@ -753,9 +647,6 @@ async def _process_symbol(
         return sig
 
     finally:
-        # FIX v7.8: si el trade NO se confirmó, liberar TODAS las reservas
-        # hechas en el camino (open_count/daily_trades, dirección, BTC corr)
-        # para que no queden contadores inflados bloqueando trades válidos.
         if not trade_confirmed:
             await risk.release_reservation()
             if dir_reserved:
@@ -776,24 +667,13 @@ async def _harvest_scan(
     risk: RiskManager, pos_mgr: PositionManager,
     diag: dict, journal=None,
 ):
-    """
-    Funding Harvest Scanner — ejecuta cada 8 iteraciones (~8 min).
-
-    Busca símbolos con:
-      - FR > HARVEST_FR_THR (0.10%/8h) → oportunidad SHORT pre-funding
-      - FR < -HARVEST_FR_THR/2          → oportunidad LONG pre-funding
-
-    El harvest aprovecha que los traders apalancados CIERRAN posiciones
-    en las 2h previas al pago de funding → movimiento predecible.
-    Sizing más pequeño que señales normales, SL más ajustado (1.0 ATR).
-    """
     harvest_thr = getattr(C, 'HARVEST_FR_THR', 0.0010)
     if harvest_thr <= 0:
         return
 
     window = regime_engine._classify_window()
     if window not in (Window.PREFUND_MAX, Window.PREFUND_PREP):
-        return  # Solo activo en ventana pre-funding
+        return
 
     htf = regime_engine.hours_to_next_funding()
     log.info("🌾 Harvest scan — ventana %s (%.1fh hasta funding) | %d símbolos",
@@ -816,19 +696,12 @@ async def _harvest_scan(
     if not candidates:
         return
 
-    # Ordenar por yield y tomar el mejor
     candidates.sort(key=lambda x: x[3], reverse=True)
-    log.info("🌾 Harvest candidates: %s",
-             [(s, d, f'{fr*100:.3f}%') for s, d, fr, _ in candidates[:3]])
-
-    # Solo abrir el mejor candidato por scan (no apilar harvests)
     symbol, direction, fr, yield_pct = candidates[0]
 
-    # Check de riesgo
     unrealized = await pos_mgr.get_unrealized_pnl()
     can, reason = await risk.can_trade(unrealized_pnl=unrealized)
     if not can:
-        log.debug("Harvest bloqueado por risk: %s", reason)
         return
 
     try:
@@ -838,7 +711,6 @@ async def _harvest_scan(
     if balance < 5:
         balance = C.CAPITAL
 
-    # Klines para ATR
     try:
         k3m = await client.get_klines(symbol, C.TIMEFRAME, 50)
         if len(k3m) < 20:
@@ -856,14 +728,12 @@ async def _harvest_scan(
         log.debug("Harvest klines error: %s", e)
         return
 
-    # Sizing harvest: MAX_NOTIONAL * 0.25 (más pequeño que señales normales)
     harvest_notional = getattr(C, 'MAX_NOTIONAL_USDT', 200) * 0.25
     qty = harvest_notional / price / C.LEVERAGE
     qty = client._round_qty(symbol, qty)
     if qty <= 0:
         return
 
-    # SL más ajustado para harvest (1.0 ATR vs 2.0 de señales normales)
     sl_mult = 1.0
     if direction == "LONG":
         sl_price  = price - atr * sl_mult
@@ -874,9 +744,7 @@ async def _harvest_scan(
         tp1_price = price - atr * 1.0
         tp2_price = price - atr * 2.0
 
-    log.info("🌾 HARVEST %s %s @ %.6f | yield=%.3f%%/8h | SL @ %.6f",
-             symbol, direction, price, yield_pct*100, sl_price)
-
+    log.info("🌾 HARVEST %s %s @ %.6f | yield=%.3f%%/8h", symbol, direction, price, yield_pct*100)
     await tg.notify_harvest_opportunity(symbol, direction, fr, yield_pct, htf)
 
     try:
@@ -890,12 +758,10 @@ async def _harvest_scan(
 
     entry_resp = results.get("entry", {})
     if entry_resp.get("code", -1) != 0:
-        log.warning("Harvest entrada rechazada: %s", entry_resp)
         return
 
     order_id = str(
-        entry_resp.get("data", {}).get("order", {}).get("orderId", "harvest")
-        or "harvest"
+        entry_resp.get("data", {}).get("order", {}).get("orderId", "harvest") or "harvest"
     )
     trade = OpenTrade(
         symbol=symbol, direction=direction,
@@ -909,20 +775,19 @@ async def _harvest_scan(
     diag["counts"]["harvest_opened"] += 1
 
 
-# Lista de símbolos activos del scan más reciente — leída por ws_market_data
-# para saber a qué símbolos suscribirse en el WebSocket. Actualizada
-# automáticamente cada vez que scan_loop refresca su universo.
 _current_symbols: list[str] = []
 
 
 def get_current_symbols() -> list[str]:
-    """Callback para ws_market_data.run_ws_client(). Nunca lanza excepción."""
     return list(_current_symbols)
 
 
 async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
-    log.info("Scanner v7.7 | Modo=%s | Interval=%ds | Batch=20",
-             C.MODE, C.SCAN_INTERVAL)
+    log.info("Scanner v7.7 SHORT-ONLY | Modo=%s | SHORT_ONLY=%s | LATERAL_ADX_MAX=%s | Interval=%ds",
+             C.MODE,
+             getattr(C, 'SHORT_ONLY', False),
+             getattr(C, 'LATERAL_ADX_MAX', 0.0),
+             C.SCAN_INTERVAL)
     symbols:   list[str] = []
     iteration: int       = 0
 
@@ -937,11 +802,11 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
                 if all_syms:
                     if complement and complement.get_exclusive_symbols():
                         symbols = complement.get_exclusive_symbols()
-                        log.info("Modo EXCLUSIVO: %d símbolos (top por volumen)", len(symbols))
+                        log.info("Modo EXCLUSIVO: %d símbolos", len(symbols))
                     else:
                         symbols = all_syms
                         log.info("Símbolos activos: %d", len(symbols))
-                    _current_symbols[:] = symbols  # sincronizar para el WS client
+                    _current_symbols[:] = symbols
                 else:
                     log.warning("get_all_symbols vacío (iter=%d)", iteration)
             except Exception as e:
@@ -962,8 +827,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             except Exception:
                 pass
 
-        # ── BTC klines — UNA sola llamada por iteración, reutilizada por
-        # todos los símbolos del scan vía BTC Correlation Guard. ───────────
         btc_klines = None
         if getattr(C, 'BTC_CORR_ENABLED', True):
             try:
@@ -987,12 +850,10 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
 
         elapsed = time.time() - start
 
-        # Diagnóstico de rechazo
         top5    = diag["counts"].most_common(5)
         avg_sc  = diag["score_sum"] / diag["score_n"] if diag["score_n"] else 0.0
         top_str = " | ".join(f"{k}={v}" for k, v in top5) if top5 else "—"
 
-        # Adaptive offset del journal
         adaptive_str = ""
         if journal and journal.get_adaptive_offset() != 0.0:
             adaptive_str = f" | adaptive_offset={journal.get_adaptive_offset():+.0f}"
@@ -1006,7 +867,6 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             adaptive_str, top_str,
         )
 
-        # Telegram: diagnóstico cada 5 iter sin señales
         if iteration % 5 == 0 and signals_found == 0:
             try:
                 await tg.notify_diagnostics(
@@ -1017,16 +877,12 @@ async def scan_loop(client, risk, pos_mgr, complement=None, journal=None):
             except Exception:
                 pass
 
-        # Telegram: journal report cada 50 iter (si hay datos)
         if journal and iteration % 50 == 0 and journal.total_closed() > 0:
             try:
                 await tg.notify_journal_report(journal.stats())
             except Exception:
                 pass
 
-        # ── HARVEST SCAN — funding market-neutral (cada 8 iteraciones) ─────
-        # Busca símbolos con FR extremo + ventana pre-funding para capturar
-        # el movimiento de longs/shorts que cierran antes del pago.
         if iteration % 8 == 0 and C.MODE == "LIVE":
             await _harvest_scan(symbols[:50], client, risk, pos_mgr, diag, journal)
 
