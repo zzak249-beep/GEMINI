@@ -229,15 +229,16 @@ class BingXClient:
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
-        """Stop-market order in hedge mode — no closePosition, use quantity."""
+        """Stop-market — quantity required by BingX hedge mode (109400 without it)."""
         side = "SELL" if position_side == "LONG" else "BUY"
+        qty_str = f"{quantity:.6f}".rstrip("0").rstrip(".") or str(quantity)
         return self._post("/openApi/swap/v2/trade/order", {
             "symbol":       symbol,
             "side":         side,
             "positionSide": position_side,
             "type":         "STOP_MARKET",
             "stopPrice":    f"{stop_price:.6f}",
-            "quantity":     f"{quantity:.6f}".rstrip("0").rstrip("."),
+            "quantity":     qty_str,
         })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
