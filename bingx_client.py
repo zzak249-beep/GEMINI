@@ -54,7 +54,7 @@ class BingXClient:
         p = dict(params)
         p["timestamp"] = self._ts()
         p["signature"] = self._sign(p)
-        r = self._session.post(f"{self.base_url}{path}", params=p, timeout=12)
+        r = self._session.post(f"{self.base_url}{path}", data=p, timeout=12)  # body not URL
         r.raise_for_status()
         d = r.json()
         if d.get("code") != 0:
