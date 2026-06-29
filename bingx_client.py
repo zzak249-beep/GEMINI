@@ -157,9 +157,13 @@ class BingXClient:
 
     def _balance_usdt(self) -> dict:
         data = self._get("/openApi/swap/v2/user/balance")
-        for a in (data.get("balance") or []):
-            if a.get("asset") == "USDT":
-                return a
+        bal = data.get("balance") or {}
+        if isinstance(bal, dict):
+            return bal
+        if isinstance(bal, list):
+            for a in bal:
+                if isinstance(a, dict) and a.get("asset") == "USDT":
+                    return a
         return {}
 
     def get_equity(self) -> float:
