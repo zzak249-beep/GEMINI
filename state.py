@@ -13,7 +13,7 @@ import time
 
 log = logging.getLogger("state")
 
-_STATE_FILE = os.getenv("STATE_FILE", "/tmp/bot_state.json")
+_STATE_FILE = os.getenv("STATE_FILE", "/app/bot_state.json")
 
 
 # ── Internal I/O ──────────────────────────────────────────────
@@ -28,6 +28,8 @@ def _load() -> dict:
 
 def _save(data: dict):
     try:
+        import os as _os
+        _os.makedirs(_os.path.dirname(_STATE_FILE) or ".", exist_ok=True)
         with open(_STATE_FILE, "w") as f:
             json.dump(data, f)
     except Exception as e:
