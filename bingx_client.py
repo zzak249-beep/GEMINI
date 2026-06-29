@@ -27,8 +27,7 @@ class BingXClient:
     # ── Signing ───────────────────────────────────────────────
 
     def _sign(self, params: dict) -> str:
-        # Manual join avoids urlencode encoding differences with BingX
-        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        qs = urllib.parse.urlencode(sorted(params.items()))
         return hmac.new(
             self.secret_key.encode(), qs.encode(), hashlib.sha256
         ).hexdigest()
