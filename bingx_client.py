@@ -27,7 +27,8 @@ class BingXClient:
     # ── Signing ───────────────────────────────────────────────
 
     def _sign(self, params: dict) -> str:
-        qs = urllib.parse.urlencode(sorted(params.items()))
+        # Manual join avoids urlencode encoding differences with BingX
+        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
         return hmac.new(
             self.secret_key.encode(), qs.encode(), hashlib.sha256
         ).hexdigest()
@@ -41,6 +42,7 @@ class BingXClient:
     def _get(self, path: str, params: dict = None):
         p = dict(params or {})
         p["timestamp"] = self._ts()
+        p["recvWindow"] = 5000
         p["signature"] = self._sign(p)
         r = self._session.get(f"{self.base_url}{path}", params=p, timeout=12)
         r.raise_for_status()
@@ -227,14 +229,15 @@ class BingXClient:
 
     def place_stop_market(self, symbol: str, position_side: str,
                           stop_price: float, quantity: float) -> dict:
+        """Stop-market order in hedge mode — no closePosition, use quantity."""
         side = "SELL" if position_side == "LONG" else "BUY"
         return self._post("/openApi/swap/v2/trade/order", {
-            "symbol": symbol, "side": side,
+            "symbol":       symbol,
+            "side":         side,
             "positionSide": position_side,
-            "type": "STOP_MARKET",
-            "stopPrice": f"{stop_price:.8g}",
-            "closePosition": "true",
-            "quantity": str(quantity),
+            "type":         "STOP_MARKET",
+            "stopPrice":    f"{stop_price:.6f}",
+            "quantity":     f"{quantity:.6f}".rstrip("0").rstrip("."),
         })
 
     def close_position(self, symbol: str, position_side: str, quantity: float) -> dict:
