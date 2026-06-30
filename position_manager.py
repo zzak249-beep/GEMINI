@@ -13,6 +13,7 @@ Fixes vs previous version:
 
 import logging
 import math
+import time
 
 import config
 import state
@@ -130,13 +131,24 @@ class PositionManager:
         try:
             self.client.set_leverage(symbol, config.LEVERAGE)
             self.client.place_market_order(symbol, "SELL", "SHORT", qty)
+
+            # FIX: verify the position actually materialized on BingX.
+            # A code=0 response only means "request accepted" — BingX can
+            # still reject the fill server-side (margin, precision, liquidity)
+            # without raising an exception on the initial POST.
+            time.sleep(1.0)
+            confirmed = self.get_position(symbol, "SHORT")
+            if not confirmed:
+                log.error(f"open_short {symbol}: order accepted but NO position found after 1s — likely rejected by exchange (qty={qty})")
+                return False
+
             state.save_entry(symbol, "SHORT")
             state.set_tp1_hit(symbol, "SHORT", False)
             state.set_be_moved(symbol, "SHORT", False)
             mark = self.client.get_mark_price(symbol)
             init_stop = mark + atr * config.TRAIL_DISTANCE_ATR
             state.save_trail(symbol, "SHORT", init_stop)
-            log.info(f"OPEN SHORT {symbol}  qty={qty}  stop={init_stop:.6g}")
+            log.info(f"OPEN SHORT {symbol}  qty={confirmed['size']}  stop={init_stop:.6g}")
             return True
         except Exception as e:
             log.error(f"open_short {symbol}: {e}")
