@@ -159,3 +159,6 @@ PORT       = _int("PORT", 8080)
 # ── Telegram
 TELEGRAM_TOKEN = _str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
+
+SESSION_START = int(os.getenv('SESSION_START', '0'))
+SESSION_END   = int(os.getenv('SESSION_END',   '24'))
