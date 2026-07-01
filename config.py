@@ -83,7 +83,7 @@ ADX_LATERAL = _float("ADX_LATERAL", 20.0)
 LATERAL_ADX_MAX = _float("LATERAL_ADX_MAX", 25.0)
 
 # ── Scoring thresholds
-MIN_SCORE  = _int("MIN_SCORE", 55)
+MIN_SCORE  = _int("MIN_SCORE", 42)
 FUEL_SCORE = _int("FUEL_SCORE", 62)
 SUP_SCORE  = _int("SUP_SCORE", 78)
 COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
@@ -139,7 +139,7 @@ KELLY_RR        = _float("KELLY_RR", 1.5)
 KELLY_FRACTION  = _float("KELLY_FRACTION", 0.15)
 
 # ── Copy / multi-bot
-COPY_MIN_SCORE     = _int("COPY_MIN_SCORE", 62)
+COPY_MIN_SCORE     = _int("COPY_MIN_SCORE", 50)
 COPY_SIZE_MULT     = _float("COPY_SIZE_MULT", 0.4)
 EXCLUSIVE_TOP_N    = _int("EXCLUSIVE_TOP_N", 30)
 COPY_MAX_ADVERSE_PCT = _float("COPY_MAX_ADVERSE_PCT", -0.3)
