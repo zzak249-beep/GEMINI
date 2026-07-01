@@ -37,8 +37,8 @@ BASE_URL   = "https://open-api.bingx.com"
 SHORT_ONLY = _bool("SHORT_ONLY", "true")
 
 # ── Trading universe
-TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 100)
-MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 5_000_000)
+TOP_N_SYMBOLS   = _int("TOP_N_SYMBOLS", 300)
+MIN_VOLUME_USDT = _float("MIN_VOLUME_USDT", 1_000_000)
 BLACKLIST       = _list("BLACKLIST",
     "ESPORTS,STABLEUSDT,EURUSD,SILVER,SILVERXAG,OILWTI,OILBRENT,PAXG,CUSDT,"
     "SYN,ANIME,FLOCK,GOLD,GOLDXAU,XAU,GASOLINE,PALLADIUM,NCCOPALLADIUM")
@@ -47,7 +47,7 @@ BLACKLIST       = _list("BLACKLIST",
 CAPITAL          = _float("CAPITAL", 289.0)
 LEVERAGE         = _int("LEVERAGE", 8)
 RISK_PCT         = _float("RISK_PCT", 0.8)
-MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 9)
+MAX_OPEN_TRADES  = _int("MAX_OPEN_TRADES", 4)
 MAX_DAILY_TRADES = _int("MAX_DAILY_TRADES", 1800)
 DAILY_LOSS_PCT   = _float("DAILY_LOSS_PCT", 5.0)        # era 50% → FIX: 5%
 MAX_NOTIONAL_USDT = _float("MAX_NOTIONAL_USDT", 30.0)   # era 800 → FIX: 30
@@ -59,7 +59,7 @@ SL_ATR_MULT         = _float("SL_ATR_MULT", 1.8)
 BREAKEVEN_ATR_MULT  = _float("BREAKEVEN_ATR_MULT", 1.0)
 TP1_ATR_MULT        = _float("TP1_ATR_MULT", 1.5)
 TP2_ATR_MULT        = _float("TP2_ATR_MULT", 3.5)
-TRAIL_DISTANCE_ATR          = _float("TRAIL_DISTANCE_ATR", 1.5)
+TRAIL_DISTANCE_ATR          = _float("TRAIL_DISTANCE_ATR", 2.0)
 TRAIL_DISTANCE_ATR_POST_TP1 = _float("TRAIL_DISTANCE_ATR_POST_TP1", 0.8)  # NEW
 
 # ── Time controls
@@ -83,7 +83,7 @@ ADX_LATERAL = _float("ADX_LATERAL", 20.0)
 LATERAL_ADX_MAX = _float("LATERAL_ADX_MAX", 25.0)
 
 # ── Scoring thresholds
-MIN_SCORE  = _int("MIN_SCORE", 42)
+MIN_SCORE  = _int("MIN_SCORE", 58)
 FUEL_SCORE = _int("FUEL_SCORE", 62)
 SUP_SCORE  = _int("SUP_SCORE", 78)
 COUNTER_TREND_PENALTY = _float("COUNTER_TREND_PENALTY", 12.0)
@@ -139,7 +139,7 @@ KELLY_RR        = _float("KELLY_RR", 1.5)
 KELLY_FRACTION  = _float("KELLY_FRACTION", 0.15)
 
 # ── Copy / multi-bot
-COPY_MIN_SCORE     = _int("COPY_MIN_SCORE", 50)
+COPY_MIN_SCORE     = _int("COPY_MIN_SCORE", 62)
 COPY_SIZE_MULT     = _float("COPY_SIZE_MULT", 0.4)
 EXCLUSIVE_TOP_N    = _int("EXCLUSIVE_TOP_N", 30)
 COPY_MAX_ADVERSE_PCT = _float("COPY_MAX_ADVERSE_PCT", -0.3)
@@ -162,3 +162,10 @@ TELEGRAM_CHAT  = _str("TELEGRAM_CHAT_ID")
 
 SESSION_START = int(os.getenv('SESSION_START', '0'))
 SESSION_END   = int(os.getenv('SESSION_END',   '24'))
+
+# Filtro de tendencia BTC: solo SHORT cuando BTC está bajista
+BTC_TREND_FILTER = _bool("BTC_TREND_FILTER", "true")
+BTC_TREND_TF     = _str("BTC_TREND_TF", "1h")
+BTC_EMA_FAST     = _int("BTC_EMA_FAST", 20)
+BTC_EMA_SLOW     = _int("BTC_EMA_SLOW", 50)
+TRADE_COOLDOWN_SEC = _int("TRADE_COOLDOWN_SEC", 300)  # 5min
