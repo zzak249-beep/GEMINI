@@ -33,7 +33,32 @@ logging.basicConfig(
 log = logging.getLogger("scanner")
 
 
+
+
+def _start_health_server():
+    """Minimal HTTP server for Railway healthcheck on /health."""
+    import threading
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        def log_message(self, *a):
+            pass  # suppress access logs
+
+    try:
+        port = getattr(config, "PORT", 8080)
+        srv = HTTPServer(("0.0.0.0", port), _H)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        log.info(f"Health server :{ port}/health")
+    except Exception as e:
+        log.warning(f"Health server failed: {e}")
+
 def main():
+    _start_health_server()
     log.info(f"=== {config.BOT_NAME} starting (SHORT_ONLY={config.SHORT_ONLY}) ===")
 
     client  = BingXClient(config.API_KEY, config.SECRET_KEY, config.BASE_URL)
@@ -45,6 +70,8 @@ def main():
 
     # Reconcile existing positions into state.py on startup
     _startup_reconcile(client, tg)
+    # Cancel orphan orders and re-place fresh SL/TP for all positions
+    _startup_cleanup_orders(client, pos_mgr, tg)
 
     iteration    = 0
     last_scan_t  = 0.0
@@ -139,6 +166,62 @@ def _startup_reconcile(client: BingXClient, tg: TelegramClient):
         log.info(f"Reconciled {reconciled} existing positions into state.py")
 
 
+def _startup_cleanup_orders(client: BingXClient, pos_mgr: PositionManager,
+                             tg: TelegramClient):
+    """
+    FIX: cancel ALL orphan orders for every open position on startup.
+    Solves the 20-orders accumulation bug caused by cancel failures.
+    Then re-places a fresh SL + TP1 based on entry price and current ATR.
+    Also re-initializes trail stop from current price so it works immediately.
+    """
+    positions = client.get_positions()
+    if not positions:
+        return
+
+    log.info(f"Startup order cleanup: {len(positions)} positions")
+    for pos in positions:
+        sym   = pos["symbol"]
+        side  = pos["positionSide"]
+        size  = pos["size"]
+        entry = pos["entryPrice"]
+
+        if side != "SHORT":
+            continue
+
+        try:
+            # Step 1: Cancel ALL existing orders (kills accumulation)
+            client.cancel_all_open_orders(sym)
+            log.info(f"Cleanup: cancelled all orders for {sym}")
+
+            # Step 2: Get current ATR
+            candles = client.get_klines(sym, config.TIMEFRAME, 80)
+            if len(candles) < 20:
+                continue
+            ind = get_indicators(candles)
+            atr = ind.get("atr")
+            if not atr:
+                continue
+
+            mark = client.get_mark_price(sym)
+
+            # Step 3: Re-initialize trail stop from current price
+            # (avoids stale trail that never fires after restart)
+            current_trail = state.get_trail(sym, side)
+            if current_trail is None:
+                fresh_stop = mark + atr * config.TRAIL_DISTANCE_ATR
+                state.save_trail(sym, side, fresh_stop)
+                log.info(f"Cleanup: trail reset {sym} → {fresh_stop:.6g}")
+
+            # Step 4: Re-place fresh SL + TP1 (max 2 orders)
+            pos_mgr.place_tp_sl(sym, side, entry, size, atr)
+            log.info(f"Cleanup: fresh TP/SL placed for {sym}")
+
+        except Exception as e:
+            log.error(f"Cleanup {sym}: {e}")
+
+    tg.info(config.BOT_NAME, f"✅ Startup cleanup: {len(positions)} posiciones saneadas")
+
+
 # ── Position management ────────────────────────────────────────
 
 def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
@@ -226,6 +309,25 @@ def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
                     risk: RiskManager, tg: TelegramClient,
                     slots: int, equity: float) -> tuple:
     n_sig   = 0
+
+    # ── BTC trend filter: solo SHORT cuando BTC bajista ──────────────────────
+    if getattr(config, "BTC_TREND_FILTER", True):
+        try:
+            c = client.get_klines("BTC-USDT", "1h", 60)
+            if len(c) >= 52:
+                cls = [x["close"] for x in c]
+                def _ema(v, p):
+                    k=2/(p+1); e=v[0]
+                    for x in v[1:]: e=x*k+e*(1-k)
+                    return e
+                e20 = _ema(cls[-20:], 20)
+                e50 = _ema(cls[-50:], 50)
+                if e20 > e50:
+                    log.info("BTC trend=UP — SHORTs bloqueados")
+                    return n_sig, 0.0, 0.0
+                log.info("BTC trend=DOWN — SHORTs permitidos")
+        except Exception as e:
+            log.warning(f"BTC trend check: {e}")
     scores  = []
 
     try:
