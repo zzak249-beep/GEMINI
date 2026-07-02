@@ -8,6 +8,25 @@ Loop:
 Log format (matches existing Railway logs):
   scanner | Iter N | 100 símbolos | N señales | Ns |
   direccionales=N avg=X max=X | session_filter=N
+
+FIX: _startup_cleanup_orders() y _manage_positions() ahora iteran
+state.get_tracked_positions() — solo posiciones propias — en vez de
+client.get_positions() (toda la cuenta). n_open/slots en main()
+también. _startup_cleanup_orders() ya está reactivada en main().
+
+_startup_reconcile() sigue DESACTIVADA: su propósito es adoptar
+cualquier posición sin entry_ts, y no hay forma de distinguir una
+propia huérfana de una de otro bot sin un tag de dueño real en el
+exchange. Requiere una decisión de diseño, no un parche mecánico.
+
+FIX: TP1 partial ahora comprueba el resultado de close_short() antes
+de marcar tp1_hit y notificar.
+
+PENDIENTE: bingx_client.py de este bot no se ha revisado. Si
+place_stop_market()/place_limit_order() no mandan reduceOnly=true,
+esto se romperá igual que se rompió en renewed-love — error BingX
+[110424] "order size must be less than the available amount" en
+cuanto entre una señal real.
 """
 
 import logging
@@ -68,9 +87,12 @@ def main():
 
     tg.startup(config.BOT_NAME, config.TIMEFRAME, config.LEVERAGE)
 
-    # Reconcile existing positions into state.py on startup
-    _startup_reconcile(client, tg)
-    # Cancel orphan orders and re-place fresh SL/TP for all positions
+    # FIX: _startup_reconcile() sigue desactivada — su propósito es
+    # "adoptar" cualquier posición sin entry_ts, y no hay forma de
+    # distinguir una propia huérfana de una de otro bot sin un tag de
+    # dueño real. _startup_cleanup_orders() ya es segura de nuevo:
+    # ahora itera solo state.get_tracked_positions(), no toda la cuenta.
+    # _startup_reconcile(client, tg)
     _startup_cleanup_orders(client, pos_mgr, tg)
 
     iteration    = 0
@@ -112,7 +134,7 @@ def main():
                     time.sleep(5)
                     continue
 
-                n_open = len(client.get_positions())
+                n_open = len(state.get_tracked_positions())   # FIX: solo propias
                 slots  = config.MAX_OPEN_TRADES - n_open
                 n_sig  = avg_sc = max_sc = 0
 
@@ -147,6 +169,10 @@ def _startup_reconcile(client: BingXClient, tg: TelegramClient):
     FIX: save entry_ts NOW for any position not already in state.py.
     Ensures MAX_HOLD works after Railway restart even for existing positions.
     Also alerts on blacklisted symbols still open.
+
+    DESACTIVADA en main() — ver docstring del módulo. client.get_positions()
+    trae toda la cuenta; esto adoptaría como propia cualquier posición de
+    otro bot que no tenga entry_ts en el state.py de joyful-art.
     """
     positions = client.get_positions()
     reconciled = 0
@@ -173,20 +199,29 @@ def _startup_cleanup_orders(client: BingXClient, pos_mgr: PositionManager,
     Solves the 20-orders accumulation bug caused by cancel failures.
     Then re-places a fresh SL + TP1 based on entry price and current ATR.
     Also re-initializes trail stop from current price so it works immediately.
+
+    FIX: itera state.get_tracked_positions() — solo posiciones propias —
+    en vez de client.get_positions() (toda la cuenta). Antes cancelaba
+    y reemplazaba el SL/TP de cualquier SHORT de la cuenta, fuera de
+    quien fuera.
     """
-    positions = client.get_positions()
-    if not positions:
+    tracked = state.get_tracked_positions()
+    if not tracked:
         return
 
-    log.info(f"Startup order cleanup: {len(positions)} positions")
-    for pos in positions:
-        sym   = pos["symbol"]
-        side  = pos["positionSide"]
-        size  = pos["size"]
-        entry = pos["entryPrice"]
-
+    log.info(f"Startup order cleanup: {len(tracked)} posiciones propias")
+    for sym, side in tracked:
         if side != "SHORT":
             continue
+
+        pos = pos_mgr.get_position(sym, side)
+        if not pos:
+            state.clear(sym, side)
+            log.info(f"state.clear {sym} {side}: ya no existe en el exchange")
+            continue
+
+        size  = pos["size"]
+        entry = pos["entryPrice"]
 
         try:
             # Step 1: Cancel ALL existing orders (kills accumulation)
@@ -219,28 +254,32 @@ def _startup_cleanup_orders(client: BingXClient, pos_mgr: PositionManager,
         except Exception as e:
             log.error(f"Cleanup {sym}: {e}")
 
-    tg.info(config.BOT_NAME, f"✅ Startup cleanup: {len(positions)} posiciones saneadas")
+    tg.info(config.BOT_NAME, f"✅ Startup cleanup: {len(tracked)} posiciones propias saneadas")
 
 
 # ── Position management ────────────────────────────────────────
 
 def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
                       risk: RiskManager, tg: TelegramClient):
-    try:
-        positions = client.get_positions()
-    except Exception as e:
-        log.error(f"get_positions: {e}")
-        return
+    """
+    FIX: itera state.get_tracked_positions() — posiciones que ESTE bot
+    abrió — en vez de client.get_positions() (toda la cuenta). Antes,
+    con la cuenta compartida, esto aplicaba max-hold/TP/trail de
+    joyful-art a cualquier SHORT de la cuenta, fuera de quien fuera.
+    """
+    for sym, side in state.get_tracked_positions():
+        if side != "SHORT":
+            continue   # este bot es SHORT-only; ignora cualquier LONG trackeado por error
 
-    for pos in positions:
-        sym   = pos["symbol"]
-        side  = pos["positionSide"]
+        pos = pos_mgr.get_position(sym, side)
+        if not pos:
+            state.clear(sym, side)
+            log.info(f"state.clear {sym} {side}: ya no existe en el exchange")
+            continue
+
         size  = pos["size"]
         entry = pos["entryPrice"]
         pnl   = pos["unrealizedPnl"]
-
-        if side != "SHORT":
-            continue
 
         try:
             mark    = client.get_mark_price(sym)
@@ -267,10 +306,10 @@ def _manage_positions(client: BingXClient, pos_mgr: PositionManager,
             if pos_mgr.should_take_tp1(sym, "SHORT", mark, entry, atr):
                 tp_qty = pos_mgr._round_qty(sym, size * 0.5)
                 if tp_qty >= pos_mgr._min_qty(sym):
-                    pos_mgr.close_short(sym, tp_qty, "tp1_partial")
-                    pos_mgr.mark_tp1_hit(sym, "SHORT")
-                    tg.exit_trade(config.BOT_NAME, sym, "SHORT", mark,
-                                  "TP1 partial", pnl * 0.5)
+                    if pos_mgr.close_short(sym, tp_qty, "tp1_partial"):   # FIX: comprobar éxito
+                        pos_mgr.mark_tp1_hit(sym, "SHORT")
+                        tg.exit_trade(config.BOT_NAME, sym, "SHORT", mark,
+                                      "TP1 partial", pnl * 0.5)
 
             # 4. ATR trail stop
             stop, hit = pos_mgr.tick_trail(sym, "SHORT", mark, atr)
