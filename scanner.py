@@ -27,6 +27,15 @@ place_stop_market()/place_limit_order() no mandan reduceOnly=true,
 esto se romperá igual que se rompió en renewed-love — error BingX
 [110424] "order size must be less than the available amount" en
 cuanto entre una señal real.
+
+FIX: filtro de tendencia BTC (EMA20 vs EMA50 en 1h) convertido de
+veto binario a penalización de score (BTC_TREND_PENALTY, default 15).
+Antes bloqueaba el 100% de los SHORT mientras BTC estuviera alcista,
+dejando el bot inactivo horas seguidas sin importar la calidad del
+setup individual. Ahora un setup excepcional puede seguir pasando
+MIN_SCORE; uno mediocre no. Sin backtesting propio — vigilar la
+primera semana y ajustar BTC_TREND_PENALTY si pasan demasiadas o
+muy pocas señales.
 """
 
 import logging
@@ -349,7 +358,13 @@ def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
                     slots: int, equity: float) -> tuple:
     n_sig   = 0
 
-    # ── BTC trend filter: solo SHORT cuando BTC bajista ──────────────────────
+    # ── BTC trend filter: penaliza SHORTs cuando BTC está alcista ────────────
+    # FIX: antes era un veto binario (return 0 señales si BTC subía).
+    # Ahora es una penalización de score, igual que COUNTER_TREND_PENALTY
+    # ya hace con la tendencia HTF del propio símbolo. Un setup muy fuerte
+    # en un símbolo concreto puede seguir pasando MIN_SCORE aunque BTC esté
+    # alcista; uno mediocre no. Ajustable vía BTC_TREND_PENALTY (default 15).
+    btc_penalty = 0
     if getattr(config, "BTC_TREND_FILTER", True):
         try:
             c = client.get_klines("BTC-USDT", "1h", 60)
@@ -362,9 +377,10 @@ def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
                 e20 = _ema(cls[-20:], 20)
                 e50 = _ema(cls[-50:], 50)
                 if e20 > e50:
-                    log.info("BTC trend=UP — SHORTs bloqueados")
-                    return n_sig, 0.0, 0.0
-                log.info("BTC trend=DOWN — SHORTs permitidos")
+                    btc_penalty = getattr(config, "BTC_TREND_PENALTY", 15)
+                    log.info(f"BTC trend=UP — penalización -{btc_penalty} a todo SHORT")
+                else:
+                    log.info("BTC trend=DOWN — sin penalización")
         except Exception as e:
             log.warning(f"BTC trend check: {e}")
     scores  = []
@@ -430,6 +446,7 @@ def _scan_and_enter(client: BingXClient, pos_mgr: PositionManager,
             # Composite score
             score = _compute_score(price, ind, sym, client)
             score -= rsi15m_penalty
+            score -= btc_penalty   # FIX: penalización en vez de veto binario
             score  = max(0, score)
             scores.append(score)
 
