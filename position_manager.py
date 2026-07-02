@@ -9,6 +9,9 @@ Fixes vs previous version:
      → fixes EURUSD 24-orders accumulation bug
   5. Notional check after rounding → skip if < MIN_NOTIONAL_USDT * 0.9
   6. Score-based tier sizing (STD / FUEL / SUP)
+  7. place_tp_sl() TP1 order now passes reduce_only=True to
+     bingx_client.place_limit_order() — needed for the reduceOnly fix
+     in bingx_client.py to actually take effect on this call.
 """
 
 import logging
@@ -245,7 +248,8 @@ class PositionManager:
 
         if tp_qty >= self._min_qty(symbol):
             try:
-                self.client.place_limit_order(symbol, "BUY", side, tp1_price, tp_qty)
+                self.client.place_limit_order(symbol, "BUY", side, tp1_price, tp_qty,
+                                              reduce_only=True)   # FIX
             except Exception as e:
                 log.error(f"place_tp1 {symbol}: {e}")
 
