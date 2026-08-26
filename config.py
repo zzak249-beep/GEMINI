@@ -176,10 +176,6 @@ DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
 DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
 HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
 
-# ── Estado ────────────────────────────────────────────────────────────
-STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-
 # ── Cascadas de liquidación (confirmación, no sustituto) ───────────────
 # Gratis: streams públicos de Binance y Bybit — BingX no publica esto,
 # y Coinglass ya no tiene tier gratuito (29$/mes mínimo). Esto SOLO
@@ -200,6 +196,40 @@ LIQ_MULTIPLIER = _float("LIQ_MULTIPLIER", 3.0)
 # Piso absoluto en USD: sin esto, un símbolo casi sin actividad de
 # liquidaciones da falsos "3×" sobre una base casi nula.
 LIQ_MIN_USD = _float("LIQ_MIN_USD", 5_000.0)
+
+# ── RSI de doble cruce (confirmación de entrada, 5m) ───────────────────
+# Traducción del script "ProBorsa: RSI & SuperTrend" — cuenta cruces del
+# RSI sobre su propia media mientras sigue en zona débil, y dispara en
+# el 2º cruce (doble suelo/techo visto en el RSI). Aquí se hizo
+# simétrico: el original solo detectaba el lado alcista.
+RSI_CONFIRM_ENABLED = _bool("RSI_CONFIRM_ENABLED", True)
+RSI_LENGTH = _int("RSI_LENGTH", 10)
+RSI_SIGNAL_LENGTH = _int("RSI_SIGNAL_LENGTH", 10)
+RSI_TRIGGER = _float("RSI_TRIGGER", 50.0)
+RSI_TARGET_CROSSES = _int("RSI_TARGET_CROSSES", 2)
+# Cuántas velas de 5m hacia atrás cuentan como "reciente" — el cruce no
+# tiene por qué caer EXACTAMENTE en la misma vela que la de agotamiento.
+RSI_CONFIRM_BARS = _int("RSI_CONFIRM_BARS", 3)
+# Si True, una señal SIN confirmación del RSI no se envía ni se abre —
+# es un filtro real, no solo informativo. Empieza en True porque es
+# literalmente lo que se pidió: combinar el RSI con las entradas.
+# Se puede aflojar a False para verlo solo como información mientras
+# se mide si ayuda o solo recorta señales buenas.
+RSI_REQUIRE = _bool("RSI_REQUIRE", True)
+
+# ── Radar de 30m (sesgo de tendencia, filtra contra-tendencia) ─────────
+# Un segundo escaneo del universo, en 30m, EXCLUSIVAMENTE para decidir
+# si hay una tendencia de fondo clara. Si la hay, bloquea las señales
+# de 5m que apuesten EN CONTRA de ella — el patrón que el propio
+# histórico del proyecto señaló como el principal origen de pérdidas
+# (largos a contra-tendencia en mercado bajista, ~43% de acierto).
+RADAR30M_ENABLED = _bool("RADAR30M_ENABLED", True)
+RADAR30M_TIMEFRAME = os.getenv("RADAR30M_TIMEFRAME", "30m").strip()
+RADAR30M_INTERVAL_MIN = _int("RADAR30M_INTERVAL_MIN", 30)
+
+# ── Estado ────────────────────────────────────────────────────────────
+STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 
 
 def is_live() -> bool:

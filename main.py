@@ -24,6 +24,7 @@ import scanner
 import xsection
 import strategy
 import liquidations
+import rsi_confirm
 import stats
 from bingx import BingX, BingXError
 from notify import State, Telegram
@@ -44,7 +45,13 @@ if config.LOG_LEVEL != "DEBUG":
 log = logging.getLogger("bot")
 
 
-def fmt_signal(sig: strategy.Signal, live: bool, cascade: dict | None = None) -> str:
+def fmt_signal(
+    sig: strategy.Signal,
+    live: bool,
+    cascade: dict | None = None,
+    rsi_result: "rsi_confirm.RsiConfirm | None" = None,
+    bias30m: str | None = None,
+) -> str:
     lado = "LARGO" if sig.side == "BUY" else "CORTO"
     cabecera = "🟢 EJECUTADO" if live else "🔔 SEÑAL"
     texto = (
@@ -59,6 +66,17 @@ def fmt_signal(sig: strategy.Signal, live: bool, cascade: dict | None = None) ->
             f"\n🔥 Confirmada por cascada: {cascade['multiplicador']:.1f}× lo normal, "
             f"{cascade['n_eventos']} liquidaciones de {cascade['lado'].lower()}"
         )
+    if rsi_result is not None:
+        if rsi_confirm.confirms(sig.side, rsi_result):
+            texto += (
+                f"\n📈 RSI confirma: doble "
+                f"{'suelo' if sig.side == 'BUY' else 'techo'} hace "
+                f"{rsi_result.velas_desde_señal} vela(s) (RSI {rsi_result.rsi_actual:.0f})"
+            )
+        else:
+            texto += f"\n📉 RSI sin confirmar (RSI {rsi_result.rsi_actual:.0f}) — solo informativo"
+    if bias30m and bias30m != "NEUTRAL":
+        texto += f"\n🧭 A favor de la tendencia de 30m ({bias30m.lower()})"
     return texto
 
 
@@ -77,6 +95,9 @@ class Bot:
         self.last_rows: list = []
         self.last_heartbeat = time.time()
         self.liq = liquidations.LiquidationTracker() if config.LIQUIDATIONS_ENABLED else None
+        self.radar30 = scanner.Scanner(self.api, timeframe=config.RADAR30M_TIMEFRAME) if config.RADAR30M_ENABLED else None
+        self.bias30m: dict[str, str] = {}
+        self.last_radar30 = 0.0
 
     async def start(self) -> None:
         log.info("Modo: %s", config.describe())
@@ -85,7 +106,9 @@ class Bot:
             f"{config.describe()}\n"
             f"Filtro de amplitud: ATR ≥ {config.MIN_ATR_PCT}% y ≥ {config.MIN_COST_COVER:.0f}× el coste\n"
             f"Riesgo por operación: {config.RISK_PCT}%\n"
-            f"Cascadas de liquidación: {'activadas (Binance + Bybit)' if self.liq else 'desactivadas'}"
+            f"Cascadas de liquidación: {'activadas (Binance + Bybit)' if self.liq else 'desactivadas'}\n"
+            f"RSI doble cruce: {'EXIGIDO' if (config.RSI_CONFIRM_ENABLED and config.RSI_REQUIRE) else ('informativo' if config.RSI_CONFIRM_ENABLED else 'desactivado')}\n"
+            f"Radar 30m (contra-tendencia): {'activado' if self.radar30 else 'desactivado'}"
         )
         await self.refresh_symbols()
         if self.liq:
@@ -99,6 +122,7 @@ class Bot:
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
                 await self.check_time_exits()
+                await self.maybe_radar30m()
                 await self.maybe_rank()
                 await self.scan_once()
             except Exception as exc:  # noqa: BLE001
@@ -402,6 +426,28 @@ class Bot:
                 self.register_close_r(symbol, pos, exit_price, reason=reason, mode="SIGNAL")
                 break
 
+    async def maybe_radar30m(self) -> None:
+        """
+        Escaneo aparte, en 30m, EXCLUSIVAMENTE para saber si hay
+        tendencia de fondo. No genera señales ni avisos propios — solo
+        actualiza self.bias30m, que scan_once() consulta para bloquear
+        entradas de 5m a contra-tendencia.
+        """
+        if not self.radar30:
+            return
+        if time.time() - self.last_radar30 < config.RADAR30M_INTERVAL_MIN * 60:
+            return
+        self.last_radar30 = time.time()
+        try:
+            rows = await self.radar30.run(self.symbols)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Radar 30m falló (%s): se mantiene el sesgo anterior", exc)
+            return
+        nuevo_bias = {r.symbol: scanner.bias_from_row(r) for r in rows}
+        con_tendencia = sum(1 for v in nuevo_bias.values() if v != "NEUTRAL")
+        log.info("Radar 30m: %d símbolos, %d con tendencia de fondo marcada", len(rows), con_tendencia)
+        self.bias30m = nuevo_bias
+
     async def maybe_rank(self) -> None:
         """Ranking del universo completo, cada RANK_INTERVAL_MIN."""
         if not config.SCAN_ALL:
@@ -469,7 +515,34 @@ class Bot:
             if sym in self.state.data.get("open", {}):
                 continue
 
-            await self.handle_signal(sig)
+            # Filtro de contra-tendencia (radar 30m). Solo bloquea
+            # cuando hay un sesgo CLARO — símbolo sin dato o en rango
+            # en 30m pasa igual, para no bloquear todo por falta de
+            # información. Es el mismo patrón que ya se midió como
+            # principal fuente de pérdidas: largos a contra-tendencia
+            # en mercado bajista.
+            bias = self.bias30m.get(sym, "NEUTRAL")
+            if (bias == "BAJISTA" and sig.side == "BUY") or (bias == "ALCISTA" and sig.side == "SELL"):
+                log.info("%s: señal %s bloqueada — contra-tendencia de 30m (%s)", sym, sig.side, bias)
+                continue
+
+            # Confirmación por RSI de doble cruce, sobre las MISMAS
+            # velas de 5m — sin llamadas extra a la API.
+            rsi_result = rsi_confirm.evaluate(
+                velas,
+                length=config.RSI_LENGTH,
+                sig_length=config.RSI_SIGNAL_LENGTH,
+                trigger=config.RSI_TRIGGER,
+                target_count=config.RSI_TARGET_CROSSES,
+                ventana=config.RSI_CONFIRM_BARS,
+            ) if config.RSI_CONFIRM_ENABLED else None
+
+            if config.RSI_CONFIRM_ENABLED and config.RSI_REQUIRE:
+                if not rsi_confirm.confirms(sig.side, rsi_result):
+                    log.info("%s: señal %s sin confirmar por RSI — descartada", sym, sig.side)
+                    continue
+
+            await self.handle_signal(sig, rsi_result=rsi_result, bias30m=bias)
             abiertas += 1
             if abiertas >= config.MAX_CONCURRENT:
                 break
@@ -481,7 +554,12 @@ class Bot:
             con_amplitud,
         )
 
-    async def handle_signal(self, sig: strategy.Signal) -> None:
+    async def handle_signal(
+        self,
+        sig: strategy.Signal,
+        rsi_result: "rsi_confirm.RsiConfirm | None" = None,
+        bias30m: str | None = None,
+    ) -> None:
         log.info(
             "SEÑAL %s %s entrada=%.8g sl=%.8g tp=%.8g rr=%.2f atr=%.2f%%",
             sig.side, sig.symbol, sig.entry, sig.sl, sig.tp, sig.rr, sig.atr_pct,
@@ -489,7 +567,7 @@ class Bot:
         cascade = self.liq.cascade_status(sig.symbol) if self.liq else None
 
         if not self.live:
-            await self.tg.send(fmt_signal(sig, live=False, cascade=cascade))
+            await self.tg.send(fmt_signal(sig, live=False, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m))
             self.state.data.setdefault("open", {})[sig.symbol] = {
                 "mode": "SIGNAL",
                 "side": sig.side,
@@ -564,7 +642,7 @@ class Bot:
             "opened_at": time.time(),
         }
         self.state.save()
-        await self.tg.send(fmt_signal(sig, live=True, cascade=cascade))
+        await self.tg.send(fmt_signal(sig, live=True, cascade=cascade, rsi_result=rsi_result, bias30m=bias30m))
 
     def register_close_r(self, symbol: str, pos: dict, exit_price: float, reason: str, mode: str) -> None:
         """

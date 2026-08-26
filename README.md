@@ -117,6 +117,46 @@ coste y donde no hubo negocio, 6-13×.
 
 ---
 
+## RSI de doble cruce + radar de 30m (confirmación de entrada)
+
+Dos filtros nuevos sobre las señales de 5m, pensados para trabajar
+juntos:
+
+**RSI de doble cruce** (`rsi_confirm.py`) — traducción del script Pine
+"ProBorsa: RSI & SuperTrend". No es un cruce de RSI cualquiera: cuenta
+cuántas veces el RSI cruza por encima de su propia media móvil
+MIENTRAS sigue por debajo de 50, y solo confirma en el 2º cruce desde
+la última vez que superó 50 — un doble suelo visto en el RSI en vez de
+en el precio. El script original solo detectaba el lado alcista; aquí
+se añadió el espejo exacto para el lado corto (doble techo), porque el
+bot opera los dos lados.
+
+```
+📈 RSI confirma: doble techo hace 1 vela(s) (RSI 68)
+```
+
+Con `RSI_REQUIRE=true` (por defecto) es un filtro real: una señal sin
+confirmar por RSI **no se envía ni se abre**. Con `RSI_REQUIRE=false`
+pasa a ser solo informativo — recomendado si quieres medir primero
+cuánto recorta antes de dejarlo bloquear entradas.
+
+**Radar de 30m** (`RADAR30M_ENABLED`) — un segundo escaneo del universo
+completo, en 30m, exclusivamente para detectar tendencia de fondo. Si
+un símbolo está en RUPTURA clara en 30m, bloquea las señales de 5m que
+apuesten EN CONTRA de esa tendencia. No es un filtro cualquiera: ataca
+directamente el patrón que el propio histórico de este proyecto
+identificó como la principal fuente de pérdidas — largos a
+contra-tendencia en mercado bajista (~43% de acierto frente a ~79% en
+cortos). Un símbolo sin tendencia clara en 30m (en rango o estirado) no
+bloquea nada — se prefiere dejar pasar una señal con contexto
+desconocido antes que bloquear todo por falta de dato.
+
+```
+🧭 A favor de la tendencia de 30m (bajista)
+```
+
+---
+
 ## Cascadas de liquidación (confirmación, gratis)
 
 Un módulo aparte, `liquidations.py`, escucha dos streams públicos y
@@ -336,6 +376,7 @@ los del Strategy Tester, no iguales.
 | `scanner.py` | Escaneo del universo completo, ranking y favoritas |
 | `stats.py` | Expectancy en R, IC95%, profit factor — ¿es rentable o es ruido? |
 | `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
+| `rsi_confirm.py` | RSI de doble cruce (traducido de ProBorsa) — confirmación de entrada en 5m |
 | `xsection.py` | Sección cruzada (retorno de 24h) |
 | `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
 | `notify.py` | Telegram y estado en disco |
@@ -386,6 +427,7 @@ strategy.py                Motor — traducción literal de reversion_5m.pine
 scanner.py                 Escaneo del universo completo, ranking y favoritas
 stats.py                   Expectancy en R, IC95%, profit factor
 liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
+rsi_confirm.py             RSI de doble cruce — confirmación de entrada
 xsection.py                Sección cruzada (retorno de 24h)
 bingx.py                   Cliente de la API
 notify.py                  Telegram y estado en disco
