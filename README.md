@@ -155,6 +155,51 @@ el aviso, no descubrirlo semanas después.
 
 ---
 
+## ¿Cómo sé si es rentable?
+
+El bot guarda el resultado real (en R, múltiplos de lo arriesgado) de
+cada operación cerrada — no solo si ganó o perdió. Cada resumen diario
+incluye el informe de expectancy:
+
+```
+📈 Rentabilidad — expectancy en R
+
+SIGNAL · n=40
+Media: +0.11R  ·  IC95%: [-0.16, +0.39]
+Win rate: 55%  ·  Profit factor: 1.37
+Drawdown máx: 4.76R
+⚠️ muestra insuficiente — el intervalo cruza cero, podría ser azar
+```
+
+**El win rate solo no basta.** Dos sistemas con el mismo % de aciertos
+pueden ser uno ganador y otro perdedor según el tamaño de los ganadores
+frente a los perdedores. Lo que decide si hay ventaja es la
+**expectativa** (media de R por operación).
+
+**Y la expectativa sola tampoco basta con pocas operaciones.** Con la
+varianza típica de una reversión (se gana 1-1.5R, se pierde 1R, y suele
+haber más pérdidas que aciertos grandes), hacen falta del orden de
+100-150 operaciones para que el intervalo de confianza al 95% deje de
+tocar cero. Por debajo de eso, un +0.3R de media puede ser tan real
+como pura suerte — es la misma cautela que ya pedía este README a mano
+("35 operaciones... es apostar, no operar"), aquí convertida en número
+exacto: si el IC95% toca cero, con esos mismos datos una estrategia SIN
+ventaja real podría dar ese mismo promedio solo por azar.
+
+El informe separa **SIGNAL de LIVE** a propósito: SIGNAL no paga
+slippage ni comisión real, LIVE sí — mezclarlos escondería justo la
+diferencia que la sección "Riesgo que conviene tener presente" de más
+abajo avisa que va a doler.
+
+**Detalle técnico importante:** en modo SIGNAL no hay posición real que
+el exchange cierre solo — el bot comprueba cada ciclo si el precio tocó
+el SL o el TP contra las velas reales (`reconcile_signal()` en
+`main.py`). Sin esto, una señal en SIGNAL no se cerraría nunca salvo por
+el límite de tiempo, y las estadísticas de rentabilidad estarían
+incompletas desde el principio.
+
+---
+
 ## Sección cruzada (opera todos los días)
 
 Segundo sistema, independiente del anterior y con una diferencia clave:
@@ -289,6 +334,7 @@ los del Strategy Tester, no iguales.
 | `main.py` | Bucle de escaneo, señales y ejecución |
 | `strategy.py` | Motor — traducción literal del Pine |
 | `scanner.py` | Escaneo del universo completo, ranking y favoritas |
+| `stats.py` | Expectancy en R, IC95%, profit factor — ¿es rentable o es ruido? |
 | `liquidations.py` | Cascadas de liquidación (Binance + Bybit, gratis) — confirmación, no criterio de entrada |
 | `xsection.py` | Sección cruzada (retorno de 24h) |
 | `bingx.py` | Cliente de la API (velas, saldo, órdenes) |
@@ -338,6 +384,7 @@ caído"**. Si un día no llega el latido, es lo segundo.
 main.py                    Bucle: escaneo, señales, salidas por tiempo, avisos
 strategy.py                Motor — traducción literal de reversion_5m.pine
 scanner.py                 Escaneo del universo completo, ranking y favoritas
+stats.py                   Expectancy en R, IC95%, profit factor
 liquidations.py            Cascadas de liquidación (Binance + Bybit, gratis)
 xsection.py                Sección cruzada (retorno de 24h)
 bingx.py                   Cliente de la API

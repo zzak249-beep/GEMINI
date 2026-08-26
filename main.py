@@ -24,6 +24,7 @@ import scanner
 import xsection
 import strategy
 import liquidations
+import stats
 from bingx import BingX, BingXError
 from notify import State, Telegram
 
@@ -94,6 +95,7 @@ class Bot:
             try:
                 await self.maybe_xsection()
                 await self.reconcile()
+                await self.reconcile_signal()
                 await self.maybe_daily_summary()
                 await self.maybe_heartbeat()
                 await self.check_time_exits()
@@ -165,6 +167,27 @@ class Bot:
         )
         if not entregado:
             log.error("El resumen diario NO se entregó: revisa las credenciales de Telegram")
+
+        informe = self.build_expectancy_report()
+        if informe:
+            await self.tg.send(informe)
+
+    def build_expectancy_report(self) -> str | None:
+        """
+        Arma {'SIGNAL': [...], 'LIVE': [...]} a partir del historial
+        guardado y delega en stats.format_report(). Separado por modo
+        a propósito: SIGNAL no paga slippage ni comisión real, LIVE sí
+        — mezclarlos escondería justo la diferencia que el README
+        avisa que va a doler.
+        """
+        trades = self.state.data.get("trades", [])
+        if not trades:
+            return None
+        rs_por_modo: dict[str, list[float]] = {}
+        for t in trades:
+            modo = t.get("mode", "LIVE")
+            rs_por_modo.setdefault(modo, []).append(float(t["r"]))
+        return stats.format_report(rs_por_modo)
 
     async def maybe_heartbeat(self) -> None:
         """Señal de vida periódica: si deja de llegar, el bot está caído."""
@@ -264,16 +287,14 @@ class Bot:
                 ultimo = velas[-1]["close"] if velas else pos["entry"]
             except Exception:  # noqa: BLE001
                 ultimo = pos["entry"]
-            if pos["side"] == "BUY":
-                gano = ultimo > pos["entry"]
-            else:
-                gano = ultimo < pos["entry"]
-            log.info("%s cerrada fuera del bot (%s)", symbol, "ganada" if gano else "perdida")
+            r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], ultimo)
+            gano = r > 0
+            log.info("%s cerrada fuera del bot (%s, %+.2fR)", symbol, "ganada" if gano else "perdida", r)
             await self.tg.send(
                 f"{'✅' if gano else '🛑'} <b>{symbol}</b> cerrada · "
-                f"{'objetivo' if gano else 'stop'}\n{self.stats_text()}"
+                f"{'objetivo' if gano else 'stop'} · {r:+.2f}R\n{self.stats_text()}"
             )
-            self.register_close(symbol, gano)
+            self.register_close_r(symbol, pos, ultimo, reason=("objetivo" if gano else "stop"), mode=pos.get("mode", "LIVE"))
 
     async def check_time_exits(self) -> None:
         """
@@ -281,6 +302,13 @@ class Bot:
         El SL y el TP los vigila el exchange; el reloj lo vigila el bot,
         porque el exchange no sabe nada de la ventana en la que la
         estrategia tiene sentido.
+
+        ANTES esto hacía pop() del estado sin llamar a
+        register_close_r(): la operación desaparecía sin dejar rastro
+        en wins/losses ni en el historial de R. Con MAX_TRADE_BARS de
+        por medio, buena parte de los cierres pasan por aquí — sin
+        registrarlos, las estadísticas de rentabilidad estaban
+        incompletas desde el principio.
         """
         if not config.USE_TIME_EXIT:
             return
@@ -290,20 +318,22 @@ class Bot:
             edad = ahora - float(pos.get("opened_at", ahora))
             if edad < limite:
                 continue
-            if config.TIME_EXIT_ONLY_LOSING:
-                try:
-                    velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
-                    ultimo = velas[-1]["close"] if velas else None
-                except Exception:  # noqa: BLE001
-                    ultimo = None
-                if ultimo is not None:
-                    entrada = float(pos.get("entry", ultimo))
-                    a_favor = ultimo > entrada if pos["side"] == "BUY" else ultimo < entrada
-                    if a_favor:
-                        log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
-                        continue
+
+            try:
+                velas = await self.api.klines(symbol, config.TIMEFRAME, limit=2)
+                ultimo = velas[-1]["close"] if velas else None
+            except Exception:  # noqa: BLE001
+                ultimo = None
+
+            if config.TIME_EXIT_ONLY_LOSING and ultimo is not None:
+                entrada = float(pos.get("entry", ultimo))
+                a_favor = ultimo > entrada if pos["side"] == "BUY" else ultimo < entrada
+                if a_favor:
+                    log.info("%s pasa del límite pero va a favor: se deja correr", symbol)
+                    continue
+
             log.info("%s lleva %.0f min abierta: cierre por tiempo", symbol, edad / 60)
-            if self.live:
+            if self.live and pos.get("mode") != "SIGNAL":
                 try:
                     qty = float(pos.get("qty", 0))
                     if qty > 0:
@@ -311,12 +341,66 @@ class Bot:
                 except Exception as exc:  # noqa: BLE001
                     await self.tg.send(f"⚠️ No se pudo cerrar {symbol} por tiempo: {exc}")
                     continue
-            self.state.data["open"].pop(symbol, None)
-            self.state.save()
+
+            exit_price = ultimo if ultimo is not None else pos["entry"]
+            r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], exit_price)
             await self.tg.send(
                 f"⏱️ <b>{symbol}</b> cerrada por tiempo tras {edad / 60:.0f} min "
-                f"(límite {limite // 60} min)\nLa vuelta no llegó: fuera de la ventana útil."
+                f"(límite {limite // 60} min) · {r:+.2f}R\n"
+                f"La vuelta no llegó: fuera de la ventana útil."
             )
+            self.register_close_r(symbol, pos, exit_price, reason="tiempo", mode=pos.get("mode", "LIVE"))
+
+    async def reconcile_signal(self) -> None:
+        """
+        En SIGNAL no hay posición real en el exchange que vigilar — el
+        SL y el TP son solo dos números guardados en el estado. SIN
+        ESTE MÉTODO, una señal en SIGNAL no se cerraba NUNCA salvo por
+        el límite de tiempo: si el precio tocaba el stop a los cinco
+        minutos, el bot no se enteraba hasta MAX_TRADE_BARS después (o
+        nunca, si iba a favor). Wins/losses se quedaban a cero para
+        siempre y era imposible saber si el sistema es rentable — que
+        es exactamente el problema que esto soluciona.
+        """
+        abiertas = self.state.data.get("open", {})
+        objetivo = [(sym, pos) for sym, pos in abiertas.items() if pos.get("mode") == "SIGNAL"]
+        for symbol, pos in objetivo:
+            try:
+                velas = await self.api.klines(symbol, config.TIMEFRAME, limit=3)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("%s: no se pudo comprobar SL/TP en SIGNAL (%s)", symbol, exc)
+                continue
+            if len(velas) < 2:
+                continue
+            # Se ignora la vela en curso — igual que en strategy.py, solo
+            # cuentan velas cerradas. Se miran las 2 últimas cerradas por
+            # si el ciclo se saltó una vela entre comprobaciones.
+            cerradas = velas[:-1][-2:]
+            entry, sl, tp, side = pos["entry"], pos["sl"], pos["tp"], pos["side"]
+            for vela in cerradas:
+                if side == "BUY":
+                    tp_hit = vela["high"] >= tp
+                    sl_hit = vela["low"] <= sl
+                else:
+                    tp_hit = vela["low"] <= tp
+                    sl_hit = vela["high"] >= sl
+                if not tp_hit and not sl_hit:
+                    continue
+                # Si la misma vela toca los dos niveles, se asume el
+                # PEOR caso (SL primero): es la convención conservadora
+                # — sin datos de tick no hay forma de saber el orden
+                # real dentro de la vela.
+                if sl_hit:
+                    exit_price, reason = sl, "stop"
+                else:
+                    exit_price, reason = tp, "objetivo"
+                r = stats.compute_r(entry, sl, side, exit_price)
+                await self.tg.send(
+                    f"{'✅' if r > 0 else '🛑'} <b>{symbol}</b> "
+                    f"{'objetivo' if r > 0 else 'stop'} (SIGNAL) · {r:+.2f}R\n{self.stats_text()}"
+                )
+                self.register_close_r(symbol, pos, exit_price, reason=reason, mode="SIGNAL")
+                break
 
     async def maybe_rank(self) -> None:
         """Ranking del universo completo, cada RANK_INTERVAL_MIN."""
@@ -406,7 +490,15 @@ class Bot:
 
         if not self.live:
             await self.tg.send(fmt_signal(sig, live=False, cascade=cascade))
-            self.state.data.setdefault("last_signal", {})[sig.symbol] = time.time()
+            self.state.data.setdefault("open", {})[sig.symbol] = {
+                "mode": "SIGNAL",
+                "side": sig.side,
+                "entry": sig.entry,
+                "sl": sig.sl,
+                "tp": sig.tp,
+                "qty": 0,
+                "opened_at": time.time(),
+            }
             self.state.save()
             return
 
@@ -463,6 +555,7 @@ class Bot:
             return
 
         self.state.data.setdefault("open", {})[sig.symbol] = {
+            "mode": "LIVE",
             "side": sig.side,
             "entry": sig.entry,
             "sl": sig.sl,
@@ -473,13 +566,18 @@ class Bot:
         self.state.save()
         await self.tg.send(fmt_signal(sig, live=True, cascade=cascade))
 
-    def register_close(self, symbol: str, won: bool) -> None:
+    def register_close_r(self, symbol: str, pos: dict, exit_price: float, reason: str, mode: str) -> None:
         """
-        Lo llama el reconciliador cuando detecta una posición cerrada.
-        El circuit breaker cuenta RACHAS, no dinero: el bot no lleva la
-        contabilidad en euros del exchange y fingir un drawdown en % con
-        datos que no tiene sería inventarse una cifra.
+        Registra el cierre con el R conseguido, no solo si ganó o
+        perdió. El circuit breaker sigue contando RACHAS igual que
+        antes — el bot no lleva contabilidad en euros del exchange y
+        fingir un drawdown en % con datos que no tiene sería
+        inventarse una cifra. Lo nuevo es el historial en R
+        (state.data['trades']), que es lo único que permite calcular
+        expectativa y profit factor de verdad — ver stats.py.
         """
+        r = stats.compute_r(pos["entry"], pos["sl"], pos["side"], exit_price)
+        won = r > 0
         d = self.state.data
         d["closed_trades"] = d.get("closed_trades", 0) + 1
         if won:
@@ -500,6 +598,23 @@ class Bot:
                     )
                 )
         d.get("open", {}).pop(symbol, None)
+
+        # Historial en R, acotado a las últimas 1000 para que
+        # state.json no crezca sin límite con el tiempo.
+        historial = d.setdefault("trades", [])
+        historial.append(
+            {
+                "symbol": symbol,
+                "side": pos["side"],
+                "r": round(r, 4),
+                "reason": reason,
+                "mode": mode,
+                "closed_at": time.time(),
+            }
+        )
+        if len(historial) > 1000:
+            del historial[: len(historial) - 1000]
+
         self.state.save()
 
 
