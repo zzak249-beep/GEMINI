@@ -1,7 +1,11 @@
-.env
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
 venv/
+.env
+state.json
 *.log
 .DS_Store
+state_rsi.json
+operaciones_rsi-st-bot.csv
+/data/
