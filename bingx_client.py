@@ -106,19 +106,26 @@ class BingXClient:
     # ------------------------------------------------------------------
     # Mercado
     # ------------------------------------------------------------------
-    def get_klines(self, symbol: str, interval: str, limit: int = 500) -> pd.DataFrame:
+    def get_klines(self, symbol: str, interval: str, limit: int = 500, end_time: int | None = None) -> pd.DataFrame:
         """Devuelve DataFrame ordenado ascendentemente por tiempo, con
         columnas open/high/low/close/volume (float) indexado por el
         instante de apertura de cada vela (UTC).
+
+        `end_time` (ms epoch, opcional) permite paginar hacia atrás en el
+        histórico: se usa en backtest.py para reunir más velas de las que
+        entrega una sola llamada.
         """
-        data = self._request(
-            "GET",
-            "/openApi/swap/v3/quote/klines",
-            {"symbol": symbol, "interval": interval, "limit": limit},
-            signed=False,
-        )
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        if end_time is not None:
+            params["endTime"] = int(end_time)
+        data = self._request("GET", "/openApi/swap/v3/quote/klines", params, signed=False)
         rows = data.get("data", [])
         if not rows:
+            if end_time is not None:
+                # Paginando hacia atrás en el histórico (backtest): una
+                # respuesta vacía aquí solo significa "no hay más velas
+                # antiguas disponibles", no es un error.
+                return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
             raise RuntimeError(f"Respuesta de klines vacía para {symbol}: {data}")
 
         parsed = []

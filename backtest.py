@@ -1,196 +1,368 @@
 """
 backtest.py
------------
-Backtesting histórico de la estrategia RSI + SuperTrend contra datos REALES
-de BingX, usando la MISMA función `strategy.compute_signals` que usa el bot
-en vivo (así el backtest no se puede desincronizar de lo que realmente
-operaría el bot).
+============
+Descarga histórico real de BingX (paginando hacia atrás con endTime) y
+simula la estrategia RSI+SuperTrend "Doble Dip" -exactamente con la misma
+lógica de indicators.py que usa el bot en vivo- sobre varias temporalidades
+a la vez, para comparar cuál rinde mejor después de comisiones.
 
-No necesita API keys: las velas históricas son un endpoint público.
+USO
+---
+    python backtest.py --symbol BTC-USDT --timeframes 5m,15m,30m,1h,2h,4h,1d --days 120
 
-Uso:
-    python backtest.py --symbol BTC/USDT --timeframe 15m --days 60
-    python backtest.py --symbol ETH/USDT --timeframe 15m --days 90 --trade-amount 200 --output resultados.csv
+Requiere BINGX_API_KEY / BINGX_API_SECRET en el entorno (o en un .env en el
+mismo directorio) - son endpoints públicos de mercado, no hace falta que la
+key tenga permisos de trading para esto. NO requiere las variables de
+Telegram (a propósito, para poder correr este script suelto sin desplegar
+el bot).
 
-Todos los parámetros de la estrategia (--rsi-length, --st-factor, etc.) son
-ajustables por si quieres explorar variantes antes de decidir la configuración
-final del bot en vivo.
+Fidelidad al bot real: la entrada se simula al CIERRE de la vela de señal
+(igual que hace trading_bot.py: detecta al cierre y manda MARKET casi de
+inmediato) y no a la apertura de la siguiente vela como asume Pine Script
+por defecto - con datos de 15m+ la diferencia es mínima, pero en 1m/5m
+puede notarse un poco. El stop-loss de seguridad se simula como una orden
+STOP_MARKET real: se dispara si el "low" de una vela posterior a la entrada
+toca el precio de stop, igual que en el exchange.
+
+LIMITACIÓN CONOCIDA: es una simulación con datos históricos de un único
+símbolo/periodo - no reemplaza el forward-testing en DRY_RUN. Un
+"buen" resultado aquí es evidencia, no garantía.
 """
+
+from __future__ import annotations
 
 import argparse
 import os
-import sys
+import time
 
+import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 
-from exchange_client import ExchangeClient
-from strategy import compute_signals
+try:
+    from dotenv import load_dotenv
 
-load_dotenv()
+    load_dotenv()
+except ImportError:
+    pass
 
+from bingx_client import BingXClient
+from indicators import compute_rsi, compute_special_buy, compute_supertrend
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--symbol", default=os.getenv("SYMBOL", "BTC/USDT"))
-    p.add_argument("--timeframe", default=os.getenv("TIMEFRAME", "15m"))
-    p.add_argument("--days", type=int, default=60, help="Días de histórico a descargar (por defecto 60)")
-    p.add_argument("--trade-amount", type=float, default=float(os.getenv("TRADE_AMOUNT_USDT", 100)),
-                    help="USDT simulados por operación")
-    p.add_argument("--fee-pct", type=float, default=0.1,
-                    help="Comisión por operación en %% (se aplica en la entrada y en la salida). BingX spot suele rondar 0.1%%.")
-    p.add_argument("--rsi-length", type=int, default=int(os.getenv("RSI_LENGTH", 10)))
-    p.add_argument("--signal-length", type=int, default=int(os.getenv("SIGNAL_LENGTH", 10)))
-    p.add_argument("--trigger-level", type=float, default=float(os.getenv("TRIGGER_LEVEL", 50)))
-    p.add_argument("--target-cross-count", type=int, default=int(os.getenv("TARGET_CROSS_COUNT", 2)))
-    p.add_argument("--atr-period", type=int, default=int(os.getenv("ATR_PERIOD", 10)))
-    p.add_argument("--st-factor", type=float, default=float(os.getenv("ST_FACTOR", 2.5)))
-    p.add_argument("--output", default=None, help="Ruta de un .csv donde guardar el detalle de cada operación")
-    return p.parse_args()
+TIMEFRAME_MINUTES = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
+}
+
+DEFAULT_TIMEFRAMES = "5m,15m,30m,1h,2h,4h,1d"
 
 
-def fetch_history(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
-    exchange = ExchangeClient("", "", demo=False)  # datos públicos: no requiere API keys
-    tf_ms = exchange.exchange.parse_timeframe(timeframe) * 1000
-    since = exchange.exchange.milliseconds() - days * 86400 * 1000
+def _env(name: str, default=None, cast=str):
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return cast(raw.split("#", 1)[0].strip().strip("'\""))
 
-    all_rows = []
-    seen = set()
-    print(f"Descargando histórico de {symbol} ({timeframe}, últimos {days} días) desde BingX...")
-    for _ in range(200):  # límite de seguridad de páginas
-        batch = exchange.fetch_ohlcv_raw(symbol, timeframe, since=since, limit=500)
-        if not batch:
+
+# ---------------------------------------------------------------------
+# Descarga de histórico con paginación
+# ---------------------------------------------------------------------
+def fetch_history(client: BingXClient, symbol: str, interval: str, days: int, max_candles: int = 20000) -> pd.DataFrame:
+    minutes = TIMEFRAME_MINUTES[interval]
+    target = min(int(days * 24 * 60 / minutes) + 5, max_candles)
+
+    frames = []
+    end_time = None
+    fetched = 0
+    oldest_seen = None
+
+    while fetched < target:
+        page_limit = min(1000, target - fetched)
+        df = client.get_klines(symbol, interval, limit=page_limit, end_time=end_time)
+        if df.empty:
             break
-        new_rows = [r for r in batch if r[0] not in seen]
-        if not new_rows:
-            break
-        all_rows.extend(new_rows)
-        seen.update(r[0] for r in new_rows)
-        since = batch[-1][0] + tf_ms
-        if len(batch) < 500 or since >= exchange.exchange.milliseconds():
-            break
+        frames.append(df)
+        fetched += len(df)
+        oldest = df.index[0]
+        if oldest_seen is not None and oldest >= oldest_seen:
+            break  # sin progreso -> ya no hay más historia, evita bucle infinito
+        oldest_seen = oldest
+        end_time = int(oldest.timestamp() * 1000) - 1
+        time.sleep(0.25)  # amable con el rate limit al paginar muchas páginas
 
-    if not all_rows:
-        raise RuntimeError(f"No se recibieron velas para {symbol} en {timeframe}. ¿Símbolo o timeframe correctos?")
+    if not frames:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
-    all_rows.sort(key=lambda r: r[0])
-    df = pd.DataFrame(all_rows, columns=["timestamp", "open", "high", "low", "close", "volume"])
-    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    print(f"  -> {len(df)} velas descargadas ({df['datetime'].iloc[0]} a {df['datetime'].iloc[-1]})\n")
-    return df
+    full = pd.concat(frames)
+    full = full[~full.index.duplicated(keep="first")].sort_index()
+
+    # Igual que en vivo: si la última vela aún no ha cerrado, se descarta.
+    now = pd.Timestamp.now(tz="UTC")
+    tf = pd.Timedelta(minutes=minutes)
+    if len(full) and (full.index[-1] + tf) > now:
+        full = full.iloc[:-1]
+
+    return full
 
 
-def simulate_trades(df: pd.DataFrame, signals: pd.DataFrame, trade_amount_usdt: float, fee_pct: float):
-    """Replica exactamente la decisión del bot en vivo: compra si no hay
-    posición y aparece special_buy; vende si hay posición y aparece sell_signal."""
+# ---------------------------------------------------------------------
+# Simulación de operaciones
+# ---------------------------------------------------------------------
+def simulate_trades(
+    df: pd.DataFrame,
+    params: dict,
+    fee_rate: float,
+    position_size_pct: float,
+    leverage: float,
+    stop_loss_pct: float,
+    starting_equity: float = 1000.0,
+) -> tuple[list[dict], list[float]]:
+    """Simula la estrategia barra a barra, con el mismo dimensionamiento
+    (position_size_pct % de equity * leverage) y comisiones del bot real.
+    fee_rate: fracción por lado (0.0005 = 0.05%), se cobra en entrada Y salida.
+    """
+    rsi = compute_rsi(df["close"], params["rsi_length"])
+    rsi_signal = rsi.rolling(params["sig_length"]).mean()
+    special_buy, _ = compute_special_buy(
+        rsi, rsi_signal, params["trigger_level"], params["target_cross_count"]
+    )
+    supertrend, direction = compute_supertrend(
+        df["high"], df["low"], df["close"], params["atr_period"], params["st_factor"]
+    )
+    st_sell = direction.diff() > 0
+
+    closes = df["close"].to_numpy()
+    lows = df["low"].to_numpy()
+    times = df.index
+
+    equity = starting_equity
+    equity_curve = []
     trades = []
-    in_position = False
-    entry_price = None
-    entry_time = None
 
-    for i in range(len(signals)):
-        row = signals.iloc[i]
-        ts = df["datetime"].iloc[i]
-        if not in_position and bool(row["special_buy"]):
-            in_position = True
-            entry_price = float(row["close"])
-            entry_time = ts
-        elif in_position and bool(row["sell_signal"]):
-            exit_price = float(row["close"])
-            gross_return = exit_price / entry_price - 1
-            net_return = gross_return - 2 * (fee_pct / 100)  # comisión de entrada + salida
-            pnl_usdt = trade_amount_usdt * net_return
+    in_position = False
+    entry_price = entry_time = entry_index = stop_price = None
+
+    n = len(df)
+    for i in range(n):
+        if not in_position:
+            equity_curve.append(equity)
+            if bool(special_buy.iloc[i]):
+                in_position = True
+                entry_price = closes[i]
+                entry_time = times[i]
+                entry_index = i
+                stop_price = entry_price * (1 - stop_loss_pct / 100.0) if stop_loss_pct > 0 else None
+            continue
+
+        exit_price = None
+        exit_reason = None
+        if i > entry_index:
+            if stop_price is not None and lows[i] <= stop_price:
+                exit_price = stop_price
+                exit_reason = "stop-loss"
+            elif bool(st_sell.iloc[i]):
+                exit_price = closes[i]
+                exit_reason = "SuperTrend"
+            elif i == n - 1:
+                # Fin de los datos con posición todavía abierta: se marca a
+                # mercado para que la curva de equity refleje el estado real.
+                exit_price = closes[i]
+                exit_reason = "fin_de_datos (abierta)"
+
+        if exit_price is not None:
+            notional = equity * (position_size_pct / 100.0) * leverage
+            gross_pct = (exit_price / entry_price) - 1.0
+            gross_pnl = notional * gross_pct
+            fee = notional * fee_rate * 2  # entrada + salida
+            net_pnl = gross_pnl - fee
+            equity += net_pnl
             trades.append(
                 {
                     "entry_time": entry_time,
-                    "exit_time": ts,
+                    "exit_time": times[i],
                     "entry_price": entry_price,
                     "exit_price": exit_price,
-                    "return_pct": net_return * 100,
-                    "pnl_usdt": pnl_usdt,
+                    "bars_held": i - entry_index,
+                    "gross_pct": gross_pct * 100,
+                    "fee": fee,
+                    "net_pnl": net_pnl,
+                    "exit_reason": exit_reason,
                 }
             )
             in_position = False
-            entry_price = None
-            entry_time = None
+            entry_price = entry_time = entry_index = stop_price = None
 
-    open_position = {"entry_time": entry_time, "entry_price": entry_price} if in_position else None
-    return trades, open_position
+        equity_curve.append(equity)
+
+    return trades, equity_curve
 
 
-def print_report(trades, open_position, trade_amount_usdt, symbol, timeframe, days):
-    print("=" * 66)
-    print(f"BACKTEST: {symbol} | {timeframe} | últimos {days} días | {trade_amount_usdt} USDT/operación")
-    print("=" * 66)
-
+def compute_metrics(trades: list[dict], equity_curve: list[float], starting_equity: float) -> dict:
     if not trades:
-        print("\nNo se generó ninguna operación completa en el periodo analizado.")
+        return {
+            "num_trades": 0, "win_rate_pct": float("nan"), "profit_factor": float("nan"),
+            "total_return_pct": 0.0, "max_drawdown_pct": 0.0, "avg_bars_held": float("nan"),
+            "final_equity": starting_equity,
+        }
+
+    t = pd.DataFrame(trades)
+    wins = t[t["net_pnl"] > 0]
+    losses = t[t["net_pnl"] <= 0]
+
+    gross_win = wins["net_pnl"].sum()
+    gross_loss = -losses["net_pnl"].sum()
+    if gross_loss > 0:
+        profit_factor = gross_win / gross_loss
     else:
-        n = len(trades)
-        wins = [t for t in trades if t["pnl_usdt"] > 0]
-        losses = [t for t in trades if t["pnl_usdt"] <= 0]
-        total_pnl = sum(t["pnl_usdt"] for t in trades)
-        win_rate = len(wins) / n * 100
+        profit_factor = float("inf") if gross_win > 0 else float("nan")
 
-        equity, peak, max_dd = 0.0, 0.0, 0.0
-        for t in trades:
-            equity += t["pnl_usdt"]
-            peak = max(peak, equity)
-            max_dd = max(max_dd, peak - equity)
+    eq = pd.Series(equity_curve)
+    running_max = eq.cummax()
+    drawdown = (eq - running_max) / running_max * 100
+    final_equity = equity_curve[-1]
 
-        print(f"\nOperaciones completas: {n}")
-        print(f"Ganadoras: {len(wins)} ({win_rate:.1f}%)  |  Perdedoras: {len(losses)}")
-        print(f"Resultado neto total: {total_pnl:+.2f} USDT  ({total_pnl / trade_amount_usdt * 100:+.2f}% acumulado sobre {trade_amount_usdt} USDT por operación)")
-        if wins:
-            print(f"Ganancia media: {sum(t['pnl_usdt'] for t in wins) / len(wins):+.2f} USDT")
-        if losses:
-            print(f"Pérdida media: {sum(t['pnl_usdt'] for t in losses) / len(losses):+.2f} USDT")
-        print(f"Máximo drawdown (sobre la curva de resultados acumulados): {max_dd:.2f} USDT")
+    return {
+        "num_trades": len(t),
+        "win_rate_pct": len(wins) / len(t) * 100,
+        "profit_factor": profit_factor,
+        "total_return_pct": (final_equity / starting_equity - 1) * 100,
+        "max_drawdown_pct": drawdown.min(),
+        "avg_bars_held": t["bars_held"].mean(),
+        "final_equity": final_equity,
+    }
 
-        print(f"\n{'Entrada (UTC)':<18}{'Salida (UTC)':<18}{'Precio in':<12}{'Precio out':<12}{'%':<9}{'USDT'}")
-        for t in trades:
-            print(
-                f"{str(t['entry_time'])[:16]:<18}{str(t['exit_time'])[:16]:<18}"
-                f"{t['entry_price']:<12.4f}{t['exit_price']:<12.4f}{t['return_pct']:+.2f}%   {t['pnl_usdt']:+.2f}"
-            )
 
-    if open_position:
-        print(
-            f"\n⚠️  Posición todavía abierta al final del periodo "
-            f"(entrada: {open_position['entry_price']} el {open_position['entry_time']}) "
-            f"— no se cuenta en las estadísticas anteriores."
+# ---------------------------------------------------------------------
+# Barrido multi-temporalidad
+# ---------------------------------------------------------------------
+def run_sweep(
+    client: BingXClient,
+    symbol: str,
+    timeframes: list[str],
+    days: int,
+    params: dict,
+    fee_rate: float,
+    position_size_pct: float,
+    leverage: float,
+    stop_loss_pct: float,
+    save_trades_dir: str | None = None,
+) -> pd.DataFrame:
+    min_needed = max(params["rsi_length"], params["atr_period"]) + params["sig_length"] + 30
+    rows = []
+
+    for tf in timeframes:
+        tf = tf.strip()
+        if tf not in TIMEFRAME_MINUTES:
+            print(f"[{tf}] temporalidad no reconocida, se omite (usa: {', '.join(TIMEFRAME_MINUTES)})")
+            continue
+        print(f"[{tf}] descargando histórico ({days} días)...")
+        try:
+            df = fetch_history(client, symbol, tf, days)
+        except Exception as exc:
+            print(f"[{tf}] error al descargar: {exc}")
+            continue
+
+        if len(df) < min_needed:
+            print(f"[{tf}] histórico insuficiente ({len(df)} velas, se necesitan >= {min_needed}), se omite")
+            continue
+
+        trades, equity_curve = simulate_trades(
+            df, params, fee_rate, position_size_pct, leverage, stop_loss_pct
+        )
+        metrics = compute_metrics(trades, equity_curve, starting_equity=1000.0)
+        metrics.update(
+            {
+                "timeframe": tf,
+                "velas": len(df),
+                "periodo": f"{df.index[0].date()} -> {df.index[-1].date()}",
+            }
+        )
+        rows.append(metrics)
+        print(f"[{tf}] {metrics['num_trades']} operaciones | retorno {metrics['total_return_pct']:.1f}% | "
+              f"drawdown máx {metrics['max_drawdown_pct']:.1f}%")
+
+        if save_trades_dir and trades:
+            os.makedirs(save_trades_dir, exist_ok=True)
+            pd.DataFrame(trades).to_csv(os.path.join(save_trades_dir, f"trades_{tf}.csv"), index=False)
+
+    if not rows:
+        return pd.DataFrame()
+
+    cols = [
+        "timeframe", "velas", "periodo", "num_trades", "win_rate_pct",
+        "profit_factor", "total_return_pct", "max_drawdown_pct",
+        "avg_bars_held", "final_equity",
+    ]
+    return pd.DataFrame(rows)[cols].sort_values("total_return_pct", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Backtest RSI+SuperTrend Doble Dip en varias temporalidades (BingX)")
+    parser.add_argument("--symbol", default=_env("SYMBOL", "BTC-USDT"))
+    parser.add_argument("--timeframes", default=DEFAULT_TIMEFRAMES, help="lista separada por comas, ej: 15m,1h,4h")
+    parser.add_argument("--days", type=int, default=120, help="días de histórico por temporalidad (por defecto 120)")
+    parser.add_argument("--fee", type=float, default=0.05, help="comisión taker por lado en %% (por defecto 0.05, tarifa estándar BingX)")
+    parser.add_argument("--leverage", type=float, default=_env("LEVERAGE", 3, float))
+    parser.add_argument("--position-size", type=float, default=_env("POSITION_SIZE_PCT", 20, float))
+    parser.add_argument("--stop-loss", type=float, default=_env("STOP_LOSS_PCT", 5, float))
+    parser.add_argument("--rsi-length", type=int, default=_env("RSI_LENGTH", 10, int))
+    parser.add_argument("--sig-length", type=int, default=_env("SIG_LENGTH", 10, int))
+    parser.add_argument("--trigger-level", type=float, default=_env("TRIGGER_LEVEL", 50, float))
+    parser.add_argument("--target-cross-count", type=int, default=_env("TARGET_CROSS_COUNT", 2, int))
+    parser.add_argument("--atr-period", type=int, default=_env("ATR_PERIOD", 10, int))
+    parser.add_argument("--st-factor", type=float, default=_env("ST_FACTOR", 2.5, float))
+    parser.add_argument("--out", default="backtest_resultados.csv")
+    parser.add_argument("--save-trades", action="store_true", help="guarda el detalle de cada operación en trades_<tf>.csv")
+    args = parser.parse_args()
+
+    api_key = _env("BINGX_API_KEY")
+    api_secret = _env("BINGX_API_SECRET")
+    if not api_key or not api_secret:
+        raise SystemExit(
+            "Falta BINGX_API_KEY / BINGX_API_SECRET en el entorno (o en un .env en este directorio). "
+            "Solo se usan endpoints públicos de klines, no hace falta permiso de trading en la key."
         )
 
-    print("\n" + "=" * 66)
-    print("Esto es una simulación histórica sobre datos pasados. NO garantiza")
-    print("resultados futuros ni tiene en cuenta slippage, huecos de liquidez")
-    print("o rechazos de órdenes que sí pueden ocurrir en real.")
-    print("=" * 66)
+    client = BingXClient(api_key, api_secret)
+    params = {
+        "rsi_length": args.rsi_length,
+        "sig_length": args.sig_length,
+        "trigger_level": args.trigger_level,
+        "target_cross_count": args.target_cross_count,
+        "atr_period": args.atr_period,
+        "st_factor": args.st_factor,
+    }
+    timeframes = [t for t in args.timeframes.split(",") if t.strip()]
 
-
-def main():
-    args = parse_args()
-    df = fetch_history(args.symbol, args.timeframe, args.days)
-    signals = compute_signals(
-        df,
-        rsi_length=args.rsi_length,
-        signal_length=args.signal_length,
-        trigger_level=args.trigger_level,
-        target_cross_count=args.target_cross_count,
-        atr_period=args.atr_period,
-        st_factor=args.st_factor,
+    print(
+        f"Backtest {args.symbol} | {args.days} días | comisión {args.fee}%/lado (round-trip {args.fee*2}%) | "
+        f"leverage {args.leverage}x | tamaño {args.position_size}% equity | stop-loss {args.stop_loss}%\n"
+        f"Estrategia: RSI({args.rsi_length}) / SMA({args.sig_length}) / trigger {args.trigger_level} / "
+        f"doble cruce #{args.target_cross_count} | SuperTrend ATR({args.atr_period}) x{args.st_factor}\n"
     )
-    trades, open_position = simulate_trades(df, signals, args.trade_amount, args.fee_pct)
-    print_report(trades, open_position, args.trade_amount, args.symbol, args.timeframe, args.days)
 
-    if args.output and trades:
-        pd.DataFrame(trades).to_csv(args.output, index=False)
-        print(f"\nDetalle de operaciones guardado en: {args.output}")
+    save_dir = "backtest_trades" if args.save_trades else None
+    results = run_sweep(
+        client, args.symbol, timeframes, args.days, params,
+        args.fee / 100.0, args.position_size, args.leverage, args.stop_loss,
+        save_trades_dir=save_dir,
+    )
+
+    print()
+    if results.empty:
+        print("Sin resultados (revisa símbolo / temporalidades / histórico disponible).")
+        return
+
+    with pd.option_context("display.width", 160, "display.float_format", "{:.2f}".format):
+        print(results.to_string(index=False))
+
+    results.to_csv(args.out, index=False)
+    print(f"\nGuardado en {args.out}" + (f" y detalle de operaciones en {save_dir}/" if save_dir else ""))
+    print(
+        "\nOjo: profit_factor = ganancia bruta / pérdida bruta (>1 = rentable en el periodo probado). "
+        "num_trades bajo (<20-30) no es una muestra fiable, aunque el retorno parezca bueno."
+    )
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"\nError: {exc}", file=sys.stderr)
-        sys.exit(1)
+    main()
