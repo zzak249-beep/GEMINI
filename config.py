@@ -1,110 +1,131 @@
 """
 config.py
-=========
-Carga la configuración desde variables de entorno. Parseo defensivo:
-quita comillas, espacios y comentarios tipo "# nota" al final del valor
-(bug ya visto en Railway: caracteres sueltos rompiendo el parseo numérico).
+---------
+Carga toda la configuración del bot desde variables de entorno.
+
+En local, puedes crear un archivo `.env` (copia `.env.example`) y se cargará
+automáticamente. En Railway, estas variables se configuran en:
+Project -> Service -> Variables.
 """
 
-from __future__ import annotations
-
 import os
+from dataclasses import dataclass
 
-try:
-    from dotenv import load_dotenv
+from dotenv import load_dotenv
 
-    load_dotenv()  # no-op si no existe un .env (p.ej. en Railway)
-except ImportError:
-    pass
-
-
-def _clean(raw: str) -> str:
-    val = raw.split("#", 1)[0].strip()
-    return val.strip("'\"")
-
-
-def _get_str(name: str, default: str | None = None, required: bool = False) -> str:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        if required:
-            raise RuntimeError(f"Falta la variable de entorno obligatoria: {name}")
-        return default
-    return _clean(raw)
-
-
-def _get_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return int(_clean(raw))
-
-
-def _get_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return float(_clean(raw))
+load_dotenv()  # No hace nada si no existe .env (p. ej. en Railway), es seguro.
 
 
 def _get_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
+    val = os.getenv(name)
+    if val is None:
         return default
-    return _clean(raw).lower() in ("1", "true", "yes", "on")
+    return val.strip().lower() in ("1", "true", "yes", "si", "sí", "on")
 
 
-class Config:
-    def __init__(self):
-        # --- Credenciales / notificaciones (obligatorias) ---
-        self.BINGX_API_KEY = _get_str("BINGX_API_KEY", required=True)
-        self.BINGX_API_SECRET = _get_str("BINGX_API_SECRET", required=True)
-        self.TELEGRAM_BOT_TOKEN = _get_str("TELEGRAM_BOT_TOKEN", required=True)
-        self.TELEGRAM_CHAT_ID = _get_str("TELEGRAM_CHAT_ID", required=True)
+def _get_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val not in (None, "") else default
 
-        # --- Mercado ---
-        self.SYMBOL = _get_str("SYMBOL", default="BTC-USDT")
-        self.TIMEFRAME = _get_str("TIMEFRAME", default="15m")
-        self.TIMEFRAME_MINUTES = _get_int("TIMEFRAME_MINUTES", default=15)
-        self.HISTORY_CANDLES = _get_int("HISTORY_CANDLES", default=500)
 
-        # --- Parámetros de la estrategia (idénticos al Pine Script fuente) ---
-        self.RSI_LENGTH = _get_int("RSI_LENGTH", default=10)
-        self.SIG_LENGTH = _get_int("SIG_LENGTH", default=10)
-        self.TRIGGER_LEVEL = _get_float("TRIGGER_LEVEL", default=50.0)
-        self.TARGET_CROSS_COUNT = _get_int("TARGET_CROSS_COUNT", default=2)
-        self.ATR_PERIOD = _get_int("ATR_PERIOD", default=10)
-        self.ST_FACTOR = _get_float("ST_FACTOR", default=2.5)
+def _get_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val not in (None, "") else default
 
-        # --- Gestión de riesgo (no viene en el Pine, se añade para operar real) ---
-        self.LEVERAGE = _get_int("LEVERAGE", default=3)
-        self.POSITION_SIZE_PCT = _get_float("POSITION_SIZE_PCT", default=20.0)
-        self.STOP_LOSS_PCT = _get_float("STOP_LOSS_PCT", default=5.0)  # 0 = desactivado
 
-        # --- Operación ---
-        self.DRY_RUN = _get_bool("DRY_RUN", default=True)
-        self.POLL_BUFFER_SECONDS = _get_int("POLL_BUFFER_SECONDS", default=8)
-        self.PORT = _get_int("PORT", default=8080)
-        self.LOG_LEVEL = _get_str("LOG_LEVEL", default="INFO")
+@dataclass
+class Settings:
+    # --- Credenciales BingX ---
+    bingx_api_key: str
+    bingx_api_secret: str
+    bingx_demo: bool  # True = opera en la red de pruebas VST (dinero ficticio) de BingX
 
-    def strategy_params(self) -> dict:
-        return {
-            "rsi_length": self.RSI_LENGTH,
-            "sig_length": self.SIG_LENGTH,
-            "trigger_level": self.TRIGGER_LEVEL,
-            "target_cross_count": self.TARGET_CROSS_COUNT,
-            "atr_period": self.ATR_PERIOD,
-            "st_factor": self.ST_FACTOR,
-        }
+    # --- Credenciales Telegram ---
+    telegram_bot_token: str
+    telegram_chat_id: str
 
-    def summary(self) -> str:
-        modo = "DRY-RUN (simulado)" if self.DRY_RUN else "REAL (dinero real)"
-        return (
-            f"Símbolo: {self.SYMBOL} | TF: {self.TIMEFRAME}\n"
-            f"RSI({self.RSI_LENGTH}) / Señal SMA({self.SIG_LENGTH}) / "
-            f"Trigger {self.TRIGGER_LEVEL} / Doble cruce #{self.TARGET_CROSS_COUNT}\n"
-            f"SuperTrend ATR({self.ATR_PERIOD}) x{self.ST_FACTOR}\n"
-            f"Apalancamiento: {self.LEVERAGE}x | Tamaño posición: {self.POSITION_SIZE_PCT}% del balance\n"
-            f"Stop-loss de seguridad: {self.STOP_LOSS_PCT}% "
-            f"{'(desactivado)' if self.STOP_LOSS_PCT <= 0 else ''}\n"
-            f"Modo: {modo}"
+    # --- Mercado ---
+    symbol: str  # p. ej. "BTC/USDT"
+    timeframe: str  # p. ej. "15m"
+    candles_lookback: int  # nº de velas históricas a pedir en cada ciclo
+
+    # --- Gestión de capital ---
+    trade_amount_usdt: float  # USDT a gastar en cada compra
+    min_position_value_usdt: float  # por debajo de esto, se considera que no hay posición abierta
+
+    # --- Parámetros de la estrategia (idénticos al Pine Script original) ---
+    rsi_length: int
+    signal_length: int
+    trigger_level: float
+    target_cross_count: int
+    atr_period: int
+    st_factor: float
+
+    # --- Operativa ---
+    dry_run: bool  # True = solo analiza y avisa por Telegram, NO envía órdenes reales
+    poll_buffer_seconds: int  # segundos de margen tras el cierre de vela antes de pedir datos
+    log_level: str
+
+    # --- Fiabilidad ---
+    max_retries: int  # reintentos ante errores de red transitorios al hablar con BingX
+    retry_backoff_seconds: float  # espera inicial entre reintentos (crece exponencialmente)
+    error_notify_cooldown_minutes: int  # no repetir el mismo aviso de error en Telegram antes de este tiempo
+
+    # --- Gestión de riesgo (opcional, desactivado por defecto = comportamiento idéntico al Pine original) ---
+    stop_loss_pct: float  # 0 = desactivado. Si >0, cierra la posición si el precio cae este % desde la entrada
+
+    # --- Observabilidad ---
+    heartbeat_every_hours: float  # 0 = desactivado. Envía un resumen de "sigo vivo" cada N horas
+
+    # --- Comandos remotos por Telegram ---
+    telegram_commands_enabled: bool  # /status, /pause, /resume, /close
+
+
+def load_settings() -> Settings:
+    missing = []
+
+    def require(name: str) -> str:
+        val = os.getenv(name)
+        if not val:
+            missing.append(name)
+        return val or ""
+
+    bingx_api_key = require("BINGX_API_KEY")
+    bingx_api_secret = require("BINGX_API_SECRET")
+    telegram_bot_token = require("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = require("TELEGRAM_CHAT_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Faltan variables de entorno obligatorias: "
+            + ", ".join(missing)
+            + ". Revisa tu archivo .env (local) o las Variables del servicio en Railway."
         )
+
+    return Settings(
+        bingx_api_key=bingx_api_key,
+        bingx_api_secret=bingx_api_secret,
+        bingx_demo=_get_bool("BINGX_DEMO", True),
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        symbol=os.getenv("SYMBOL", "BTC/USDT"),
+        timeframe=os.getenv("TIMEFRAME", "15m"),
+        candles_lookback=_get_int("CANDLES_LOOKBACK", 300),
+        trade_amount_usdt=_get_float("TRADE_AMOUNT_USDT", 100.0),
+        min_position_value_usdt=_get_float("MIN_POSITION_VALUE_USDT", 5.0),
+        rsi_length=_get_int("RSI_LENGTH", 10),
+        signal_length=_get_int("SIGNAL_LENGTH", 10),
+        trigger_level=_get_float("TRIGGER_LEVEL", 50.0),
+        target_cross_count=_get_int("TARGET_CROSS_COUNT", 2),
+        atr_period=_get_int("ATR_PERIOD", 10),
+        st_factor=_get_float("ST_FACTOR", 2.5),
+        dry_run=_get_bool("DRY_RUN", True),
+        poll_buffer_seconds=_get_int("POLL_BUFFER_SECONDS", 20),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        max_retries=_get_int("MAX_RETRIES", 3),
+        retry_backoff_seconds=_get_float("RETRY_BACKOFF_SECONDS", 2.0),
+        error_notify_cooldown_minutes=_get_int("ERROR_NOTIFY_COOLDOWN_MINUTES", 15),
+        stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.0),
+        heartbeat_every_hours=_get_float("HEARTBEAT_EVERY_HOURS", 24.0),
+        telegram_commands_enabled=_get_bool("TELEGRAM_COMMANDS_ENABLED", True),
+    )
