@@ -35,6 +35,7 @@ class BingX:
         self._c = client
         self._base = config.BINGX_BASE_URL.rstrip("/")
         self._precision: dict[str, dict] = {}
+        self._logged_position_shape = False
 
     # ── firma ─────────────────────────────────────────────────────────
     def _sign(self, params: dict[str, Any]) -> str:
@@ -165,8 +166,7 @@ class BingX:
         )
 
     async def market_order(
-        self, symbol: str, side: str, quantity: float, sl: float, tp: float,
-        client_id: str | None = None
+        self, symbol: str, side: str, quantity: float, sl: float, tp: float
     ) -> dict:
         """
         side: 'BUY' (largo) o 'SELL' (corto).
@@ -181,9 +181,6 @@ class BingX:
             "positionSide": position_side,
             "type": "MARKET",
             "quantity": quantity,
-            # Identificador propio: permite comprobar DESPUÉS si la orden
-            # existe cuando la respuesta se pierde por el camino.
-            "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
             "stopLoss": (
                 '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl
             ),
@@ -194,8 +191,7 @@ class BingX:
         return await self._private("POST", "/openApi/swap/v2/trade/order", params)
 
     async def limit_order(
-        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float,
-        client_id: str | None = None
+        self, symbol: str, side: str, quantity: float, price: float, sl: float, tp: float
     ) -> dict:
         """
         Entrada con precio límite. Puede no ejecutarse, y eso es
@@ -214,7 +210,6 @@ class BingX:
                 "price": price,
                 "quantity": quantity,
                 "timeInForce": "GTC",
-                "clientOrderID": client_id or f"rev{int(time.time()*1000)}",
                 "stopLoss": '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % sl,
                 "takeProfit": '{"type":"TAKE_PROFIT_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}' % tp,
             },
@@ -244,34 +239,44 @@ class BingX:
             },
         )
 
-    async def open_orders(self, symbol: str) -> list[dict]:
-        data = await self._private("GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol})
-        if isinstance(data, dict):
-            data = data.get("orders", [])
-        return data if isinstance(data, list) else []
-
-    async def order_exists(self, symbol: str, client_id: str) -> bool:
-        """
-        ¿Existe esta orden en el exchange?
-
-        Se llama cuando el envío falló por red: la petición pudo llegar
-        igualmente y la respuesta perderse. Sin esta comprobación, el
-        bot da por fallida una orden que SÍ existe — y luego abre otra.
-        """
-        try:
-            for o in await self.open_orders(symbol):
-                if str(o.get("clientOrderID") or o.get("clientOrderId") or "") == client_id:
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            for p in await self.open_positions():
-                if str(p.get("symbol")) == symbol and float(p.get("positionAmt", 0) or 0) != 0:
-                    return True
-        except Exception:  # noqa: BLE001
-            pass
-        return False
-
     async def open_positions(self) -> list[dict]:
         data = await self._private("GET", "/openApi/swap/v2/user/positions")
-        return data if isinstance(data, list) else []
+        positions = data if isinstance(data, list) else []
+        if positions and not self._logged_position_shape:
+            self._logged_position_shape = True
+            log.info(
+                "Forma real de una posición devuelta por BingX (para verificar "
+                "nombres de campo): %s",
+                {k: v for k, v in positions[0].items()},
+            )
+        return positions
+
+    # Nombres de campo vistos en distintas versiones/documentación de APIs
+    # de futuros al estilo Binance. AUDITORÍA: el proyecto solo probaba
+    # "positionAmt"; si BingX usara otro nombre, tanto reconcile() como el
+    # guard anti-doble-entrada de handle_signal() creerían SIEMPRE que no
+    # hay ninguna posición abierta, en silencio. Este método intenta varios
+    # nombres y, si ninguno aparece en una posición que sí trae otros
+    # campos (o sea, no es un dict vacío), lo AVISA en vez de asumir 0.
+    _AMT_FIELDS = ("positionAmt", "positionAmount", "positionSize", "amount", "size", "amt")
+    _warned_missing_amt_fields = False
+
+    def position_amt(self, pos: dict) -> float:
+        for field in self._AMT_FIELDS:
+            if field in pos and pos[field] not in (None, ""):
+                try:
+                    return float(pos[field])
+                except (TypeError, ValueError):
+                    continue
+        if pos and not self._warned_missing_amt_fields:
+            self._warned_missing_amt_fields = True
+            log.warning(
+                "Ninguno de los campos esperados (%s) aparece en la posición "
+                "devuelta por BingX: %s — reconcile() y el guard anti-doble-entrada "
+                "van a tratar esto como 'sin posición' sin poder confirmarlo. "
+                "Revisa la respuesta real de /openApi/swap/v2/user/positions.",
+                ", ".join(self._AMT_FIELDS), list(pos.keys()),
+            )
+        return 0.0
+
+

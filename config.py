@@ -1,125 +1,131 @@
 """
-Configuración del bot RSI doble suelo + SuperTrend.
+config.py
+---------
+Carga toda la configuración del bot desde variables de entorno.
 
-MODE=SIGNAL por defecto. Esta estrategia no tiene ni una operación
-medida: los parámetros del Pine original (RSI 10 en vez de 14,
-multiplicador 2.5) son ajustes que su autor hizo para dar más señales y
-salidas más rentables, o sea que vienen ya optimizados sobre algún
-histórico que no es el tuyo. Mídela antes de ponerle dinero.
+En local, puedes crear un archivo `.env` (copia `.env.example`) y se cargará
+automáticamente. En Railway, estas variables se configuran en:
+Project -> Service -> Variables.
 """
+
 import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+load_dotenv()  # No hace nada si no existe .env (p. ej. en Railway), es seguro.
 
 
-def _bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "sí")
-
-
-def _float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
+def _get_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
         return default
+    return val.strip().lower() in ("1", "true", "yes", "si", "sí", "on")
 
 
-def _int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
+def _get_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val not in (None, "") else default
 
 
-MODE = os.getenv("MODE", "SIGNAL").strip().upper()
-LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
-
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
-
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
-
-# ── Estrategia (mismos valores que el Pine original) ──────────────────
-RSI_LEN = _int("RSI_LEN", 10)
-SIG_LEN = _int("SIG_LEN", 10)
-TRIGGER_LEVEL = _float("TRIGGER_LEVEL", 50.0)
-# 2 = doble suelo (W). Con 1 se opera el primer intento, que es
-# justamente el que el autor considera que falla.
-TARGET_CROSS = _int("TARGET_CROSS", 2)
-ST_PERIOD = _int("ST_PERIOD", 10)
-ST_FACTOR = _float("ST_FACTOR", 2.5)
-# TENSIÓN REAL DEL PINE ORIGINAL, descubierta al probar el motor:
-# un doble suelo ocurre POR DEFINICIÓN durante una caída, así que en el
-# momento de la señal el SuperTrend casi siempre está bajista y su línea
-# queda POR ENCIMA del precio — no sirve como stop. El Pine no lo nota
-# porque su salida solo se dispara en el INSTANTE del giro a bajista:
-# si ya estaba bajista, la posición se queda abierta sin protección
-# hasta el siguiente giro, que puede tardar días.
-#   true  = exigir SuperTrend ya alcista. Menos señales, stop coherente.
-#   false = fiel al original. Entra igual, y el stop lo pone el mínimo
-#           reciente porque el SuperTrend no puede.
-REQUIRE_ST_BULL = _bool("REQUIRE_ST_BULL", True)
-SL_SWING_ATR = _float("SL_SWING_ATR", 0.5)
-SL_SWING_LOOKBACK = _int("SL_SWING_LOOKBACK", 20)
-
-# ── Objetivo ──────────────────────────────────────────────────────────
-# El Pine original NO tiene objetivo: sale solo cuando gira el
-# SuperTrend. Aquí es opcional para poder comparar las dos variantes.
-USE_TP = _bool("USE_TP", False)
-RR_TARGET = _float("RR_TARGET", 2.0)
-
-# ── Universo y filtros ────────────────────────────────────────────────
-TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
-SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 90)
-MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
-SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
-EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
-MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 3_000_000.0)
-# El stop lo pone el SuperTrend, que puede quedar lejísimos. Sin este
-# tope, una sola operación puede llevarse un múltiplo del riesgo previsto.
-MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
-MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
-# EL FILTRO QUE FALTABA. El stop lo pone el SuperTrend o el mínimo
-# reciente, y a veces queda MUY cerca: un riesgo del 0.69% con 0.25% de
-# coste significa que la operación empieza perdiendo 0.36R antes de que
-# el precio se mueva. Es el mismo error que ya se corrigió en el otro
-# bot: no basta con acotar el stop por arriba, hay que acotarlo también
-# por ABAJO en relación al coste.
-MIN_RISK_PCT = _float("MIN_RISK_PCT", 1.5)
-MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
-SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
-
-# ── Riesgo ────────────────────────────────────────────────────────────
-RISK_PCT = _float("RISK_PCT", 0.25)
-MAX_CONCURRENT = _int("MAX_CONCURRENT", 2)
-LEVERAGE = _int("LEVERAGE", 2)
-MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
-COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 180)
-ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
-LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
-
-# ── Avisos ────────────────────────────────────────────────────────────
-# Enfriamiento por símbolo en modo SIGNAL: sin esto la misma señal se
-# repite en cada ciclo mientras no cambie la vela.
-SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
-
-DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
-DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
-HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
-IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
-
-STATE_PATH = os.getenv("STATE_PATH", "/data/state_rsi.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-
-COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
+def _get_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val not in (None, "") else default
 
 
-def is_live() -> bool:
-    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+@dataclass
+class Settings:
+    # --- Credenciales BingX ---
+    bingx_api_key: str
+    bingx_api_secret: str
+    bingx_demo: bool  # True = opera en la red de pruebas VST (dinero ficticio) de BingX
+
+    # --- Credenciales Telegram ---
+    telegram_bot_token: str
+    telegram_chat_id: str
+
+    # --- Mercado ---
+    symbol: str  # p. ej. "BTC/USDT"
+    timeframe: str  # p. ej. "15m"
+    candles_lookback: int  # nº de velas históricas a pedir en cada ciclo
+
+    # --- Gestión de capital ---
+    trade_amount_usdt: float  # USDT a gastar en cada compra
+    min_position_value_usdt: float  # por debajo de esto, se considera que no hay posición abierta
+
+    # --- Parámetros de la estrategia (idénticos al Pine Script original) ---
+    rsi_length: int
+    signal_length: int
+    trigger_level: float
+    target_cross_count: int
+    atr_period: int
+    st_factor: float
+
+    # --- Operativa ---
+    dry_run: bool  # True = solo analiza y avisa por Telegram, NO envía órdenes reales
+    poll_buffer_seconds: int  # segundos de margen tras el cierre de vela antes de pedir datos
+    log_level: str
+
+    # --- Fiabilidad ---
+    max_retries: int  # reintentos ante errores de red transitorios al hablar con BingX
+    retry_backoff_seconds: float  # espera inicial entre reintentos (crece exponencialmente)
+    error_notify_cooldown_minutes: int  # no repetir el mismo aviso de error en Telegram antes de este tiempo
+
+    # --- Gestión de riesgo (opcional, desactivado por defecto = comportamiento idéntico al Pine original) ---
+    stop_loss_pct: float  # 0 = desactivado. Si >0, cierra la posición si el precio cae este % desde la entrada
+
+    # --- Observabilidad ---
+    heartbeat_every_hours: float  # 0 = desactivado. Envía un resumen de "sigo vivo" cada N horas
+
+    # --- Comandos remotos por Telegram ---
+    telegram_commands_enabled: bool  # /status, /pause, /resume, /close
 
 
-def describe() -> str:
-    if is_live():
-        return "LIVE — enviando órdenes reales a BingX"
-    if MODE == "LIVE":
-        return "LIVE pedido pero SIN confirmar (falta LIVE_CONFIRMED o claves) — sigue en SIGNAL"
-    return "SIGNAL — solo avisos, no toca el exchange"
+def load_settings() -> Settings:
+    missing = []
+
+    def require(name: str) -> str:
+        val = os.getenv(name)
+        if not val:
+            missing.append(name)
+        return val or ""
+
+    bingx_api_key = require("BINGX_API_KEY")
+    bingx_api_secret = require("BINGX_API_SECRET")
+    telegram_bot_token = require("TELEGRAM_BOT_TOKEN")
+    telegram_chat_id = require("TELEGRAM_CHAT_ID")
+
+    if missing:
+        raise RuntimeError(
+            "Faltan variables de entorno obligatorias: "
+            + ", ".join(missing)
+            + ". Revisa tu archivo .env (local) o las Variables del servicio en Railway."
+        )
+
+    return Settings(
+        bingx_api_key=bingx_api_key,
+        bingx_api_secret=bingx_api_secret,
+        bingx_demo=_get_bool("BINGX_DEMO", True),
+        telegram_bot_token=telegram_bot_token,
+        telegram_chat_id=telegram_chat_id,
+        symbol=os.getenv("SYMBOL", "BTC/USDT"),
+        timeframe=os.getenv("TIMEFRAME", "15m"),
+        candles_lookback=_get_int("CANDLES_LOOKBACK", 300),
+        trade_amount_usdt=_get_float("TRADE_AMOUNT_USDT", 100.0),
+        min_position_value_usdt=_get_float("MIN_POSITION_VALUE_USDT", 5.0),
+        rsi_length=_get_int("RSI_LENGTH", 10),
+        signal_length=_get_int("SIGNAL_LENGTH", 10),
+        trigger_level=_get_float("TRIGGER_LEVEL", 50.0),
+        target_cross_count=_get_int("TARGET_CROSS_COUNT", 2),
+        atr_period=_get_int("ATR_PERIOD", 10),
+        st_factor=_get_float("ST_FACTOR", 2.5),
+        dry_run=_get_bool("DRY_RUN", True),
+        poll_buffer_seconds=_get_int("POLL_BUFFER_SECONDS", 20),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+        max_retries=_get_int("MAX_RETRIES", 3),
+        retry_backoff_seconds=_get_float("RETRY_BACKOFF_SECONDS", 2.0),
+        error_notify_cooldown_minutes=_get_int("ERROR_NOTIFY_COOLDOWN_MINUTES", 15),
+        stop_loss_pct=_get_float("STOP_LOSS_PCT", 0.0),
+        heartbeat_every_hours=_get_float("HEARTBEAT_EVERY_HOURS", 24.0),
+        telegram_commands_enabled=_get_bool("TELEGRAM_COMMANDS_ENABLED", True),
+    )

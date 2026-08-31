@@ -107,10 +107,47 @@ def analyse(rs: list[float]) -> Verdict | None:
     )
 
 
+def buckets_por_score(trades: list[dict]) -> str | None:
+    """
+    Responde a la pregunta que score.py deja abierta a propósito: ¿el
+    score de entrada predice algo de verdad, o es una intuición que
+    suena bien pero no se sostiene con datos? Se agrupan las
+    operaciones cerradas por franja de score y se compara la
+    expectativa de cada franja — si las franjas altas no rinden mejor
+    que las bajas, el score no está aportando nada y hay que decirlo,
+    no seguir usándolo por inercia.
+
+    None si no hay al menos 5 operaciones con score guardado — las
+    cerradas antes de tener score (campo ausente) se ignoran aquí sin
+    romper nada, ya cuentan en el informe general de format_report().
+    """
+    con_score = [t for t in trades if t.get("score") is not None]
+    if len(con_score) < 5:
+        return None
+
+    rangos = [(0.0, 40.0, "<40"), (40.0, 60.0, "40-60"), (60.0, 80.0, "60-80"), (80.0, 101.0, "80-100")]
+    bloques: list[str] = []
+    for lo, hi, etiqueta in rangos:
+        rs = [float(t["r"]) for t in con_score if lo <= float(t["score"]) < hi]
+        if not rs:
+            continue
+        v = analyse(rs)
+        if v is None:
+            continue
+        pf = "∞" if v.profit_factor == float("inf") else f"{v.profit_factor:.2f}"
+        bloques.append(f"Score {etiqueta} · n={v.n} · media {v.mean_r:+.2f}R · PF {pf}")
+
+    if len(bloques) < 2:
+        return None  # con una sola franja poblada no hay nada que comparar
+    return "🎯 <b>¿El score predice algo?</b> (comparar franjas)\n\n" + "\n".join(bloques)
+
+
 def format_report(rs_por_modo: dict[str, list[float]]) -> str:
-    """rs_por_modo: {'SIGNAL': [...], 'LIVE': [...]}. Se informan por
+    """
+    rs_por_modo: {'SIGNAL': [...], 'LIVE': [...]}. Se informan por
     separado a propósito: tienen slippage distinto y mezclarlos
-    escondería justo la diferencia que el README avisa que va a doler."""
+    escondería justo la diferencia que el README avisa que va a doler.
+    """
     etiquetas = {
         "insuficiente": "⚠️ muestra insuficiente — el intervalo cruza cero, podría ser azar",
         "indicios": "🟡 hay indicios, todavía no es concluyente",
