@@ -47,6 +47,8 @@ class Signal:
     cross_count: int
     st_value: float
     atr_pct: float
+    timeframe: str = ""
+    btc_24h: float | None = None
 
 
 def sma(values: list[float], length: int) -> list[float]:
@@ -249,3 +251,62 @@ def position_size(equity: float, entry: float, sl: float) -> float:
     if riesgo_unidad <= 0 or entry <= 0:
         return 0.0
     return (equity * config.RISK_PCT / 100.0) / riesgo_unidad
+
+
+# ══════════════════════════════════════════════════════════════════════
+# ESTADO DE VIGILANCIA
+# Para el aviso periódico: no solo las que YA dan señal, sino en qué
+# punto del patrón está cada una. Un símbolo con el contador en 1 de 2
+# ya tocó suelo una vez y está a un cruce de disparar — eso es lo que
+# se quiere ver venir, no enterarse cuando ya pasó.
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Watch:
+    symbol: str
+    rsi: float
+    rsi_sig: float
+    cross_count: int
+    st_alcista: bool
+    atr_pct: float
+    bajo_umbral: bool
+    listo: bool
+
+
+def watch_status(candles: list[dict]) -> Watch | None:
+    """Dónde está este símbolo dentro del patrón, dispare o no."""
+    need = max(config.RSI_LEN, config.SIG_LEN, config.ST_PERIOD) * 4 + 20
+    if len(candles) < need:
+        return None
+
+    c = candles[:-1]
+    closes = [x["close"] for x in c]
+    highs = [x["high"] for x in c]
+    lows = [x["low"] for x in c]
+
+    rsi = rsi_series(closes, config.RSI_LEN)
+    if len(rsi) < config.SIG_LEN + 2:
+        return None
+    rsi_sig = sma(rsi, config.SIG_LEN)
+    a = atr_series(highs, lows, closes, config.ATR_LEN)
+    _, dirs = supertrend(highs, lows, closes, config.ST_FACTOR, config.ST_PERIOD)
+    if not a or not dirs:
+        return None
+
+    cross_count = 0
+    for i in range(1, len(rsi)):
+        if rsi[i] > config.TRIGGER_LEVEL:
+            cross_count = 0
+            continue
+        if rsi[i] > rsi_sig[i] and rsi[i - 1] <= rsi_sig[i - 1] and rsi[i] < config.TRIGGER_LEVEL:
+            cross_count += 1
+            if cross_count == config.TARGET_CROSS:
+                cross_count = 0 if i != len(rsi) - 1 else config.TARGET_CROSS
+
+    atr_pct = a[-1] / closes[-1] * 100.0 if closes[-1] > 0 else 0.0
+    return Watch(
+        symbol="", rsi=rsi[-1], rsi_sig=rsi_sig[-1], cross_count=cross_count,
+        st_alcista=dirs[-1] == -1, atr_pct=atr_pct,
+        bajo_umbral=rsi[-1] < config.TRIGGER_LEVEL,
+        listo=cross_count >= config.TARGET_CROSS,
+    )

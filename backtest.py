@@ -1,395 +1,242 @@
 """
-backtest.py
-============
-Descarga histórico real de BingX (paginando hacia atrás con endTime) y
-simula la estrategia RSI+SuperTrend "Doble Dip" -exactamente con la misma
-lógica de indicators.py que usa el bot en vivo- sobre varias temporalidades
-a la vez, para comparar cuál rinde mejor después de comisiones.
+Backtest local sobre histórico descargado del exchange.
 
-USO
----
-    python backtest.py --symbol BTC-USDT --timeframes 5m,15m,30m,1h,2h,4h,1d --days 120
+    python backtest.py ZEC-USDT 5m 240
+    python backtest.py ZEC-USDT 15m 240 --mensual
+    python backtest.py ZEC-USDT,PUMP-USDT,LDO-USDT 30m 240
 
-Requiere BINGX_API_KEY / BINGX_API_SECRET en el entorno (o en un .env en el
-mismo directorio) - son endpoints públicos de mercado, no hace falta que la
-key tenga permisos de trading para esto. NO requiere las variables de
-Telegram (a propósito, para poder correr este script suelto sin desplegar
-el bot).
+POR QUÉ EXISTE
+El plan gratuito de TradingView limita las barras del histórico: en 5m
+llegas a unas tres semanas, en 15m a un par de meses, en 30m a varios.
+Eso hace IMPOSIBLE comparar timeframes de forma justa — cada uno mira
+un periodo distinto, y entonces no estás midiendo el timeframe, estás
+midiendo qué meses te tocaron. Aquí se descargan los días que pidas,
+iguales para todos los timeframes.
 
-Fidelidad al bot real: la entrada se simula al CIERRE de la vela de señal
-(igual que hace trading_bot.py: detecta al cierre y manda MARKET casi de
-inmediato) y no a la apertura de la siguiente vela como asume Pine Script
-por defecto - con datos de 15m+ la diferencia es mínima, pero en 1m/5m
-puede notarse un poco. El stop-loss de seguridad se simula como una orden
-STOP_MARKET real: se dispara si el "low" de una vela posterior a la entrada
-toca el precio de stop, igual que en el exchange.
+LA VENTAJA QUE NO TIENE TRADINGVIEW
+Usa el MISMO strategy.py que ejecuta el bot. Los backtests de Pine
+miden una estrategia parecida pero no idéntica — sin el filtro de
+coste, sin REQUIRE_ST_BULL, sin el tope de riesgo. Aquí no hay esa
+distancia: lo que mides es exactamente lo que opera.
 
-LIMITACIÓN CONOCIDA: es una simulación con datos históricos de un único
-símbolo/periodo - no reemplaza el forward-testing en DRY_RUN. Un
-"buen" resultado aquí es evidencia, no garantía.
+DE DÓNDE SALEN LOS DATOS
+Binance Futures, endpoint público de klines. Sin API key, sin cuenta,
+sin límite práctico de histórico. La mayoría de perpetuos de BingX
+cotizan también allí con el mismo nombre sin guion (ZEC-USDT →
+ZECUSDT). Si un símbolo no existe en Binance, se avisa y se salta.
+
+LO QUE ESTO NO ARREGLA
+El deslizamiento sigue siendo una estimación, y el backtest supone que
+entras al cierre de la vela de señal. En pares finos eso es optimista.
+Los resultados de aquí son un techo, no una promesa.
 """
-
 from __future__ import annotations
 
-import argparse
-import os
+import asyncio
+import sys
 import time
+from dataclasses import dataclass, field
 
-import numpy as np
-import pandas as pd
+import httpx
 
-try:
-    from dotenv import load_dotenv
+import config
+import strategy
 
-    load_dotenv()
-except ImportError:
-    pass
-
-from bingx_client import BingXClient
-from indicators import compute_rsi, compute_special_buy, compute_supertrend, compute_trend_filter
-
-TIMEFRAME_MINUTES = {
-    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-    "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
-}
-
-DEFAULT_TIMEFRAMES = "5m,15m,30m,1h,2h,4h,1d"
+BINANCE_KLINES = "https://fapi.binance.com/fapi/v1/klines"
+MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+      "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
 
 
-def _env(name: str, default=None, cast=str):
-    raw = os.environ.get(name)
-    if raw is None or raw.strip() == "":
-        return default
-    return cast(raw.split("#", 1)[0].strip().strip("'\""))
+@dataclass
+class Trade:
+    symbol: str
+    entry_ts: int
+    entry: float
+    sl: float
+    exit_ts: int = 0
+    exit: float = 0.0
+    r: float = 0.0
+    motivo: str = ""
 
 
-# ---------------------------------------------------------------------
-# Descarga de histórico con paginación
-# ---------------------------------------------------------------------
-def fetch_history(client: BingXClient, symbol: str, interval: str, days: int, max_candles: int = 20000) -> pd.DataFrame:
-    minutes = TIMEFRAME_MINUTES[interval]
-    target = min(int(days * 24 * 60 / minutes) + 5, max_candles)
+@dataclass
+class Result:
+    symbol: str
+    trades: list[Trade] = field(default_factory=list)
+    descartes: dict[str, int] = field(default_factory=dict)
 
-    frames = []
-    end_time = None
-    fetched = 0
-    oldest_seen = None
 
-    while fetched < target:
-        page_limit = min(1000, target - fetched)
-        df = client.get_klines(symbol, interval, limit=page_limit, end_time=end_time)
-        if df.empty:
+async def download(client: httpx.AsyncClient, symbol: str, interval: str, days: int) -> list[dict]:
+    """Descarga paginando hacia atrás. Binance da 1500 velas por llamada."""
+    binance_sym = symbol.replace("-", "").upper()
+    paso = MS.get(interval, 300_000)
+    total = int(days * 24 * 60 * 60 * 1000 / paso)
+    fin = int(time.time() * 1000)
+    velas: list[dict] = []
+
+    while len(velas) < total:
+        faltan = min(1500, total - len(velas))
+        inicio = fin - faltan * paso
+        r = await client.get(
+            BINANCE_KLINES,
+            params={"symbol": binance_sym, "interval": interval,
+                    "startTime": inicio, "endTime": fin, "limit": faltan},
+            timeout=30,
+        )
+        if r.status_code != 200:
+            if not velas:
+                raise RuntimeError(f"{binance_sym}: {r.status_code} {r.text[:120]}")
             break
-        frames.append(df)
-        fetched += len(df)
-        oldest = df.index[0]
-        if oldest_seen is not None and oldest >= oldest_seen:
-            break  # sin progreso -> ya no hay más historia, evita bucle infinito
-        oldest_seen = oldest
-        end_time = int(oldest.timestamp() * 1000) - 1
-        time.sleep(0.25)  # amable con el rate limit al paginar muchas páginas
+        datos = r.json()
+        if not datos:
+            break
+        lote = [{"time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                 "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])}
+                for k in datos]
+        velas = lote + velas
+        fin = lote[0]["time"] - 1
+        await asyncio.sleep(0.15)  # cortesía con el endpoint público
 
-    if not frames:
-        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-
-    full = pd.concat(frames)
-    full = full[~full.index.duplicated(keep="first")].sort_index()
-
-    # Igual que en vivo: si la última vela aún no ha cerrado, se descarta.
-    now = pd.Timestamp.now(tz="UTC")
-    tf = pd.Timedelta(minutes=minutes)
-    if len(full) and (full.index[-1] + tf) > now:
-        full = full.iloc[:-1]
-
-    return full
+    velas.sort(key=lambda v: v["time"])
+    return velas
 
 
-# ---------------------------------------------------------------------
-# Simulación de operaciones
-# ---------------------------------------------------------------------
-def simulate_trades(
-    df: pd.DataFrame,
-    params: dict,
-    fee_rate: float,
-    position_size_pct: float,
-    leverage: float,
-    stop_loss_pct: float,
-    starting_equity: float = 1000.0,
-) -> tuple[list[dict], list[float]]:
-    """Simula la estrategia barra a barra, con el mismo dimensionamiento
-    (position_size_pct % de equity * leverage) y comisiones del bot real.
-    fee_rate: fracción por lado (0.0005 = 0.05%), se cobra en entrada Y salida.
+def simulate(symbol: str, velas: list[dict]) -> Result:
     """
-    rsi = compute_rsi(df["close"], params["rsi_length"])
-    rsi_signal = rsi.rolling(params["sig_length"]).mean()
-    special_buy, _ = compute_special_buy(
-        rsi, rsi_signal, params["trigger_level"], params["target_cross_count"]
-    )
-    if params.get("trend_filter_enabled"):
-        trend_ok = compute_trend_filter(df["high"], df["low"], df["close"], params)
-        special_buy = special_buy & trend_ok
-    supertrend, direction = compute_supertrend(
-        df["high"], df["low"], df["close"], params["atr_period"], params["st_factor"]
-    )
-    st_sell = direction.diff() > 0
+    Recorre el histórico vela a vela llamando a strategy.evaluate() con
+    la ventana visible en cada momento — igual que hace el bot en vivo.
+    Nunca ve el futuro: esa es toda la diferencia entre un backtest y
+    un dibujo bonito.
+    """
+    res = Result(symbol)
+    ventana = 400
+    abierta: Trade | None = None
+    i = ventana
 
-    closes = df["close"].to_numpy()
-    lows = df["low"].to_numpy()
-    times = df.index
+    while i < len(velas):
+        vela = velas[i]
 
-    equity = starting_equity
-    equity_curve = []
-    trades = []
-
-    in_position = False
-    entry_price = entry_time = entry_index = stop_price = None
-
-    n = len(df)
-    for i in range(n):
-        if not in_position:
-            equity_curve.append(equity)
-            if bool(special_buy.iloc[i]):
-                in_position = True
-                entry_price = closes[i]
-                entry_time = times[i]
-                entry_index = i
-                stop_price = entry_price * (1 - stop_loss_pct / 100.0) if stop_loss_pct > 0 else None
+        if abierta:
+            # Salida por stop, o por giro del SuperTrend.
+            if vela["low"] <= abierta.sl:
+                abierta.exit = abierta.sl
+                abierta.exit_ts = vela["time"]
+                abierta.r = -1.0
+                abierta.motivo = "stop"
+                res.trades.append(abierta)
+                abierta = None
+            elif strategy.exit_signal(velas[: i + 1]):
+                riesgo = abierta.entry - abierta.sl
+                abierta.exit = vela["close"]
+                abierta.exit_ts = vela["time"]
+                abierta.r = (vela["close"] - abierta.entry) / riesgo if riesgo > 0 else 0.0
+                # El coste se descuenta SIEMPRE, en R, igual que en vivo.
+                abierta.r -= config.COST_ROUNDTRIP_PCT / (riesgo / abierta.entry * 100.0)
+                abierta.motivo = "supertrend"
+                res.trades.append(abierta)
+                abierta = None
+            i += 1
             continue
 
-        exit_price = None
-        exit_reason = None
-        if i > entry_index:
-            if stop_price is not None and lows[i] <= stop_price:
-                exit_price = stop_price
-                exit_reason = "stop-loss"
-            elif bool(st_sell.iloc[i]):
-                exit_price = closes[i]
-                exit_reason = "SuperTrend"
-            elif i == n - 1:
-                # Fin de los datos con posición todavía abierta: se marca a
-                # mercado para que la curva de equity refleje el estado real.
-                exit_price = closes[i]
-                exit_reason = "fin_de_datos (abierta)"
+        sig, motivo = strategy.evaluate(symbol, velas[max(0, i - ventana) : i + 1])
+        if sig is None:
+            clave = motivo.split("(")[0].strip()
+            res.descartes[clave] = res.descartes.get(clave, 0) + 1
+        else:
+            abierta = Trade(symbol, vela["time"], sig.entry, sig.sl)
+        i += 1
 
-        if exit_price is not None:
-            notional = equity * (position_size_pct / 100.0) * leverage
-            gross_pct = (exit_price / entry_price) - 1.0
-            gross_pnl = notional * gross_pct
-            fee = notional * fee_rate * 2  # entrada + salida
-            net_pnl = gross_pnl - fee
-            equity += net_pnl
-            trades.append(
-                {
-                    "entry_time": entry_time,
-                    "exit_time": times[i],
-                    "entry_price": entry_price,
-                    "exit_price": exit_price,
-                    "bars_held": i - entry_index,
-                    "gross_pct": gross_pct * 100,
-                    "fee": fee,
-                    "net_pnl": net_pnl,
-                    "exit_reason": exit_reason,
-                }
-            )
-            in_position = False
-            entry_price = entry_time = entry_index = stop_price = None
-
-        equity_curve.append(equity)
-
-    return trades, equity_curve
+    return res
 
 
-def compute_metrics(trades: list[dict], equity_curve: list[float], starting_equity: float) -> dict:
-    if not trades:
-        return {
-            "num_trades": 0, "win_rate_pct": float("nan"), "profit_factor": float("nan"),
-            "total_return_pct": 0.0, "max_drawdown_pct": 0.0, "avg_bars_held": float("nan"),
-            "final_equity": starting_equity,
-        }
+def report(res: Result, mensual: bool = False) -> str:
+    t = res.trades
+    if not t:
+        top = sorted(res.descartes.items(), key=lambda x: -x[1])[:3]
+        return (f"\n{res.symbol}: SIN OPERACIONES\n  " +
+                " · ".join(f"{k}: {v}" for k, v in top))
 
-    t = pd.DataFrame(trades)
-    wins = t[t["net_pnl"] > 0]
-    losses = t[t["net_pnl"] <= 0]
+    ganadoras = [x for x in t if x.r > 0]
+    perdedoras = [x for x in t if x.r <= 0]
+    suma_g = sum(x.r for x in ganadoras)
+    suma_p = abs(sum(x.r for x in perdedoras))
+    pf = suma_g / suma_p if suma_p > 0 else float("inf")
+    exp = sum(x.r for x in t) / len(t)
 
-    gross_win = wins["net_pnl"].sum()
-    gross_loss = -losses["net_pnl"].sum()
-    if gross_loss > 0:
-        profit_factor = gross_win / gross_loss
-    else:
-        profit_factor = float("inf") if gross_win > 0 else float("nan")
+    # Drawdown en R sobre la curva acumulada.
+    acum = 0.0
+    pico = 0.0
+    dd = 0.0
+    for x in t:
+        acum += x.r
+        pico = max(pico, acum)
+        dd = min(dd, acum - pico)
 
-    eq = pd.Series(equity_curve)
-    running_max = eq.cummax()
-    drawdown = (eq - running_max) / running_max * 100
-    final_equity = equity_curve[-1]
-
-    return {
-        "num_trades": len(t),
-        "win_rate_pct": len(wins) / len(t) * 100,
-        "profit_factor": profit_factor,
-        "total_return_pct": (final_equity / starting_equity - 1) * 100,
-        "max_drawdown_pct": drawdown.min(),
-        "avg_bars_held": t["bars_held"].mean(),
-        "final_equity": final_equity,
-    }
-
-
-# ---------------------------------------------------------------------
-# Barrido multi-temporalidad
-# ---------------------------------------------------------------------
-def run_sweep(
-    client: BingXClient,
-    symbol: str,
-    timeframes: list[str],
-    days: int,
-    params: dict,
-    fee_rate: float,
-    position_size_pct: float,
-    leverage: float,
-    stop_loss_pct: float,
-    save_trades_dir: str | None = None,
-) -> pd.DataFrame:
-    min_needed = max(params["rsi_length"], params["atr_period"]) + params["sig_length"] + 30
-    if params.get("trend_filter_enabled"):
-        min_needed = max(min_needed, params["trend_ema_length"] + params["trend_max_bars_after_break"] + 20)
-    rows = []
-
-    for tf in timeframes:
-        tf = tf.strip()
-        if tf not in TIMEFRAME_MINUTES:
-            print(f"[{tf}] temporalidad no reconocida, se omite (usa: {', '.join(TIMEFRAME_MINUTES)})")
-            continue
-        print(f"[{tf}] descargando histórico ({days} días)...")
-        try:
-            df = fetch_history(client, symbol, tf, days)
-        except Exception as exc:
-            print(f"[{tf}] error al descargar: {exc}")
-            continue
-
-        if len(df) < min_needed:
-            print(f"[{tf}] histórico insuficiente ({len(df)} velas, se necesitan >= {min_needed}), se omite")
-            continue
-
-        trades, equity_curve = simulate_trades(
-            df, params, fee_rate, position_size_pct, leverage, stop_loss_pct
-        )
-        metrics = compute_metrics(trades, equity_curve, starting_equity=1000.0)
-        metrics.update(
-            {
-                "timeframe": tf,
-                "velas": len(df),
-                "periodo": f"{df.index[0].date()} -> {df.index[-1].date()}",
-            }
-        )
-        rows.append(metrics)
-        print(f"[{tf}] {metrics['num_trades']} operaciones | retorno {metrics['total_return_pct']:.1f}% | "
-              f"drawdown máx {metrics['max_drawdown_pct']:.1f}%")
-
-        if save_trades_dir and trades:
-            os.makedirs(save_trades_dir, exist_ok=True)
-            pd.DataFrame(trades).to_csv(os.path.join(save_trades_dir, f"trades_{tf}.csv"), index=False)
-
-    if not rows:
-        return pd.DataFrame()
-
-    cols = [
-        "timeframe", "velas", "periodo", "num_trades", "win_rate_pct",
-        "profit_factor", "total_return_pct", "max_drawdown_pct",
-        "avg_bars_held", "final_equity",
+    out = [
+        f"\n{'='*58}",
+        f"{res.symbol}",
+        f"{'='*58}",
+        f"Operaciones      {len(t)}",
+        f"Acierto          {len(ganadoras)/len(t)*100:.1f}%",
+        f"Factor ganancias {pf:.3f}",
+        f"Expectativa      {exp:+.3f} R por operación",
+        f"Total            {sum(x.r for x in t):+.1f} R",
+        f"Peor racha       {dd:.1f} R",
     ]
-    return pd.DataFrame(rows)[cols].sort_values("total_return_pct", ascending=False).reset_index(drop=True)
+
+    if mensual:
+        import datetime as dt
+        meses: dict[str, list[float]] = {}
+        for x in t:
+            k = dt.datetime.utcfromtimestamp(x.entry_ts / 1000).strftime("%Y-%m")
+            meses.setdefault(k, []).append(x.r)
+        out.append("\nPor mes (el reparto es lo que revela si depende del régimen):")
+        for k in sorted(meses):
+            rs = meses[k]
+            marca = "✓" if sum(rs) > 0 else "✗"
+            out.append(f"  {k}  {marca}  {len(rs):3d} ops  {sum(rs):+7.1f} R")
+
+    return "\n".join(out)
 
 
-# ---------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(description="Backtest RSI+SuperTrend Doble Dip en varias temporalidades (BingX)")
-    parser.add_argument("--symbol", default=_env("SYMBOL", "BTC-USDT"))
-    parser.add_argument("--timeframes", default=DEFAULT_TIMEFRAMES, help="lista separada por comas, ej: 15m,1h,4h")
-    parser.add_argument("--days", type=int, default=120, help="días de histórico por temporalidad (por defecto 120)")
-    parser.add_argument("--fee", type=float, default=0.05, help="comisión taker por lado en %% (por defecto 0.05, tarifa estándar BingX)")
-    parser.add_argument("--leverage", type=float, default=_env("LEVERAGE", 3, float))
-    parser.add_argument("--position-size", type=float, default=_env("POSITION_SIZE_PCT", 20, float))
-    parser.add_argument("--stop-loss", type=float, default=_env("STOP_LOSS_PCT", 5, float))
-    parser.add_argument("--rsi-length", type=int, default=_env("RSI_LENGTH", 10, int))
-    parser.add_argument("--sig-length", type=int, default=_env("SIG_LENGTH", 10, int))
-    parser.add_argument("--trigger-level", type=float, default=_env("TRIGGER_LEVEL", 50, float))
-    parser.add_argument("--target-cross-count", type=int, default=_env("TARGET_CROSS_COUNT", 2, int))
-    parser.add_argument("--atr-period", type=int, default=_env("ATR_PERIOD", 10, int))
-    parser.add_argument("--st-factor", type=float, default=_env("ST_FACTOR", 2.5, float))
-    parser.add_argument("--no-trend-filter", action="store_true",
-                         help="desactiva el filtro de tendencia EMA50+ruptura (Doble Dip puro, como el Pine original)")
-    parser.add_argument("--trend-ema-length", type=int, default=_env("TREND_EMA_LENGTH", 50, int))
-    parser.add_argument("--trend-ema-slope-lookback", type=int, default=_env("TREND_EMA_SLOPE_LOOKBACK", 5, int))
-    parser.add_argument("--trend-pivot-left", type=int, default=_env("TREND_PIVOT_LEFT", 5, int))
-    parser.add_argument("--trend-pivot-right", type=int, default=_env("TREND_PIVOT_RIGHT", 5, int))
-    parser.add_argument("--trend-max-bars-after-break", type=int, default=_env("TREND_MAX_BARS_AFTER_BREAK", 30, int))
-    parser.add_argument("--out", default="backtest_resultados.csv")
-    parser.add_argument("--save-trades", action="store_true", help="guarda el detalle de cada operación en trades_<tf>.csv")
-    args = parser.parse_args()
+async def main() -> int:
+    if len(sys.argv) < 3:
+        print(__doc__)
+        return 1
+    symbols = [s.strip().upper() for s in sys.argv[1].split(",")]
+    interval = sys.argv[2]
+    days = int(sys.argv[3]) if len(sys.argv) > 3 else 180
+    mensual = "--mensual" in sys.argv
 
-    api_key = _env("BINGX_API_KEY")
-    api_secret = _env("BINGX_API_SECRET")
-    if not api_key or not api_secret:
-        raise SystemExit(
-            "Falta BINGX_API_KEY / BINGX_API_SECRET en el entorno (o en un .env en este directorio). "
-            "Solo se usan endpoints públicos de klines, no hace falta permiso de trading en la key."
-        )
+    print(f"Descargando {days} días en {interval} para {len(symbols)} símbolo(s)...")
+    print(f"Filtros activos: coste {config.COST_ROUNDTRIP_PCT}% · "
+          f"riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%")
 
-    trend_filter_env_default = _env(
-        "TREND_FILTER_ENABLED", True, lambda s: str(s).lower() not in ("false", "0", "no")
-    )
-    trend_filter_enabled = trend_filter_env_default and not args.no_trend_filter
+    total_r = 0.0
+    total_ops = 0
+    async with httpx.AsyncClient() as client:
+        for sym in symbols:
+            try:
+                velas = await download(client, sym, interval, days)
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n{sym}: no se pudo descargar ({exc})")
+                continue
+            if len(velas) < 500:
+                print(f"\n{sym}: solo {len(velas)} velas, insuficiente")
+                continue
+            res = simulate(sym, velas)
+            print(report(res, mensual))
+            total_r += sum(x.r for x in res.trades)
+            total_ops += len(res.trades)
 
-    client = BingXClient(api_key, api_secret)
-    params = {
-        "rsi_length": args.rsi_length,
-        "sig_length": args.sig_length,
-        "trigger_level": args.trigger_level,
-        "target_cross_count": args.target_cross_count,
-        "atr_period": args.atr_period,
-        "st_factor": args.st_factor,
-        "trend_filter_enabled": trend_filter_enabled,
-        "trend_ema_length": args.trend_ema_length,
-        "trend_ema_slope_lookback": args.trend_ema_slope_lookback,
-        "trend_pivot_left": args.trend_pivot_left,
-        "trend_pivot_right": args.trend_pivot_right,
-        "trend_max_bars_after_break": args.trend_max_bars_after_break,
-    }
-    timeframes = [t for t in args.timeframes.split(",") if t.strip()]
-
-    filtro_txt = (
-        f"filtro tendencia ACTIVO (EMA{args.trend_ema_length})" if trend_filter_enabled
-        else "filtro tendencia DESACTIVADO (Doble Dip puro)"
-    )
-    print(
-        f"Backtest {args.symbol} | {args.days} días | comisión {args.fee}%/lado (round-trip {args.fee*2}%) | "
-        f"leverage {args.leverage}x | tamaño {args.position_size}% equity | stop-loss {args.stop_loss}% | {filtro_txt}\n"
-        f"Estrategia: RSI({args.rsi_length}) / SMA({args.sig_length}) / trigger {args.trigger_level} / "
-        f"doble cruce #{args.target_cross_count} | SuperTrend ATR({args.atr_period}) x{args.st_factor}\n"
-    )
-
-    save_dir = "backtest_trades" if args.save_trades else None
-    results = run_sweep(
-        client, args.symbol, timeframes, args.days, params,
-        args.fee / 100.0, args.position_size, args.leverage, args.stop_loss,
-        save_trades_dir=save_dir,
-    )
-
-    print()
-    if results.empty:
-        print("Sin resultados (revisa símbolo / temporalidades / histórico disponible).")
-        return
-
-    with pd.option_context("display.width", 160, "display.float_format", "{:.2f}".format):
-        print(results.to_string(index=False))
-
-    results.to_csv(args.out, index=False)
-    print(f"\nGuardado en {args.out}" + (f" y detalle de operaciones en {save_dir}/" if save_dir else ""))
-    print(
-        "\nOjo: profit_factor = ganancia bruta / pérdida bruta (>1 = rentable en el periodo probado). "
-        "num_trades bajo (<20-30) no es una muestra fiable, aunque el retorno parezca bueno."
-    )
+    if total_ops:
+        print(f"\n{'='*58}")
+        print(f"AGREGADO: {total_ops} operaciones · {total_r:+.1f} R · "
+              f"{total_r/total_ops:+.3f} R por operación")
+        print("Con menos de 100 operaciones repartidas en varios meses,")
+        print("esto sigue siendo una pista, no una conclusión.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(asyncio.run(main()))

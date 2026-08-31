@@ -49,9 +49,8 @@ async def main() -> int:
                     "✅ <b>Prueba correcta</b>\n"
                     "Si lees esto, el bot puede avisarte.\n\n"
                     f"Modo configurado: {config.describe()}\n"
-                    f"Amplitud mínima: {config.MIN_ATR_PCT}% · riesgo {config.MIN_RISK_PCT}-{config.MAX_RISK_PCT}%\n"
-                    f"Coste máximo: {config.MAX_COST_IN_R:.2f}R (ida y vuelta {config.COST_ROUNDTRIP_PCT}%)\n"
-                    f"Salida: SuperTrend({config.ST_PERIOD}, {config.ST_FACTOR}), sin límite de tiempo"
+                    f"Amplitud mínima: {config.MIN_ATR_PCT}% y {config.MIN_COST_COVER:.0f}× el coste\n"
+                    f"Tiempo máximo por operación: {config.max_trade_seconds() // 60} min"
                 ),
                 "parse_mode": "HTML",
             },
