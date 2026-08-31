@@ -2,7 +2,14 @@
 indicators.py
 =============
 Réplica en Python, barra a barra, de la lógica del Pine Script v6 original
-("ProBorsa: RSI & SuperTrend Özel Dip Stratejisi").
+("ProBorsa: RSI & SuperTrend Özel Dip Stratejisi"), más un filtro de
+tendencia OPCIONAL (TREND_FILTER_ENABLED) tomado del script
+"Higher-Low tras Ruptura de Base + EMA50": no tomar el Doble Dip si el
+precio sigue dentro de una base sin confirmar (la EMA de tendencia
+todavía no sube, o el precio no ha roto la directriz bajista de la base
+previa). Es el mismo "no compres el primer rebote, compra tras confirmar
+estructura" aplicado como filtro sobre la señal de RSI en vez de como
+señal propia.
 
 Reglas de entrada/salida (idénticas al script fuente):
   - RSI(rsi_length) vía RMA (suavizado de Wilder), igual que ta.rma de Pine.
@@ -17,9 +24,15 @@ Reglas de entrada/salida (idénticas al script fuente):
     (idéntico al ta.supertrend de Pine: bandas ajustadas + persistencia de
     dirección). direction == 1 -> bajista, direction == -1 -> alcista.
   - stSell = la dirección de SuperTrend pasa de -1 a 1 (cambio > 0)
+  - Filtro de tendencia (si TREND_FILTER_ENABLED): specialBuy final =
+    specialBuy crudo Y ema_de_tendencia subiendo Y precio ya rompió la
+    directriz bajista de la base previa (ver compute_trend_filter). La
+    ruptura se invalida sola si aparece un nuevo mínimo por debajo del
+    suelo de la ruptura, o si pasa demasiado tiempo sin confirmarse.
 
-Todo el cálculo es secuencial (bar-by-bar) porque el contador y el
-SuperTrend dependen de su propio valor previo, igual que en Pine.
+Todo el cálculo es secuencial (bar-by-bar) porque el contador, el
+SuperTrend y el filtro de tendencia dependen de su propio valor previo,
+igual que en Pine.
 """
 
 from __future__ import annotations
@@ -218,6 +231,96 @@ class SignalResult:
     direction: int
     close: float
     candle_time: pd.Timestamp
+    trend_filter_ok: bool = True   # True si el filtro está desactivado o no bloqueó nada
+    raw_special_buy: bool = False  # specialBuy ANTES del filtro de tendencia (para depurar)
+
+
+def _pivots(series: pd.Series, left: int, right: int, mode: str) -> np.ndarray:
+    """Pivotes estilo ta.pivothigh/ta.pivotlow de Pine: el valor se reporta
+    `right` barras después de ocurrir (para no repintar)."""
+    values = series.to_numpy(dtype=float)
+    n = len(values)
+    out = np.full(n, np.nan)
+    for i in range(left, n - right):
+        window = values[i - left : i + right + 1]
+        center = values[i]
+        if mode == "low" and center == np.min(window) and np.sum(window == center) == 1:
+            out[i + right] = center
+        elif mode == "high" and center == np.max(window) and np.sum(window == center) == 1:
+            out[i + right] = center
+    return out
+
+
+def compute_trend_filter(high: pd.Series, low: pd.Series, close: pd.Series, params: dict) -> pd.Series:
+    """Filtro de tendencia tomado de "Higher-Low tras Ruptura de Base +
+    EMA50": True solo cuando la EMA de tendencia está subiendo Y el precio
+    ya rompió la directriz bajista que conectaba los 2 últimos pivote-altos
+    de la base previa. Antes de esa ruptura (base sin confirmar, como el
+    "Dont buy this" de la imagen de referencia) siempre da False.
+
+    A diferencia del bot Higher-Low+EMA50 (donde esto ES la señal de
+    entrada), aquí es solo un FILTRO sobre la señal de RSI - no exige que
+    haya un higher-low exacto en la misma vela, solo que ya estemos en la
+    fase confirmada de la tendencia.
+    """
+    ema = close.ewm(span=params["trend_ema_length"], adjust=False).mean()
+    ema_vals = ema.to_numpy()
+    n = len(close)
+
+    ema_rising = np.zeros(n, dtype=bool)
+    lb = params["trend_ema_slope_lookback"]
+    for i in range(lb, n):
+        ema_rising[i] = ema_vals[i] > ema_vals[i - lb]
+
+    ph_raw = _pivots(high, params["trend_pivot_left"], params["trend_pivot_right"], "high")
+    pl_raw = _pivots(low, params["trend_pivot_left"], params["trend_pivot_right"], "low")
+    low_vals = low.to_numpy()
+    close_vals = close.to_numpy()
+
+    ph1 = ph2 = np.nan
+    ph1_bar = ph2_bar = None
+    pl1 = np.nan
+
+    broken_above = False
+    break_bar = None
+    low_at_break = np.nan
+
+    result = np.zeros(n, dtype=bool)
+
+    for i in range(n):
+        if not np.isnan(ph_raw[i]):
+            ph2, ph2_bar = ph1, ph1_bar
+            ph1, ph1_bar = ph_raw[i], i - params["trend_pivot_right"]
+
+        new_pivot_low = not np.isnan(pl_raw[i])
+        if new_pivot_low:
+            pl1 = pl_raw[i]
+
+        have_tl = not np.isnan(ph1) and not np.isnan(ph2) and ph1_bar != ph2_bar
+        slope = (ph1 - ph2) / (ph1_bar - ph2_bar) if have_tl else np.nan
+        tl_val = ph1 + slope * (i - ph1_bar) if have_tl else np.nan
+        is_down_tl = have_tl and slope < 0
+
+        breakout_now = False
+        if is_down_tl and not np.isnan(tl_val) and i > 0:
+            prev_tl_val = ph1 + slope * ((i - 1) - ph1_bar)
+            if close_vals[i] > tl_val and close_vals[i - 1] <= prev_tl_val:
+                breakout_now = True
+
+        if breakout_now:
+            broken_above = True
+            break_bar = i
+            low_at_break = pl1 if not np.isnan(pl1) else low_vals[i]
+
+        if broken_above and new_pivot_low and pl1 < low_at_break:
+            broken_above = False
+
+        if broken_above and break_bar is not None and (i - break_bar) > params["trend_max_bars_after_break"]:
+            broken_above = False
+
+        result[i] = ema_rising[i] and broken_above
+
+    return pd.Series(result, index=close.index)
 
 
 def evaluate(df: pd.DataFrame, params: dict) -> SignalResult:
@@ -227,13 +330,20 @@ def evaluate(df: pd.DataFrame, params: dict) -> SignalResult:
     """
     rsi = compute_rsi(df["close"], params["rsi_length"])
     rsi_signal = rsi.rolling(params["sig_length"]).mean()
-    special_buy, counts = compute_special_buy(
+    raw_special_buy, counts = compute_special_buy(
         rsi, rsi_signal, params["trigger_level"], params["target_cross_count"]
     )
     supertrend, direction = compute_supertrend(
         df["high"], df["low"], df["close"], params["atr_period"], params["st_factor"]
     )
     st_sell = direction.diff() > 0
+
+    if params.get("trend_filter_enabled"):
+        trend_ok = compute_trend_filter(df["high"], df["low"], df["close"], params)
+        special_buy = raw_special_buy & trend_ok
+    else:
+        trend_ok = pd.Series(True, index=df.index)
+        special_buy = raw_special_buy
 
     i = len(df) - 1
     return SignalResult(
@@ -246,4 +356,6 @@ def evaluate(df: pd.DataFrame, params: dict) -> SignalResult:
         direction=int(direction.iloc[i]),
         close=float(df["close"].iloc[i]),
         candle_time=df.index[i],
+        trend_filter_ok=bool(trend_ok.iloc[i]),
+        raw_special_buy=bool(raw_special_buy.iloc[i]),
     )

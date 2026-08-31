@@ -1,23 +1,7 @@
-# Secretos / configuración local
 .env
-
-# Estado local del bot (precio de entrada, etc.)
-state.json
-
-# Python
 __pycache__/
 *.pyc
-*.pyo
 .venv/
 venv/
-env/
-*.egg-info/
-.pytest_cache/
-
-# Resultados de backtest exportados
-backtest_*.csv
-
-# Sistema / editores
+*.log
 .DS_Store
-.vscode/
-.idea/

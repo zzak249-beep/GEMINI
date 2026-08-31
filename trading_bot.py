@@ -1,36 +1,48 @@
 """
 trading_bot.py
 ===============
-Orquesta el ciclo completo: espera al cierre de cada vela de 15m,
-descarga klines de BingX, evalúa la estrategia RSI+SuperTrend "Doble Dip"
-y ejecuta entradas/salidas en BingX Futures, notificando todo por Telegram.
+Motor de escaneo multi-símbolo: en cada cierre de vela descarga klines de
+TODOS los símbolos configurados (o de todos los perpetuos USDT-M de BingX
+si SYMBOLS=ALL), evalúa la estrategia RSI+SuperTrend "Doble Dip" EN
+PARALELO (solo lectura, vía ThreadPoolExecutor) y ejecuta entradas/salidas
+de forma SECUENCIAL, notificando todo por Telegram.
 
-Diseño clave para fiabilidad 24/7:
-  - Antes de cada decisión se relee la posición REAL en BingX (no se
-    confía solo en el estado en memoria) para evitar duplicar órdenes
-    tras un reinicio del proceso en Railway.
-  - El stop-loss de seguridad (STOP_LOSS_PCT) se coloca como orden
-    STOP_MARKET real en el exchange, no como vigilancia por polling:
-    sigue protegiendo la cuenta aunque el bot se caiga.
-  - Si la posición desaparece entre ciclos sin que el bot la haya
-    cerrado (el stop-loss saltó solo), se detecta y se avisa por
-    Telegram en vez de quedar en silencio.
-  - Al reiniciar con una posición ya abierta, el bot intenta recuperar
-    el orderId de su stop-loss existente; y al cerrar por señal,
-    cancela TODAS las órdenes abiertas del símbolo (no solo el ID que
-    recuerda en memoria), para no dejar nunca un stop huérfano.
-  - Comprobación de credenciales/conectividad al arrancar: si
-    BINGX_API_KEY/SECRET son inválidas, falla de inmediato con aviso
-    claro en vez de esperar a la primera señal real.
-  - DRY_RUN=true (por defecto) calcula y notifica las señales sin
-    enviar ninguna orden real - úsalo para validar el comportamiento
-    antes de pasar a operar con dinero real.
+Por qué secuencial para las órdenes: si dos símbolos dan señal en el mismo
+ciclo y se piden en paralelo, ambas peticiones pueden leer el MISMO balance
+disponible antes de que la primera orden lo haya consumido, comprometiendo
+más margen del que en realidad hay (justo el bug ya visto antes en un bot
+similar: "rate limiting / lecturas paralelas de balance"). Procesando las
+entradas una por una, cada dimensionamiento ya ve el balance actualizado
+tras la operación anterior.
+
+Controles de riesgo específicos de escanear muchos símbolos a la vez
+(no vienen en el Pine Script original - se necesitan para no comprometer
+más del 100% del equity si varios símbolos dan señal el mismo ciclo):
+  - MAX_CONCURRENT_POSITIONS: techo duro de posiciones abiertas a la vez.
+  - SYMBOL_COOLDOWN_MINUTES: tras cerrar un símbolo, no se reabre en X min.
+  - Circuit breaker global: tras N pérdidas SEGUIDAS (en cualquier
+    símbolo) se pausan nuevas entradas un rato; las salidas de posiciones
+    ya abiertas NUNCA se pausan por esto.
+
+Fiabilidad 24/7 (igual que en la versión single-symbol):
+  - Antes de decidir, se relee el estado REAL de posiciones en BingX (una
+    sola llamada para TODOS los símbolos) en vez de fiarse de la memoria.
+  - Si una posición desaparece entre ciclos sin que el bot la cerrara
+    (probable stop-loss), se detecta y avisa por Telegram, símbolo a
+    símbolo, y cuenta como pérdida para el circuit breaker.
+  - Al cerrar por señal se cancelan TODAS las órdenes abiertas de ESE
+    símbolo, no solo el ID de stop-loss recordado en memoria.
+  - DRY_RUN=true (por defecto): calcula y notifica señales sin mandar
+    ninguna orden real, manteniendo un set de posiciones "virtuales" en
+    memoria para poder probar cooldown / circuit breaker / máximo de
+    posiciones sin arriesgar nada.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import pandas as pd
@@ -54,22 +66,81 @@ class TradingBot:
         self.config = config
         self.client = BingXClient(config.BINGX_API_KEY, config.BINGX_API_SECRET)
         self.notifier = TelegramNotifier(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID)
-        self.contract_info = {"quantity_precision": 3, "price_precision": 2}
-        self.state = {"stop_order_id": None}
+
+        self.symbols: list[str] = []
+        self.contract_info: dict[str, dict] = {}
+        self._symbols_refreshed_at = 0.0
+        self._first_refresh_done = False
+        self.leverage_set_symbols: set[str] = set()
+
+        self.stop_orders: dict[str, object] = {}
+        self.symbol_last_close: dict[str, float] = {}
+        self.dry_run_open: set[str] = set()
+        self.last_known_open: set[str] = set()
+
+        self.consecutive_losses = 0
+        self.circuit_breaker_until: float | None = None
+
         self.last_status = {"started_at": datetime.now(timezone.utc).isoformat()}
 
     # ------------------------------------------------------------------
-    def _initialize(self):
-        try:
-            self.contract_info = self.client.get_contract_info(self.config.SYMBOL)
-            logger.info("Info de contrato %s: %s", self.config.SYMBOL, self.contract_info)
-        except Exception as exc:
-            logger.error("No se pudo leer la info del contrato, uso valores por defecto: %s", exc)
+    # Descubrimiento / refresco de símbolos
+    # ------------------------------------------------------------------
+    def _default_contract_info(self, symbol: str) -> dict:
+        return self.contract_info.get(symbol, {"quantity_precision": 3, "price_precision": 2})
 
+    def _resolve_symbols(self) -> list[str]:
+        if not self.config.SCAN_ALL_SYMBOLS:
+            return [s.strip() for s in self.config.SYMBOLS.split(",") if s.strip()]
+
+        contracts = self.client.get_all_contracts()
+        suffix = f"-{self.config.QUOTE_ASSET_FILTER}"
+        excluded = set(self.config.EXCLUDED_SYMBOLS)
+        symbols = []
+        for c in contracts:
+            sym = c["symbol"]
+            if not sym.endswith(suffix) or sym in excluded:
+                continue
+            symbols.append(sym)
+            self.contract_info[sym] = {
+                "quantity_precision": c["quantity_precision"],
+                "price_precision": c["price_precision"],
+            }
+        return symbols
+
+    def _maybe_refresh_symbols(self, force: bool = False):
+        now = time.time()
+        if not force and self.symbols and (now - self._symbols_refreshed_at) < self.config.SYMBOL_REFRESH_HOURS * 3600:
+            return
+        try:
+            symbols = self._resolve_symbols()
+        except Exception as exc:
+            logger.error("No se pudo obtener/actualizar la lista de símbolos: %s", exc)
+            if not self.symbols:
+                raise
+            return
+
+        if not symbols:
+            logger.error("La lista de símbolos resultante está vacía, se mantiene la anterior.")
+            return
+
+        added = set(symbols) - set(self.symbols)
+        removed = set(self.symbols) - set(symbols)
+        self.symbols = symbols
+        self._symbols_refreshed_at = now
+        logger.info("Símbolos a escanear: %d (nuevos: %d, retirados: %d)", len(symbols), len(added), len(removed))
+        if self._first_refresh_done and (added or removed):
+            self.notifier.info(
+                f"ℹ️ Universo de símbolos actualizado: {len(symbols)} en total "
+                f"(+{len(added)} nuevos, -{len(removed)} retirados)."
+            )
+        self._first_refresh_done = True
+
+    # ------------------------------------------------------------------
+    # Arranque
+    # ------------------------------------------------------------------
+    def _initialize(self):
         if not self.config.DRY_RUN:
-            # Comprobación de conectividad/credenciales en caliente: si la
-            # API key/secret están mal, falla aquí de forma clara en vez de
-            # descubrirlo días después, cuando por fin salte una señal real.
             try:
                 balance = self.client.get_available_balance()
                 logger.info("Conexión con BingX OK. Balance disponible: %.2f USDT", balance)
@@ -82,38 +153,32 @@ class TradingBot:
                 self.notifier.error(msg)
                 raise RuntimeError(msg) from exc
 
-            try:
-                self.client.set_leverage(self.config.SYMBOL, self.config.LEVERAGE, side="LONG")
-            except Exception as exc:
-                logger.warning("No se pudo fijar apalancamiento automáticamente: %s", exc)
+        self._maybe_refresh_symbols(force=True)
+        logger.info("Universo inicial: %d símbolos.", len(self.symbols))
 
+        if not self.config.DRY_RUN:
             try:
-                position = self.client.get_position(self.config.SYMBOL, "LONG")
-                self.state["in_position"] = position is not None
-                if position:
-                    logger.info("Posición LONG ya abierta al arrancar: %s", position)
+                positions = self.client.get_all_positions()
+                self.last_known_open = set(positions.keys())
+                if positions:
+                    logger.info("Posiciones LONG ya abiertas al arrancar: %s", list(positions.keys()))
                     self.notifier.info(
-                        f"ℹ️ Al arrancar ya hay una posición LONG abierta en {self.config.SYMBOL}: "
-                        f"{position['amount']} @ {position['entry_price']:.4f}. "
-                        "El bot la gestionará (la cerrará si SuperTrend da señal de venta)."
+                        f"ℹ️ Al arrancar ya hay {len(positions)} posición(es) LONG abierta(s): "
+                        f"{', '.join(positions.keys())}. El bot las gestionará."
                     )
-                    self._reconcile_stop_order()
+                    self._reconcile_stop_orders(positions.keys())
             except Exception as exc:
-                logger.warning("No se pudo consultar posición existente al arrancar: %s", exc)
+                logger.warning("No se pudo consultar posiciones existentes al arrancar: %s", exc)
 
-    def _reconcile_stop_order(self):
-        """Si al arrancar ya hay una posición abierta, intenta recuperar el
-        orderId de su stop-loss existente (por si el bot se reinició y
-        perdió el estado en memoria) para poder cancelarlo correctamente
-        más adelante en vez de depender de un ID que ya no recuerda."""
-        try:
-            open_orders = self.client.get_open_orders(self.config.SYMBOL)
-            stop_orders = [o for o in open_orders if o.get("type") == "STOP_MARKET"]
-            if stop_orders:
-                self.state["stop_order_id"] = stop_orders[0].get("orderId")
-                logger.info("Stop-loss existente vinculado tras reinicio: %s", self.state["stop_order_id"])
-        except Exception as exc:
-            logger.warning("No se pudieron leer las órdenes abiertas al arrancar: %s", exc)
+    def _reconcile_stop_orders(self, symbols):
+        for symbol in symbols:
+            try:
+                open_orders = self.client.get_open_orders(symbol)
+                stops = [o for o in open_orders if o.get("type") == "STOP_MARKET"]
+                if stops:
+                    self.stop_orders[symbol] = stops[0].get("orderId")
+            except Exception as exc:
+                logger.warning("[%s] no se pudieron leer las órdenes abiertas al arrancar: %s", symbol, exc)
 
     def run(self):
         self._initialize()
@@ -132,6 +197,8 @@ class TradingBot:
                 time.sleep(30)
 
     # ------------------------------------------------------------------
+    # Escaneo concurrente (SOLO LECTURA)
+    # ------------------------------------------------------------------
     def _drop_unclosed_candle(self, df: pd.DataFrame) -> pd.DataFrame:
         now = pd.Timestamp.now(tz="UTC")
         tf = pd.Timedelta(minutes=self.config.TIMEFRAME_MINUTES)
@@ -139,65 +206,145 @@ class TradingBot:
             df = df.iloc[:-1]
         return df
 
-    def _run_cycle(self):
-        df = self.client.get_klines(self.config.SYMBOL, self.config.TIMEFRAME, self.config.HISTORY_CANDLES)
+    def _min_candles_needed(self) -> int:
+        base = max(self.config.RSI_LENGTH, self.config.ATR_PERIOD) + self.config.SIG_LENGTH + 5
+        if self.config.TREND_FILTER_ENABLED:
+            trend_min = self.config.TREND_EMA_LENGTH + self.config.TREND_MAX_BARS_AFTER_BREAK + 20
+            base = max(base, trend_min)
+        return base
+
+    def _fetch_and_evaluate(self, symbol: str) -> SignalResult | None:
+        df = self.client.get_klines(symbol, self.config.TIMEFRAME, self.config.HISTORY_CANDLES)
         df = self._drop_unclosed_candle(df)
-        if len(df) < max(self.config.RSI_LENGTH, self.config.ATR_PERIOD) + self.config.SIG_LENGTH + 5:
-            logger.warning("Muy pocas velas cerradas (%d) para calcular indicadores con fiabilidad.", len(df))
+        if len(df) < self._min_candles_needed():
+            return None
+        return evaluate(df, self.config.strategy_params())
+
+    def _scan_all_symbols(self) -> dict:
+        results = {}
+        with ThreadPoolExecutor(max_workers=max(1, self.config.SCAN_CONCURRENCY)) as executor:
+            future_map = {executor.submit(self._fetch_and_evaluate, s): s for s in self.symbols}
+            for future in as_completed(future_map):
+                symbol = future_map[future]
+                try:
+                    results[symbol] = future.result()
+                except Exception as exc:
+                    logger.warning("[%s] error al escanear: %s", symbol, exc)
+                    results[symbol] = None
+        return results
+
+    # ------------------------------------------------------------------
+    # Riesgo: cooldown por símbolo y circuit breaker global
+    # ------------------------------------------------------------------
+    def _in_cooldown(self, symbol: str) -> bool:
+        last_close = self.symbol_last_close.get(symbol)
+        if not last_close:
+            return False
+        return (time.time() - last_close) < self.config.SYMBOL_COOLDOWN_MINUTES * 60
+
+    def _circuit_breaker_active(self) -> bool:
+        return self.circuit_breaker_until is not None and time.time() < self.circuit_breaker_until
+
+    def _record_trade_result(self, won: bool):
+        if won:
+            self.consecutive_losses = 0
+            return
+        self.consecutive_losses += 1
+        if self.consecutive_losses >= self.config.MAX_CONSECUTIVE_LOSSES and not self._circuit_breaker_active():
+            self.circuit_breaker_until = time.time() + self.config.CIRCUIT_BREAKER_COOLDOWN_MINUTES * 60
+            self.notifier.error(
+                f"🛑 Circuit breaker: {self.consecutive_losses} pérdidas seguidas. Nuevas entradas "
+                f"pausadas {self.config.CIRCUIT_BREAKER_COOLDOWN_MINUTES:.0f} min "
+                "(las salidas de posiciones ya abiertas siguen funcionando con normalidad)."
+            )
+
+    # ------------------------------------------------------------------
+    # Ciclo principal
+    # ------------------------------------------------------------------
+    def _get_positions_snapshot(self) -> dict:
+        if self.config.DRY_RUN:
+            return {s: {"amount": 0.0, "entry_price": 0.0, "unrealized_pnl": 0.0} for s in self.dry_run_open}
+        return self.client.get_all_positions()
+
+    def _run_cycle(self):
+        self._maybe_refresh_symbols()
+        if not self.symbols:
+            logger.warning("Sin símbolos para escanear este ciclo.")
             return
 
-        signal = evaluate(df, self.config.strategy_params())
-        logger.info(
-            "Vela %s | close=%.4f RSI=%.2f señal=%.2f cross=%d ST=%.4f dir=%d specialBuy=%s stSell=%s",
-            signal.candle_time, signal.close, signal.rsi, signal.rsi_signal,
-            signal.cross_count, signal.supertrend, signal.direction,
-            signal.special_buy, signal.st_sell,
-        )
+        positions_before = self._get_positions_snapshot()
 
-        if self.config.DRY_RUN:
-            position = None
-            in_position = self.state.get("dry_run_in_position", False)
+        vanished = self.last_known_open - set(positions_before.keys())
+        for symbol in vanished:
+            self._handle_external_close(symbol)
+
+        signals = self._scan_all_symbols()
+
+        closed_this_cycle = set()
+        for symbol, position in positions_before.items():
+            signal = signals.get(symbol)
+            if not (signal and signal.st_sell):
+                continue
+            try:
+                if self._close_long(symbol, signal, position, reason="Cambio de dirección de SuperTrend (bajista)"):
+                    closed_this_cycle.add(symbol)
+            except Exception as exc:
+                logger.exception("[%s] error inesperado al cerrar", symbol)
+                self.notifier.error(f"[{symbol}] error inesperado al cerrar: {exc}")
+
+        opened_this_cycle = set()
+        if self._circuit_breaker_active():
+            remaining_min = (self.circuit_breaker_until - time.time()) / 60.0
+            logger.info("Circuit breaker activo (%.0f min restantes): se omiten nuevas entradas.", remaining_min)
         else:
-            position = self.client.get_position(self.config.SYMBOL, "LONG")
-            in_position = position is not None
+            open_count = len(positions_before) - len(closed_this_cycle)
+            available_slots = self.config.MAX_CONCURRENT_POSITIONS - open_count
+            for symbol, signal in signals.items():
+                if available_slots <= 0:
+                    break
+                if symbol in positions_before and symbol not in closed_this_cycle:
+                    continue
+                if self._in_cooldown(symbol):
+                    continue
+                if not (signal and signal.special_buy):
+                    continue
+                try:
+                    if self._open_long(symbol, signal):
+                        opened_this_cycle.add(symbol)
+                        available_slots -= 1
+                except Exception as exc:
+                    logger.exception("[%s] error inesperado al abrir", symbol)
+                    self.notifier.error(f"[{symbol}] error inesperado al abrir: {exc}")
 
-        was_in_position = self.state.get("in_position", False)
+        self.last_known_open = (set(positions_before.keys()) - closed_this_cycle) | opened_this_cycle
 
+        n_special = sum(1 for s in signals.values() if s and s.special_buy)
+        n_sell = sum(1 for s in signals.values() if s and s.st_sell)
         self.last_status.update(
             {
                 "last_check": datetime.now(timezone.utc).isoformat(),
-                "candle_time": str(signal.candle_time),
-                "close": signal.close,
-                "rsi": signal.rsi,
-                "supertrend_direction": signal.direction,
-                "in_position": bool(in_position),
-                "special_buy": signal.special_buy,
-                "st_sell": signal.st_sell,
+                "symbols_scanned": len(signals),
+                "open_positions": sorted(self.last_known_open),
+                "num_open": len(self.last_known_open),
+                "special_buy_signals": n_special,
+                "st_sell_signals": n_sell,
+                "consecutive_losses": self.consecutive_losses,
+                "circuit_breaker_active": self._circuit_breaker_active(),
             }
         )
+        logger.info(
+            "Ciclo OK | %d símbolos escaneados | %d abiertas | %d specialBuy | %d stSell",
+            len(signals), len(self.last_known_open), n_special, n_sell,
+        )
 
-        if not in_position and signal.special_buy:
-            self._open_long(signal)
-        elif in_position and signal.st_sell:
-            self._close_long(signal, position, reason="Cambio de dirección de SuperTrend (bajista)")
-        elif (not self.config.DRY_RUN) and was_in_position and not in_position:
-            self._handle_external_close()
-
-        if not self.config.DRY_RUN:
-            self.state["in_position"] = in_position
-
-    def _handle_external_close(self):
-        """La posición estaba abierta en el ciclo anterior y ahora ya no
-        existe, sin que este ciclo la haya cerrado por señal de SuperTrend.
-        Motivo casi siempre: saltó el stop-loss de seguridad (o se cerró
-        manualmente en el exchange). Sin esto, el bot se quedaría "plano"
-        en silencio y el usuario no se enteraría salvo mirando BingX."""
-        logger.info("La posición se cerró entre ciclos sin intervención del bot (probable stop-loss).")
-        self.state["stop_order_id"] = None
+    def _handle_external_close(self, symbol: str):
+        logger.info("[%s] la posición se cerró entre ciclos sin intervención del bot (probable stop-loss).", symbol)
+        self.stop_orders.pop(symbol, None)
+        self.symbol_last_close[symbol] = time.time()
+        self._record_trade_result(won=False)  # si fue el stop-loss, es una pérdida por definición
         self.notifier.info(
-            f"ℹ️ La posición LONG en {self.config.SYMBOL} ya no está abierta: se cerró entre "
-            "ciclos (probablemente por el stop-loss de seguridad, o manualmente). El bot "
-            "queda a la espera de una nueva señal de entrada."
+            f"ℹ️ La posición LONG en {symbol} ya no está abierta: se cerró entre ciclos "
+            "(probablemente por el stop-loss de seguridad, o manualmente)."
         )
 
     # ------------------------------------------------------------------
@@ -212,95 +359,100 @@ class TradingBot:
             pass
         return fallback
 
-    def _open_long(self, signal: SignalResult):
-        precision = self.contract_info.get("quantity_precision", 3)
+    def _ensure_leverage(self, symbol: str):
+        if symbol in self.leverage_set_symbols:
+            return
+        try:
+            self.client.set_leverage(symbol, self.config.LEVERAGE, side="LONG")
+        except Exception as exc:
+            logger.warning("[%s] no se pudo fijar apalancamiento: %s", symbol, exc)
+        self.leverage_set_symbols.add(symbol)
 
+    def _open_long(self, symbol: str, signal: SignalResult) -> bool:
         if self.config.DRY_RUN:
             self.notifier.info(
-                f"🟢 [DRY-RUN] Señal de ENTRADA en {self.config.SYMBOL} a ~{signal.close:.4f} "
-                f"(RSI={signal.rsi:.2f}, cruce Doble Dip). No se envía orden real."
+                f"🟢 [DRY-RUN] Señal de ENTRADA en {symbol} a ~{signal.close:.4f} "
+                f"(RSI={signal.rsi:.2f}, Doble Dip). No se envía orden real."
             )
-            self.state["dry_run_in_position"] = True
-            return
+            self.dry_run_open.add(symbol)
+            return True
 
         try:
             balance = self.client.get_available_balance()
         except Exception as exc:
-            logger.error("No se pudo leer balance: %s", exc)
-            self.notifier.error(f"Señal de entrada detectada pero no se pudo leer el balance: {exc}")
-            return
+            logger.error("[%s] no se pudo leer balance: %s", symbol, exc)
+            self.notifier.error(f"[{symbol}] señal de entrada pero no se pudo leer el balance: {exc}")
+            return False
 
+        info = self._default_contract_info(symbol)
         margin_to_use = balance * (self.config.POSITION_SIZE_PCT / 100.0)
         notional = margin_to_use * self.config.LEVERAGE
-        raw_qty = notional / signal.close
-        qty = format_quantity(raw_qty, precision)
+        qty = format_quantity(notional / signal.close, info["quantity_precision"])
 
         if float(qty) <= 0:
-            logger.warning("Cantidad calculada es 0. Balance=%.2f margen=%.2f", balance, margin_to_use)
-            self.notifier.error(
-                f"Señal de entrada detectada pero la cantidad calculada dio 0. "
-                f"Balance disponible: {balance:.2f} USDT."
-            )
-            return
+            logger.warning("[%s] cantidad calculada es 0 (balance=%.2f, margen=%.2f)", symbol, balance, margin_to_use)
+            return False
 
-        logger.info("Abriendo LONG: balance=%.2f margen=%.2f notional=%.2f qty=%s", balance, margin_to_use, notional, qty)
+        self._ensure_leverage(symbol)
+
+        logger.info(
+            "[%s] abriendo LONG: balance=%.2f margen=%.2f notional=%.2f qty=%s",
+            symbol, balance, margin_to_use, notional, qty,
+        )
         try:
-            order = self.client.open_long_market(self.config.SYMBOL, qty)
+            order = self.client.open_long_market(symbol, qty)
         except BingXAPIError as exc:
-            logger.error("Error al abrir LONG: %s", exc)
-            self.notifier.error(f"Fallo al abrir LONG en {self.config.SYMBOL}: {exc}")
-            return
+            logger.error("[%s] error al abrir LONG: %s", symbol, exc)
+            self.notifier.error(f"[{symbol}] fallo al abrir LONG: {exc}")
+            return False
 
         fill_price = self._extract_fill_price(order, fallback=signal.close)
 
         if self.config.STOP_LOSS_PCT > 0:
-            price_precision = self.contract_info.get("price_precision", 2)
             stop_price = fill_price * (1 - self.config.STOP_LOSS_PCT / 100.0)
-            stop_price_str = f"{stop_price:.{price_precision}f}"
+            stop_price_str = f"{stop_price:.{info['price_precision']}f}"
             try:
-                sl_order = self.client.place_stop_loss(self.config.SYMBOL, stop_price_str, qty)
-                self.state["stop_order_id"] = (
-                    sl_order.get("data", {}).get("order", {}).get("orderId")
-                )
+                sl_order = self.client.place_stop_loss(symbol, stop_price_str, qty)
+                self.stop_orders[symbol] = sl_order.get("data", {}).get("order", {}).get("orderId")
             except Exception as exc:
-                logger.error("No se pudo colocar el stop-loss de seguridad: %s", exc)
+                logger.error("[%s] no se pudo colocar el stop-loss: %s", symbol, exc)
                 self.notifier.error(
-                    f"Posición LONG abierta en {self.config.SYMBOL} pero el stop-loss de "
-                    f"seguridad NO se pudo colocar: {exc}. Revisa la posición manualmente."
+                    f"[{symbol}] posición abierta pero el stop-loss NO se pudo colocar: {exc}. Revisa manualmente."
                 )
 
-        self.notifier.entry(self.config.SYMBOL, float(qty), fill_price, self.config.LEVERAGE, signal.rsi)
+        self.notifier.entry(symbol, float(qty), fill_price, self.config.LEVERAGE, signal.rsi)
+        return True
 
-    def _close_long(self, signal: SignalResult, position: dict | None, reason: str):
+    def _close_long(self, symbol: str, signal: SignalResult, position: dict, reason: str) -> bool:
         if self.config.DRY_RUN:
-            self.notifier.info(
-                f"🔴 [DRY-RUN] Señal de SALIDA en {self.config.SYMBOL} a ~{signal.close:.4f} ({reason})."
-            )
-            self.state["dry_run_in_position"] = False
-            return
+            self.notifier.info(f"🔴 [DRY-RUN] Señal de SALIDA en {symbol} a ~{signal.close:.4f} ({reason}).")
+            self.dry_run_open.discard(symbol)
+            self.symbol_last_close[symbol] = time.time()  # el cooldown también se prueba en DRY_RUN
+            return True
 
-        precision = self.contract_info.get("quantity_precision", 3)
-        qty = format_quantity(position["amount"], precision)
+        info = self._default_contract_info(symbol)
+        qty = format_quantity(position["amount"], info["quantity_precision"])
 
-        # Cancela cualquier orden abierta (el stop-loss) antes de cerrar por
-        # mercado. Se cancelan TODAS las abiertas del símbolo, no solo el
-        # orderId recordado en memoria, para que un reinicio del bot no deje
-        # un stop-loss huérfano tras el cierre.
         try:
-            self.client.cancel_all_open_orders(self.config.SYMBOL)
+            self.client.cancel_all_open_orders(symbol)
         except Exception as exc:
-            logger.warning("No se pudieron cancelar las órdenes abiertas antes de cerrar: %s", exc)
-        self.state["stop_order_id"] = None
+            logger.warning("[%s] no se pudieron cancelar órdenes abiertas antes de cerrar: %s", symbol, exc)
+        self.stop_orders.pop(symbol, None)
 
         try:
-            order = self.client.close_long_market(self.config.SYMBOL, qty)
+            order = self.client.close_long_market(symbol, qty)
             fill_price = self._extract_fill_price(order, fallback=signal.close)
         except PositionNotExistError:
-            logger.info("La posición ya no existía en BingX (probablemente cerrada por el stop-loss).")
+            logger.info("[%s] la posición ya no existía (probablemente cerrada por el stop-loss).", symbol)
             fill_price = signal.close
         except BingXAPIError as exc:
-            logger.error("Error al cerrar LONG: %s", exc)
-            self.notifier.error(f"Fallo al cerrar LONG en {self.config.SYMBOL}: {exc}")
-            return
+            logger.error("[%s] error al cerrar LONG: %s", symbol, exc)
+            self.notifier.error(f"[{symbol}] fallo al cerrar LONG: {exc}")
+            return False
 
-        self.notifier.exit(self.config.SYMBOL, position["amount"], fill_price, reason, position.get("unrealized_pnl"))
+        pnl = position.get("unrealized_pnl")
+        won = (pnl > 0) if pnl is not None else (fill_price > position["entry_price"])
+        self.notifier.exit(symbol, position["amount"], fill_price, reason, pnl)
+        self.symbol_last_close[symbol] = time.time()
+        self._record_trade_result(won=won)
+        return True

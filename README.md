@@ -1,229 +1,182 @@
-# Bot RSI + SuperTrend "Doble Suelo" — BingX / Railway / Telegram
+# RSI + SuperTrend "Doble Dip" — Bot BingX Futures
 
-Bot de trading automático en Python que replica la estrategia del Pine Script
-**"ProBorsa: RSI & SuperTrend Özel Dip Stratejisi"**, pensado para operar en
-**BingX** (spot), desplegarse en **Railway** y enviar avisos por **Telegram**.
+Bot Python que replica en 15m la estrategia del Pine Script v6 subido
+("RSI & SuperTrend Özel Dip Stratejisi"):
 
-Temporalidad por defecto: **15 minutos**.
+- **Entrada (long):** 2º cruce alcista de RSI(10) sobre su media SMA(10),
+  con RSI por debajo de 50, sin que RSI haya vuelto a superar 50 entre
+  cruces ("Doble Dip" / formación en W).
+- **Salida:** SuperTrend(ATR 10, factor 2.5) cambia de alcista a bajista.
+- Solo opera en largo (igual que el script original, que no tiene lógica
+  de cortos).
 
-> ⚠️ **Esto no es un consejo financiero.** Operar de forma automática con
-> criptomonedas conlleva un riesgo real de pérdida de capital. Un buen
-> resultado en backtest no garantiza resultados futuros en real. Lee
-> [Antes de operar en real](#5-antes-de-operar-en-real) antes de poner
-> dinero de verdad.
+Añadido sobre el script original (no viene en el Pine, se necesita para
+operar con dinero real): tamaño de posición configurable, apalancamiento
+configurable y un stop-loss de seguridad como orden real en el exchange.
 
-## 🆕 Novedades de esta versión
+**Mejoras de fiabilidad (v2):**
+- Comprobación de credenciales/conexión con BingX al arrancar — falla
+  rápido y avisa por Telegram si `BINGX_API_KEY`/`SECRET` son inválidas,
+  en vez de esperar a la primera señal real para descubrirlo.
+- Detección de cierre externo: si el stop-loss salta solo entre ciclos
+  (o alguien cierra la posición a mano en BingX), el bot lo detecta y
+  avisa por Telegram — antes se quedaba en silencio.
+- Al cerrar por señal de SuperTrend, cancela **todas** las órdenes
+  abiertas del símbolo (no solo el ID de stop-loss que recuerda en
+  memoria), así un reinicio de Railway nunca deja un stop huérfano.
+- Si el bot se reinicia con una posición ya abierta, recupera el
+  stop-loss existente en vez de perder su referencia.
 
-Sobre la primera entrega, esta versión añade (sin tocar la lógica de
-señales, ya verificada bar a bar contra el Pine Script):
+**v3 — escaneo de todas las monedas (`SYMBOLS=ALL`):**
+El bot ya no opera un solo símbolo: descubre todos los perpetuos USDT-M
+de BingX (o la lista que le pases), evalúa la estrategia en **paralelo**
+en todos a la vez (solo lectura) y abre/cierra posiciones de forma
+**secuencial**, para que el dimensionamiento de cada entrada lea el
+balance ya actualizado por la entrada anterior del mismo ciclo — así no
+se compromete más margen del que en realidad hay.
 
-- **`backtest.py`**: valida la estrategia contra datos históricos REALES de
-  BingX (sin necesidad de API keys) antes de arriesgar nada.
-- **Reintentos con backoff** ante fallos de red transitorios al hablar con BingX.
-- **Comprobación previa de saldo y de mínimos del mercado** antes de comprar
-  (mensaje claro en vez de un error críptico del exchange).
-- **Guarda de idempotencia**: no vuelve a procesar/avisar dos veces la misma vela.
-- **Stop-loss opcional** (`STOP_LOSS_PCT`, desactivado por defecto = mismo
-  comportamiento exacto que el Pine original).
-- **Heartbeat periódico** ("sigo vivo") por Telegram.
-- **Comandos remotos por Telegram**: `/status` `/pause` `/resume` `/close` `/help`.
-- **`Dockerfile`** como alternativa de despliegue.
-- **Suite de tests** (`tests/`) con `pytest`, incluida una reimplementación
-  independiente de la lógica de señales para verificarla por partida doble.
-- Avisos de error con **cooldown** para no saturar el Telegram si un problema persiste.
+Controles de riesgo nuevos, específicos de operar muchos símbolos a la
+vez (no existen en el Pine original):
+- `MAX_CONCURRENT_POSITIONS` — techo duro de posiciones abiertas
+  simultáneas, cueste lo que cueste el resto de señales.
+- `SYMBOL_COOLDOWN_MINUTES` — tras cerrar un símbolo, no se reabre antes
+  de X minutos.
+- Circuit breaker global — tras `MAX_CONSECUTIVE_LOSSES` cierres en
+  pérdida seguidos (en cualquier símbolo, incluidos los que se cierran
+  solos por el stop-loss), se pausan **nuevas entradas**
+  `CIRCUIT_BREAKER_COOLDOWN_MINUTES`. Las salidas de posiciones ya
+  abiertas nunca se pausan por esto.
+- `POSITION_SIZE_PCT` por defecto baja de 20% a 5% respecto a la versión
+  de un solo símbolo, precisamente porque ahora se apila: con los valores
+  por defecto, `MAX_CONCURRENT_POSITIONS x POSITION_SIZE_PCT` = 5 x 5% =
+  25% del balance en margen como máximo teórico simultáneo.
 
-## ¿Qué hace exactamente la estrategia? (sin cambios)
+**v4 — filtro de tendencia (`TREND_FILTER_ENABLED=true`, activo por
+defecto):** tomado del script "Higher-Low tras Ruptura de Base + EMA50"
+(a partir de una imagen de patrón chartista): no toma el Doble Dip si el
+precio sigue dentro de una base sin confirmar. Exige que la EMA de
+tendencia (`TREND_EMA_LENGTH`, 50 por defecto) esté subiendo Y que el
+precio ya haya roto la directriz bajista que conectaba los últimos dos
+pivote-altos de la base previa - la ruptura se invalida sola si aparece un
+nuevo mínimo por debajo del suelo de la ruptura, o si pasa
+`TREND_MAX_BARS_AFTER_BREAK` velas sin confirmarse. A diferencia del bot
+Higher-Low+EMA50 (donde esto ES la señal), aquí es solo un FILTRO sobre la
+señal de RSI: no exige que haya un higher-low exacto en la misma vela.
 
-1. Calcula el **RSI** (suavizado de Wilder, igual que TradingView) de longitud 10.
-2. Calcula una **media móvil del RSI** (longitud 10) como línea de señal.
-3. Cuenta cuántas veces el RSI cruza al alza esa media **mientras el RSI
-   está por debajo de 50**. Si el RSI sube de 50, el contador se reinicia.
-4. Cuando el contador llega a **2 cruces** (patrón de doble suelo / "W"),
-   se genera una **señal de compra**.
-5. La posición se cierra cuando el **SuperTrend** (ATR 10, factor 2.5) gira
-   de tendencia alcista a bajista → **señal de venta** (o, opcionalmente,
-   si salta el stop-loss antes de que eso ocurra).
+**Hallazgo del backtest al construirlo:** en una serie sintética de 3000
+velas, el filtro pasó de 29 operaciones (Doble Dip puro) a solo 1 - un
+filtro de confirmación de tendencia rechaza casi todo en datos sin
+tendencias sostenidas (random walk puro). No sé si tus símbolos reales se
+comportan igual; **corre `backtest.py` con y sin `--no-trend-filter` sobre
+tu histórico real antes de asumir que el filtro por defecto (activado) es
+mejor** - podría estar dejando pasar muy pocas señales para tu gusto.
 
-Estrategia **solo long** (no abre cortos), igual que el script original.
+## Archivos
 
-## Estructura del proyecto
+| Archivo | Función |
+|---|---|
+| `main.py` | Arranque: servidor Flask de salud + hilo del bot |
+| `trading_bot.py` | Bucle principal, ejecución de entradas/salidas |
+| `indicators.py` | RSI, SuperTrend y lógica del contador Doble Dip |
+| `bingx_client.py` | Cliente REST de BingX (firma, klines, órdenes) |
+| `telegram_notifier.py` | Notificaciones a Telegram |
+| `config.py` | Carga de variables de entorno |
 
-```
-bingx-rsi-bot/
-├── bot.py                    # Punto de entrada: bucle principal en vivo
-├── backtest.py                 # Backtest histórico contra datos reales de BingX
-├── strategy.py                   # RSI, SuperTrend y señales (idéntico al Pine, ya verificado)
-├── exchange_client.py              # BingX vía ccxt: reintentos, balances, órdenes, límites
-├── telegram_commands.py              # /status /pause /resume /close /help (hilo en background)
-├── notifier.py                         # Envío de mensajes a Telegram (con cooldown de errores)
-├── config.py                             # Carga y validación de variables de entorno
-├── tests/                                  # Suite de pytest
-├── requirements.txt                          # Dependencias de producción
-├── requirements-dev.txt                        # + pytest, pandas_ta (solo para desarrollo/tests)
-├── Procfile / railway.json / Dockerfile           # Despliegue en Railway
-├── .env.example
-└── .gitignore
-```
+## 1. BingX — crear API key
 
-## 1. Requisitos previos
+1. BingX → Cuenta → API Management → Crear API key.
+2. Permisos: **lectura** + **Perpetual Futures trading**. NO actives
+   permiso de retiros.
+3. Si restringes por IP, en Railway la IP saliente puede cambiar salvo
+   que uses un plan con IP estática; si no, deja la key sin restricción
+   de IP (los permisos de "sin retiros" ya limitan el daño posible).
 
-- Cuenta en [BingX](https://bingx.com/) con **API Key** (Menú → API Management).
-  - Permisos: **lectura + trading spot**. **NO actives permiso de retiros**
-    en la key que uses aquí.
-  - Para probar sin dinero real: BingX tiene un modo demo ("VST" / Virtual
-    USDT). Genera API keys específicas para ese modo desde tu cuenta y
-    actívalo con `BINGX_DEMO=true`.
-- Un bot de Telegram:
-  1. Habla con **@BotFather** → `/newbot` → copia el **token**.
-  2. Escríbele cualquier mensaje a tu bot (para "activar" el chat).
-  3. Visita `https://api.telegram.org/bot<TU_TOKEN>/getUpdates` y busca
-     `"chat":{"id":...}` — ese número es tu `TELEGRAM_CHAT_ID`. (O pídeselo
-     a **@userinfobot**.)
-- Cuenta de [GitHub](https://github.com/) y de [Railway](https://railway.app/).
+## 2. Telegram — crear bot
 
-## 2. Valida la estrategia ANTES de tocar tu cuenta: `backtest.py`
+1. Habla con `@BotFather` → `/newbot` → copia el token → `TELEGRAM_BOT_TOKEN`.
+2. Habla con `@userinfobot` (o `@RawDataBot`) para obtener tu `chat_id`
+   → `TELEGRAM_CHAT_ID`.
 
-No necesita API keys (las velas históricas son datos públicos):
-
-```bash
-pip install -r requirements-dev.txt
-python3 backtest.py --symbol BTC/USDT --timeframe 15m --days 60
-```
-
-Verás el número de operaciones, tasa de acierto, resultado neto, drawdown
-máximo y el detalle de cada operación. Prueba distintos `--symbol`,
-`--days` o incluso variantes de los parámetros (`--st-factor`,
-`--target-cross-count`, etc.) antes de decidir la configuración final.
-Opcional: `--output resultados.csv` para exportar el detalle.
-
-## 3. Probar el bot en vivo, en local
-
-```bash
-git clone <la-url-de-tu-repo>
-cd bingx-rsi-bot
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-# Edita .env con tus claves reales. Déjalo con DRY_RUN=true y
-# BINGX_DEMO=true para la primera prueba.
-
-python3 bot.py
-```
-
-Recibirás un mensaje de Telegram de "Bot iniciado" con un resumen de la
-configuración. Si `TELEGRAM_COMMANDS_ENABLED=true`, ya puedes escribirle
-`/help` a tu bot desde ese mismo chat.
-
-## 4. Subir a GitHub y desplegar en Railway
+## 3. Desplegar en Railway
 
 ```bash
-git init && git add . && git commit -m "Bot RSI + SuperTrend"
-git branch -M main
-git remote add origin https://github.com/TU_USUARIO/TU_REPO.git
+git init
+git add .
+git commit -m "RSI+SuperTrend Doble Dip bot"
+git remote add origin <tu-repo-github>
 git push -u origin main
 ```
 
-`.env` y `state.json` están en `.gitignore`: nunca se suben tus claves.
+En Railway: **New Project → Deploy from GitHub repo** → selecciona el
+repo. Railway detecta `Procfile`/`railway.json` automáticamente.
 
-En [railway.app](https://railway.app/): **New Project → Deploy from GitHub
-repo** → selecciona el repo. Railway detecta Python (Nixpacks) e instala
-`requirements.txt` automáticamente (o usa el `Dockerfile` si prefieres
-construirlo así). Añade en la pestaña **Variables** todas las de
-`.env.example` con tus valores reales. El arranque ya está definido
-(`Procfile` / `railway.json` → `python bot.py`); si Railway no lo detecta
-solo, ponlo a mano en **Settings → Deploy → Custom Start Command**.
+En **Variables**, copia todas las claves de `.env.example` y rellena
+los valores (`BINGX_API_KEY`, `BINGX_API_SECRET`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_CHAT_ID` son obligatorias; el resto tiene valores por defecto
+razonables). No definas `PORT` a mano, Railway lo inyecta solo.
 
-**No hace falta** generar un dominio público ni exponer ningún puerto: el
-bot no recibe tráfico web, solo se conecta hacia fuera (BingX y Telegram).
+## 4. Antes de operar con dinero real
 
-## 5. Antes de operar en real
+El bot arranca con `DRY_RUN=true`: escanea todos los símbolos, calcula
+las señales sobre velas reales y las notifica por Telegram, pero **no
+envía ninguna orden**. Con `SYMBOLS=ALL` vas a recibir bastantes más
+avisos que con un solo símbolo — es la muestra más realista de con qué
+frecuencia va a operar de verdad. Déjalo así unos días y solo entonces
+cambia `DRY_RUN=false` en Railway (redeploy automático).
 
-| DRY_RUN | BINGX_DEMO | Qué pasa |
-|---|---|---|
-| `true`  | `true`  | 100% seguro. Analiza con datos reales, consulta tu balance demo (VST) y avisa por Telegram. **Ninguna orden real.** |
-| `true`  | `false` | Consulta tu balance **real** (para simular "en posición" con precisión) y avisa, pero **sigue sin ordenar nada**. |
-| `false` | `true`  | Envía órdenes reales, pero contra el entorno demo de BingX (dinero ficticio). Ideal para probar la ejecución de punta a punta. |
-| `false` | `false` | 🔴 **En real.** Dinero de verdad. |
+Revisa `LEVERAGE`, `POSITION_SIZE_PCT`, `MAX_CONCURRENT_POSITIONS` y
+`STOP_LOSS_PCT` antes de pasar a real — los valores por defecto son
+conservadores a propósito (exposición máxima teórica ≈ 25% del balance
+en margen), no una recomendación de cuánto
+arriesgar.
 
-Recomendación: `backtest.py` → fila 1 → fila 2 → fila 3 → fila 4, dejando
-correr el bot varias velas en cada paso. Empieza con un `TRADE_AMOUNT_USDT`
-pequeño al pasar a real.
+## 5. Verificar que sigue vivo
 
-## 6. Comandos de Telegram (si `TELEGRAM_COMMANDS_ENABLED=true`)
+Railway te da una URL pública (Settings → Networking → Generate
+Domain). `GET /` confirma que el proceso responde; `GET /health`
+devuelve el estado de la última vela evaluada (precio, RSI, dirección
+de SuperTrend, si hay posición abierta).
 
-| Comando | Qué hace |
-|---|---|
-| `/status` | Última vela analizada, precio, RSI, si hay posición abierta y si está en pausa |
-| `/pause` | Sigue analizando y avisando, pero no envía ninguna orden hasta `/resume` |
-| `/resume` | Reanuda la operativa normal |
-| `/close` | Cierra la posición abierta ahora mismo, a mercado (respeta `DRY_RUN`) |
-| `/help` | Lista de comandos |
+## 6. Backtest multi-temporalidad (`backtest.py`)
 
-Por seguridad, el bot **ignora** cualquier mensaje que no venga exactamente
-del `TELEGRAM_CHAT_ID` configurado.
-
-## 7. Variables de configuración
-
-| Variable | Por defecto | Descripción |
-|---|---|---|
-| `BINGX_API_KEY` / `BINGX_API_SECRET` | — (obligatorio) | Credenciales de BingX |
-| `BINGX_DEMO` | `true` | `true` = red de pruebas VST de BingX |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — (obligatorio) | Credenciales del bot de Telegram |
-| `SYMBOL` | `BTC/USDT` | Par a operar (formato ccxt: `BASE/QUOTE`) |
-| `TIMEFRAME` | `15m` | Temporalidad de las velas |
-| `CANDLES_LOOKBACK` | `300` | Nº de velas históricas descargadas en cada ciclo |
-| `TRADE_AMOUNT_USDT` | `100` | USDT gastados en cada señal de compra |
-| `MIN_POSITION_VALUE_USDT` | `5` | Umbral (USDT) para considerar que "hay posición abierta" |
-| `RSI_LENGTH` / `SIGNAL_LENGTH` / `TRIGGER_LEVEL` / `TARGET_CROSS_COUNT` | `10` / `10` / `50` / `2` | Parámetros del RSI (idénticos al Pine) |
-| `ATR_PERIOD` / `ST_FACTOR` | `10` / `2.5` | Parámetros del SuperTrend (idénticos al Pine) |
-| `DRY_RUN` | `true` | `true` = solo avisa, no envía órdenes reales |
-| `POLL_BUFFER_SECONDS` | `20` | Margen tras el cierre de vela antes de pedir datos |
-| `MAX_RETRIES` / `RETRY_BACKOFF_SECONDS` | `3` / `2` | Reintentos ante errores de red transitorios |
-| `ERROR_NOTIFY_COOLDOWN_MINUTES` | `15` | No repetir el mismo aviso de error antes de este tiempo |
-| `STOP_LOSS_PCT` | `0` (desactivado) | Si >0, cierra si el precio cae ese % desde la entrada |
-| `HEARTBEAT_EVERY_HOURS` | `24` | Aviso periódico de "sigo activo". `0` = desactivado |
-| `TELEGRAM_COMMANDS_ENABLED` | `true` | Activa `/status /pause /resume /close /help` |
-| `LOG_LEVEL` | `INFO` | Nivel de logging |
-
-## 8. Tests
+Descarga histórico real de BingX (paginando hacia atrás) y simula la
+MISMA lógica de `indicators.py` que usa el bot en vivo, en varias
+temporalidades a la vez, con el mismo dimensionamiento
+(`POSITION_SIZE_PCT` × `LEVERAGE`) y comisiones. Solo necesita
+`BINGX_API_KEY`/`BINGX_API_SECRET` en el entorno (no hace falta
+Telegram ni permisos de trading en la key, son endpoints públicos):
 
 ```bash
-pip install -r requirements-dev.txt
-pytest tests/ -v
+python backtest.py --symbol BTC-USDT --timeframes 5m,15m,30m,1h,2h,4h,1d --days 120
+
+# comparar con y sin el filtro de tendencia sobre el mismo símbolo/periodo
+python backtest.py --symbol BTC-USDT --timeframes 1h --days 120
+python backtest.py --symbol BTC-USDT --timeframes 1h --days 120 --no-trend-filter
 ```
 
-Incluye una reimplementación independiente (bucle separado, no reutiliza
-`strategy.py`) de la lógica del contador `crossCount`/`specialBuy`, para
-verificarla por partida doble además de la comparación contra `pandas_ta`.
+Argumentos útiles: `--fee` (comisión taker por lado, %, por defecto
+0.05 = tarifa estándar BingX), `--leverage`, `--position-size`,
+`--stop-loss` (si no los pasas, toma los de tu `.env`), `--no-trend-filter`
+(Doble Dip puro, sin el filtro EMA50+ruptura), y `--save-trades` para
+volcar cada operación individual a `backtest_trades/trades_<tf>.csv`.
 
-## 9. Limitaciones honestas
+Corre esto donde SÍ tengas salida a internet hacia BingX (tu propio
+PC, o como comando de un servicio Railway) — no es parte del bot que
+corre 24/7, es una herramienta de análisis aparte.
 
-- **SuperTrend**: TradingView no publica el código fuente exacto de su
-  función incorporada `ta.supertrend()`. `strategy.py` implementa el
-  algoritmo estándar de SuperTrend (ATR suavizado igual que Pine, vía
-  `ta.rma`); coincide en la práctica, pero en casos límite muy puntuales
-  podría haber 1 vela de diferencia. Por eso `backtest.py` y el modo
-  DRY_RUN/DEMO existen: úsalos antes de ir a real.
-- **Solo spot, solo largos**: sin cortos ni apalancamiento, igual que el
-  Pine original.
-- **P&L en Telegram**: se apoya en `state.json` (mejor esfuerzo) y, si se
-  pierde tras un redeploy, intenta reconstruir el precio de entrada desde
-  tu historial real de operaciones en BingX (`fetch_my_trades`). La
-  detección de "¿hay posición abierta?" siempre usa tu balance real, nunca
-  depende de este archivo.
-- El backtest no modela slippage, huecos de liquidez ni rechazos de
-  órdenes que sí pueden pasar en real — es una simulación, no una garantía.
-- El stop-loss opcional se evalúa solo al cierre de cada vela (como el
-  resto de la estrategia), no vela a vela en tiempo real dentro de la vela.
+Lee `num_trades` antes que nada: con menos de ~20-30 operaciones en el
+periodo probado, cualquier `win_rate`/`profit_factor` bonito no es
+estadísticamente fiable, es ruido.
 
-## 10. Seguridad
+## Notas técnicas / supuestos de la API de BingX
 
-- Nunca subas tu `.env` a GitHub (ya está en `.gitignore`).
-- Restringe la API key de BingX a solo lectura + trading spot (sin retiros).
-- Si BingX permite whitelist de IPs y tu IP de salida en Railway es
-  estable, actívalo.
-- El token de Telegram y el `TELEGRAM_CHAT_ID` son tan sensibles como una
-  contraseña: quien los tenga puede leer tus avisos o, si además conociera
-  tu chat_id exacto, intentar mandar comandos (aunque el bot verifica el
-  chat_id en cada mensaje entrante).
+- Firma HMAC-SHA256 sobre query string, cabecera `X-BX-APIKEY`, igual
+  en GET y en POST (patrón estándar de la familia de APIs tipo
+  Binance). Si un envío de orden da error **100001** (firma inválida),
+  revisa primero las credenciales y el `recvWindow`.
+- Cuenta en **modo Hedge**: las órdenes usan `positionSide=LONG`
+  explícito, no `reduceOnly`+`BOTH`.
+- Si al arrancar el log muestra velas con OHLC que no cuadran con el
+  gráfico real del símbolo en BingX, compara antes de operar en real —
+  el parseo de klines incluye una ruta de reserva por si la API
+  devolviera arrays en vez de objetos.

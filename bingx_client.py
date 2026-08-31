@@ -17,6 +17,14 @@ las llamadas de orden usan positionSide=LONG/SHORT explícito en vez de
 reduceOnly + positionSide=BOTH.
 
 Símbolos en formato BingX: "BTC-USDT" (con guion), no "BTCUSDT".
+
+Uso concurrente: trading_bot.py llama a get_klines() desde varios hilos a
+la vez (ThreadPoolExecutor) para escanear todos los símbolos en paralelo.
+requests.Session es seguro para eso (el pool de conexiones de urllib3 es
+thread-safe); las llamadas que SÍ mutan estado (balance, órdenes) se hacen
+siempre secuenciales desde el hilo principal, nunca en paralelo entre sí,
+para no leer el mismo balance dos veces antes de que la primera orden lo
+haya consumido.
 """
 
 from __future__ import annotations
@@ -86,6 +94,13 @@ class BingXClient:
         for attempt in range(1, retries + 1):
             try:
                 resp = self.session.request(method, url, timeout=self.timeout)
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    last_exc = RuntimeError(f"HTTP {resp.status_code}")
+                    logger.warning(
+                        "HTTP %s en %s %s (intento %s/%s)", resp.status_code, method, path, attempt, retries
+                    )
+                    time.sleep(min(2 ** attempt, 10))
+                    continue
                 data = resp.json()
                 break
             except (requests.RequestException, ValueError) as exc:
@@ -176,6 +191,27 @@ class BingXClient:
                 }
         raise RuntimeError(f"Símbolo {symbol} no encontrado en /quote/contracts: {data}")
 
+    def get_all_contracts(self) -> list[dict]:
+        """Lista completa de contratos perpetuos disponibles (todas las
+        monedas). Se usa para descubrir qué escanear; no hace falta
+        autenticación (endpoint público)."""
+        data = self._request("GET", "/openApi/swap/v2/quote/contracts", {}, signed=False)
+        rows = data.get("data", [])
+        out = []
+        for row in rows:
+            symbol = row.get("symbol")
+            if not symbol:
+                continue
+            out.append(
+                {
+                    "symbol": symbol,
+                    "quantity_precision": int(row.get("quantityPrecision", 3)),
+                    "price_precision": int(row.get("pricePrecision", 2)),
+                    "status": row.get("status"),
+                }
+            )
+        return out
+
     # ------------------------------------------------------------------
     # Cuenta
     # ------------------------------------------------------------------
@@ -203,6 +239,25 @@ class BingXClient:
                         "leverage": pos.get("leverage"),
                     }
         return None
+
+    def get_all_positions(self, position_side: str = "LONG") -> dict:
+        """Todas las posiciones abiertas de la cuenta en una sola llamada
+        (sin filtrar por símbolo) - mucho más eficiente que consultar
+        símbolo por símbolo cuando se escanean todas las monedas."""
+        data = self._request("GET", "/openApi/swap/v2/user/positions", {})
+        out = {}
+        for pos in data.get("data", []):
+            if pos.get("positionSide") != position_side:
+                continue
+            amt = float(pos.get("positionAmt", 0) or 0)
+            if abs(amt) > 0 and pos.get("symbol"):
+                out[pos["symbol"]] = {
+                    "amount": abs(amt),
+                    "entry_price": float(pos.get("avgPrice", 0) or 0),
+                    "unrealized_pnl": float(pos.get("unrealizedProfit", 0) or 0),
+                    "leverage": pos.get("leverage"),
+                }
+        return out
 
     def set_leverage(self, symbol: str, leverage: int, side: str = "LONG") -> None:
         self._request(
