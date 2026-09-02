@@ -159,8 +159,16 @@ class BingXClient:
             "positionSide": position_side,
             "type": "MARKET",
             "quantity": quantity,
-            "reduceOnly": "true" if reduce_only else "false",
         }
+        # En modo Hedge (positionSide=LONG/SHORT, el que usa este bot),
+        # BingX rechaza la orden con error 109400 "In the Hedge mode, the
+        # 'ReduceOnly' field can not be filled" si el campo va presente al
+        # ABRIR -- da igual que sea "true" o "false", solo con que exista
+        # ya falla. Solo se manda cuando de verdad se está cerrando
+        # (close_position lo pasa como reduce_only=True); en una entrada
+        # nueva se omite del todo.
+        if reduce_only:
+            params["reduceOnly"] = "true"
         if stop_loss:
             params["stopLoss"] = (
                 '{"type":"STOP_MARKET","stopPrice":%s,"workingType":"MARK_PRICE"}'
