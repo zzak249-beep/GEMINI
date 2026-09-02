@@ -8,7 +8,6 @@ import hashlib
 import hmac
 import logging
 import time
-from urllib.parse import urlencode
 
 import requests
 
@@ -58,15 +57,20 @@ class BingXClient:
         params["recvWindow"] = params.get("recvWindow", "10000")
         timestamp = str(int(time.time() * 1000))
 
-        # BingX firma así (parseParam de su SDK oficial): todos los
-        # parámetros ordenados alfabéticamente EXCEPTO "timestamp", que va
-        # SIEMPRE al final, fuera del sort. Meter timestamp dentro del
-        # sorted() (como estaba antes) lo descoloca -- por ejemplo cae entre
-        # "takeProfit" y "type" en vez de al final -- y BingX rechaza la
-        # firma con error 100001 "signature mismatch" en TODAS las órdenes.
-        # Mismo bug ya resuelto antes en renewed-love/joyful-art.
+        # BingX firma así (parseParam de su SDK oficial, el mismo que enlaza
+        # su propio error 100001): todos los parámetros ordenados
+        # alfabéticamente, concatenados EN CRUDO como "clave=valor" (nada de
+        # urlencode/percent-encoding) y con "timestamp" añadido el último,
+        # fuera del sort. Dos bugs iguales de importantes:
+        #   1. timestamp dentro del sorted() -- ya corregido antes.
+        #   2. urlencode() sobre el query string -- rompe la firma en
+        #      cualquier orden con stopLoss/takeProfit, porque ese valor es
+        #      JSON embebido ({"type":"STOP_MARKET",...}) lleno de
+        #      caracteres que urlencode sí transforma (%7B, %22...) y que
+        #      BingX firma en su forma literal, sin codificar.
+        # Mismo patrón de bug ya resuelto antes en renewed-love/joyful-art.
         ordered_items = sorted(params.items())
-        query_string = urlencode(ordered_items)
+        query_string = "&".join(f"{k}={v}" for k, v in ordered_items)
         query_string = f"{query_string}&timestamp={timestamp}" if query_string else f"timestamp={timestamp}"
 
         signature = hmac.new(
