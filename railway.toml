@@ -1,0 +1,12 @@
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+
+# This is a background worker, not a web server — it does not bind $PORT
+# and does not need to. If Railway's dashboard shows a health-check
+# warning because of that, it's safe to ignore for this service, or you
+# can disable health checks for it under Settings.

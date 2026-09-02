@@ -1,172 +1,165 @@
 """
-Configuración del bot RSI doble suelo + SuperTrend.
-
-MODE=SIGNAL por defecto. Esta estrategia no tiene ni una operación
-medida: los parámetros del Pine original (RSI 10 en vez de 14,
-multiplicador 2.5) son ajustes que su autor hizo para dar más señales y
-salidas más rentables, o sea que vienen ya optimizados sobre algún
-histórico que no es el tuyo. Mídela antes de ponerle dinero.
+Loads and validates all bot settings from environment variables (via a
+local .env file when running locally, or Railway's injected env vars in
+production). Nothing in here is a secret by itself — see .env.example for
+the full list of variables — but this module is the single source of truth
+for defaults, so change values there or in your Railway service settings,
+not in code.
 """
+import logging
 import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+load_dotenv()  # no-op in Railway, useful for local runs
 
 
-def _bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in ("1", "true", "yes", "si", "sí")
+def _bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _float(name: str, default: float) -> float:
-    try:
-        return float(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
+    val = os.getenv(name)
+    return float(val) if val not in (None, "") else default
 
 
 def _int(name: str, default: int) -> int:
-    try:
-        return int(os.getenv(name, default))
-    except (TypeError, ValueError):
-        return default
+    val = os.getenv(name)
+    return int(val) if val not in (None, "") else default
 
 
-MODE = os.getenv("MODE", "SIGNAL").strip().upper()
-LIVE_CONFIRMED = _bool("LIVE_CONFIRMED", False)
-
-BINGX_API_KEY = os.getenv("BINGX_API_KEY", "").strip()
-BINGX_API_SECRET = os.getenv("BINGX_API_SECRET", "").strip()
-BINGX_BASE_URL = os.getenv("BINGX_BASE_URL", "https://open-api.bingx.com").strip()
-
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or os.getenv("CHAT_ID") or "").strip()
-
-# ── Estrategia (mismos valores que el Pine original) ──────────────────
-RSI_LEN = _int("RSI_LEN", 10)
-SIG_LEN = _int("SIG_LEN", 10)
-TRIGGER_LEVEL = _float("TRIGGER_LEVEL", 50.0)
-# 2 = doble suelo (W). Con 1 se opera el primer intento, que es
-# justamente el que el autor considera que falla.
-TARGET_CROSS = _int("TARGET_CROSS", 2)
-ATR_LEN = _int("ATR_LEN", 14)
-ST_PERIOD = _int("ST_PERIOD", 10)
-ST_FACTOR = _float("ST_FACTOR", 2.5)
-# TENSIÓN REAL DEL PINE ORIGINAL, descubierta al probar el motor:
-# un doble suelo ocurre POR DEFINICIÓN durante una caída, así que en el
-# momento de la señal el SuperTrend casi siempre está bajista y su línea
-# queda POR ENCIMA del precio — no sirve como stop. El Pine no lo nota
-# porque su salida solo se dispara en el INSTANTE del giro a bajista:
-# si ya estaba bajista, la posición se queda abierta sin protección
-# hasta el siguiente giro, que puede tardar días.
-#   true  = exigir SuperTrend ya alcista. Menos señales, stop coherente.
-#   false = fiel al original. Entra igual, y el stop lo pone el mínimo
-#           reciente porque el SuperTrend no puede.
-REQUIRE_ST_BULL = _bool("REQUIRE_ST_BULL", True)
-SL_SWING_ATR = _float("SL_SWING_ATR", 0.5)
-SL_SWING_LOOKBACK = _int("SL_SWING_LOOKBACK", 20)
-
-# ── Objetivo ──────────────────────────────────────────────────────────
-# El Pine original NO tiene objetivo: sale solo cuando gira el
-# SuperTrend. Aquí es opcional para poder comparar las dos variantes.
-USE_TP = _bool("USE_TP", False)
-RR_TARGET = _float("RR_TARGET", 2.0)
-
-# ── Universo y filtros ────────────────────────────────────────────────
-TIMEFRAME = os.getenv("TIMEFRAME", "15m").strip()
-# Varios timeframes a la vez. El patrón se busca en cada uno por
-# separado y la señal dice en cuál salió.
-# AVISO SOBRE 5m: los stops del SuperTrend son proporcionalmente más
-# pequeños cuanto menor es el timeframe, y el coste de operar NO baja.
-# Con MIN_RISK_PCT=1.5 la mayoría de señales de 5m se descartarán por
-# "stop demasiado cerca" — eso no es un fallo, es el filtro haciendo su
-# trabajo. Si en 5m no sale nada, la respuesta no es bajar el mínimo:
-# es que en ese timeframe el coste se come el movimiento.
-TIMEFRAMES = [t.strip() for t in os.getenv("TIMEFRAMES", TIMEFRAME).split(",") if t.strip()]
-SCAN_INTERVAL_SEC = _int("SCAN_INTERVAL_SEC", 90)
-MAX_SYMBOLS = _int("MAX_SYMBOLS", 400)
-SYMBOL_WHITELIST = [s.strip().upper() for s in os.getenv("SYMBOL_WHITELIST", "").split(",") if s.strip()]
-EXCLUDE_PREFIXES = [p.strip().upper() for p in os.getenv("EXCLUDE_PREFIXES", "NC").split(",") if p.strip()]
-MIN_QUOTE_VOLUME_24H = _float("MIN_QUOTE_VOLUME_24H", 3_000_000.0)
-# El stop lo pone el SuperTrend, que puede quedar lejísimos. Sin este
-# tope, una sola operación puede llevarse un múltiplo del riesgo previsto.
-MIN_ATR_PCT = _float("MIN_ATR_PCT", 0.5)
-MAX_RISK_PCT = _float("MAX_RISK_PCT", 4.0)
-# EL FILTRO QUE FALTABA. El stop lo pone el SuperTrend o el mínimo
-# reciente, y a veces queda MUY cerca: un riesgo del 0.69% con 0.25% de
-# coste significa que la operación empieza perdiendo 0.36R antes de que
-# el precio se mueva. Es el mismo error que ya se corrigió en el otro
-# bot: no basta con acotar el stop por arriba, hay que acotarlo también
-# por ABAJO en relación al coste.
-MIN_RISK_PCT = _float("MIN_RISK_PCT", 1.5)
-MAX_COST_IN_R = _float("MAX_COST_IN_R", 0.20)
-SCAN_CONCURRENCY = _int("SCAN_CONCURRENCY", 8)
-
-# ── Riesgo ────────────────────────────────────────────────────────────
-RISK_PCT = _float("RISK_PCT", 0.25)
-# LÍMITE GLOBAL DE LA CUENTA: cuenta TODAS las posiciones abiertas en
-# BingX, las de este bot y las de cualquier otro.
-# Varios bots comparten cuenta y ninguno sabe de los otros. Con 2
-# posiciones por bot y tres bots, el riesgo "declarado" sería la suma de
-# riesgos independientes; pero la correlación entre criptos pasa de ~0.30
-# en calma a 0.77-0.90 en un desplome, así que en el momento malo esas
-# posiciones se mueven como UNA SOLA apuesta multiplicada. La
-# diversificación entre alts es una ilusión justo cuando hace falta.
-MAX_TOTAL_POSITIONS = _int("MAX_TOTAL_POSITIONS", 3)
-
-MAX_CONCURRENT = _int("MAX_CONCURRENT", 2)
-LEVERAGE = _int("LEVERAGE", 2)
-MAX_CONSECUTIVE_LOSSES = _int("MAX_CONSECUTIVE_LOSSES", 3)
-# LÍMITE DE PÉRDIDA DIARIA, en múltiplos de R.
-# El estudio de Taiwán sobre 450.000 traders encuentra que menos del 1%
-# gana de forma consistente, y que los que lo consiguen comparten un
-# rasgo concreto: stops duros de pérdida DIARIA, no solo por operación.
-# El circuit breaker por rachas no cubre esto — tres pérdidas seguidas
-# saltan, pero seis alternadas con dos ganancias pequeñas no, y el día
-# acaba igual de mal.
-MAX_DAILY_LOSS_R = _float("MAX_DAILY_LOSS_R", 3.0)
-
-# ── Contexto de mercado (BTC como referencia) ─────────────────────────
-# No es un filtro adivinatorio: es un REGISTRO. En cada operación se
-# apunta cómo iba BTC, porque el régimen actual (dominancia 56-59%,
-# índice de altseason por debajo de 40, rallies de alts aislados y
-# especulativos) hace que una estrategia SOLO DE LARGOS en alts esté
-# comprando contra la corriente relativa. Dentro de un mes, con el
-# diario delante, podrás ver si tus resultados dependen de eso — en
-# vez de suponerlo.
-BTC_CONTEXT = _bool("BTC_CONTEXT", True)
-# Filtro OPCIONAL y apagado: no abrir largos si BTC cae fuerte, porque
-# las alts caen más. Apagado a propósito: sin datos propios que lo
-# respalden, activarlo sería añadir una creencia al sistema.
-BTC_FILTER = _bool("BTC_FILTER", False)
-BTC_MIN_24H = _float("BTC_MIN_24H", -3.0)
-COOLDOWN_MINUTES = _int("COOLDOWN_MINUTES", 180)
-ENTRY_TYPE = os.getenv("ENTRY_TYPE", "LIMIT").strip().upper()
-LIMIT_OFFSET_PCT = _float("LIMIT_OFFSET_PCT", 0.05)
-
-# ── Avisos ────────────────────────────────────────────────────────────
-# Enfriamiento por símbolo en modo SIGNAL: sin esto la misma señal se
-# repite en cada ciclo mientras no cambie la vela.
-SIGNAL_COOLDOWN_MIN = _int("SIGNAL_COOLDOWN_MIN", 60)
-# Aviso periódico con las que están CERCA del patrón (contador en 1 de
-# 2). Las señales avisan cuando ya pasó; esto deja verlo venir. 0 lo
-# desactiva.
-WATCHLIST_MIN = _int("WATCHLIST_MIN", 30)
-
-DAILY_SUMMARY = _bool("DAILY_SUMMARY", True)
-DAILY_SUMMARY_HOUR_UTC = _int("DAILY_SUMMARY_HOUR_UTC", 7)
-HEARTBEAT_HOURS = _int("HEARTBEAT_HOURS", 12)
-IDLE_ALERT_DAYS = _int("IDLE_ALERT_DAYS", 5)
-
-STATE_PATH = os.getenv("STATE_PATH", "/data/state_rsi.json")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-
-COST_ROUNDTRIP_PCT = _float("COST_ROUNDTRIP_PCT", 0.25)
+def _str(name: str, default: str = "") -> str:
+    val = os.getenv(name)
+    return val if val not in (None, "") else default
 
 
-def is_live() -> bool:
-    return MODE == "LIVE" and LIVE_CONFIRMED and bool(BINGX_API_KEY) and bool(BINGX_API_SECRET)
+@dataclass
+class Config:
+    # Exchange
+    bingx_api_key: str
+    bingx_api_secret: str
+    market_type: str      # "swap" (USDT-M perpetual futures) or "spot"
+    symbol: str            # ccxt unified symbol, e.g. "BTC/USDT:USDT"
+    timeframe: str          # e.g. "5m"
+    leverage: int
+    dry_run: bool           # True = never place real orders
+
+    # Strategy (mirrors the Pine script inputs 1:1)
+    lookback_energy: int
+    k_dominance: float
+    cooldown_bars: int
+    use_vol_filter: bool
+    vol_len: int
+    vol_mult: float
+
+    # Risk management
+    qty_pct: float           # % of equity risked as position notional
+    use_atr_sl: bool
+    atr_length: int
+    atr_mult_sl: float
+    atr_mult_tp: float
+    sl_percent: float        # fraction, e.g. 0.01 = 1%
+    tp_percent: float
+    use_trail: bool
+    trail_trigger_atr: float
+    trail_offset_atr: float
+    max_daily_loss_pct: float  # kill switch: halt new entries for the day
+
+    # Telegram
+    telegram_bot_token: str
+    telegram_chat_id: str
+
+    # Loop
+    poll_seconds: int
+    log_level: str
+
+    @property
+    def can_trade_live(self) -> bool:
+        """
+        Whether the bot is actually allowed to send real orders to BingX.
+        Requires BOTH real API keys AND DRY_RUN=false. Missing either one
+        keeps the bot in read-only / signal-only mode, on purpose.
+        """
+        has_keys = bool(self.bingx_api_key and self.bingx_api_secret)
+        return has_keys and not self.dry_run
+
+    @property
+    def telegram_enabled(self) -> bool:
+        return bool(self.telegram_bot_token and self.telegram_chat_id)
+
+    @property
+    def mode_label(self) -> str:
+        if self.can_trade_live:
+            return "🔴 LIVE — real orders will be sent to BingX"
+        if self.bingx_api_key and self.bingx_api_secret:
+            return "🟡 PAPER (DRY_RUN) — real data, simulated orders only"
+        return "⚪ SIGNAL-ONLY — no BingX keys, Telegram alerts only"
 
 
-def describe() -> str:
-    if is_live():
-        return "LIVE — enviando órdenes reales a BingX"
-    if MODE == "LIVE":
-        return "LIVE pedido pero SIN confirmar (falta LIVE_CONFIRMED o claves) — sigue en SIGNAL"
-    return "SIGNAL — solo avisos, no toca el exchange"
+def load_config() -> Config:
+    cfg = Config(
+        bingx_api_key=_str("BINGX_API_KEY"),
+        bingx_api_secret=_str("BINGX_API_SECRET"),
+        market_type=_str("MARKET_TYPE", "swap"),
+        symbol=_str("SYMBOL", "BTC/USDT:USDT"),
+        timeframe=_str("TIMEFRAME", "5m"),
+        leverage=_int("LEVERAGE", 3),
+        dry_run=_bool("DRY_RUN", True),
+        lookback_energy=_int("LOOKBACK_ENERGY", 40),
+        k_dominance=_float("K_DOMINANCE", 1.5),
+        cooldown_bars=_int("COOLDOWN_BARS", 4),
+        use_vol_filter=_bool("USE_VOL_FILTER", False),
+        vol_len=_int("VOL_LEN", 20),
+        vol_mult=_float("VOL_MULT", 1.2),
+        qty_pct=_float("QTY_PCT", 10.0),
+        use_atr_sl=_bool("USE_ATR_SL", True),
+        atr_length=_int("ATR_LENGTH", 14),
+        atr_mult_sl=_float("ATR_MULT_SL", 1.5),
+        atr_mult_tp=_float("ATR_MULT_TP", 2.5),
+        sl_percent=_float("SL_PERCENT", 1.0) / 100,
+        tp_percent=_float("TP_PERCENT", 2.0) / 100,
+        use_trail=_bool("USE_TRAIL", False),
+        trail_trigger_atr=_float("TRAIL_TRIGGER_ATR", 1.0),
+        trail_offset_atr=_float("TRAIL_OFFSET_ATR", 1.0),
+        max_daily_loss_pct=_float("MAX_DAILY_LOSS_PCT", 5.0),
+        telegram_bot_token=_str("TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=_str("TELEGRAM_CHAT_ID"),
+        poll_seconds=_int("POLL_SECONDS", 30),
+        log_level=_str("LOG_LEVEL", "INFO"),
+    )
+    _validate(cfg)
+    return cfg
+
+
+def _validate(cfg: Config) -> None:
+    errors = []
+    if not (0 < cfg.qty_pct <= 100):
+        errors.append("QTY_PCT must be between 0 and 100")
+    if not (1 <= cfg.leverage <= 125):
+        errors.append("LEVERAGE looks out of range (expected 1-125)")
+    if cfg.market_type not in ("swap", "spot"):
+        errors.append("MARKET_TYPE must be 'swap' or 'spot'")
+    if not cfg.dry_run and not (cfg.bingx_api_key and cfg.bingx_api_secret):
+        errors.append(
+            "DRY_RUN=false but BINGX_API_KEY/BINGX_API_SECRET are missing — "
+            "refusing to start in a half-configured live-trading state. "
+            "Set both keys, or set DRY_RUN=true."
+        )
+
+    if errors:
+        raise SystemExit("Configuration error(s):\n- " + "\n- ".join(errors))
+
+    if not cfg.telegram_enabled:
+        logging.getLogger(__name__).warning(
+            "TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not set — the bot will run "
+            "and log signals, but will NOT push anything to Telegram."
+        )
+    if cfg.can_trade_live:
+        logging.getLogger(__name__).warning(
+            "Starting in LIVE mode — real orders will be sent to BingX with "
+            "real funds. Ctrl+C now if that's not what you intended."
+        )
