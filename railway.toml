@@ -2,11 +2,10 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 30"
+startCommand = "sh -c 'gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 30'"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-# Bot de trading con un scheduler en background (APScheduler) + servidor
-# Flask para health-check / endpoints manuales (/status, /positions,
-# /emergency-stop, etc). SÍ bindea $PORT -- gunicorn lo necesita para
-# responder al healthcheck de Railway y para que los endpoints manuales
-# (sobre todo /emergency-stop) sean alcanzables en cualquier momento.
+# Envuelto en `sh -c '...'` a propósito: Railway pasa startCommand tal cual
+# al proceso, sin pasar por una shell que expanda variables. Sin el `sh -c`,
+# gunicorn recibe el texto literal "$PORT" en vez del número de puerto real
+# y falla con "Error: '$PORT' is not a valid port number." en bucle.
