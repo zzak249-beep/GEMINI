@@ -1,0 +1,59 @@
+# --- BingX ---
+BINGX_API_KEY=
+BINGX_API_SECRET=
+BINGX_BASE_URL=https://open-api.bingx.com
+BINGX_DEMO=true          # cámbialo a false solo cuando hayas validado todo
+
+# --- Telegram ---
+# Crea el bot con @BotFather, y consigue tu chat_id hablándole a @userinfobot
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# --- Webhook ---
+# Genera algo largo y aleatorio, ej: openssl rand -hex 24
+WEBHOOK_SECRET=cambia-esto-por-algo-aleatorio-y-largo
+
+# --- Modo de operación ---
+# false = SOLO manda señales a Telegram, no toca dinero real (recomendado al empezar)
+AUTO_TRADE=false
+
+# --- Riesgo ---
+RISK_PCT_PER_TRADE=2.0
+LEVERAGE=10
+MAX_CONCURRENT_POSITIONS=1
+HARD_MAX_TOTAL_POSITIONS=5
+
+# --- Circuit breaker ---
+MAX_CONSECUTIVE_LOSSES=4
+MAX_DAILY_DRAWDOWN_PCT=6.0
+
+# --- Persistencia ---
+STATE_FILE=state.json
+
+# --- Origen de la señal ---
+# python: el bot calcula la señal wavelet solo, leyendo velas de BingX
+#         (NO necesitas plan de pago de TradingView). Recomendado.
+# tradingview: usa el webhook de TradingView de siempre (requiere plan pago).
+SIGNAL_SOURCE=python
+ENABLE_SCHEDULER=true
+
+# Símbolos a vigilar (formato BingX BASE-QUOTE, separados por coma).
+# Pon SYMBOLS=ALL para que el bot descubra y vigile TODOS los perpetuos
+# USDT de BingX automáticamente (ver SCAN_ALL_MAX_SYMBOLS más abajo).
+SYMBOLS=BTC-USDT
+SCAN_ALL_MAX_SYMBOLS=150
+SCAN_ALL_REFRESH_HOURS=6
+MIN_24H_VOLUME_USDT=2000000
+
+# Resumen periódico por Telegram del estado del filtro en todo lo vigilado
+# (no ejecuta nada, solo informa). Muy recomendable si usas SYMBOLS=ALL.
+SCAN_REPORT_ENABLED=false
+SCAN_REPORT_INTERVAL_HOURS=4
+
+# --- Parámetros del filtro (iguales a los inputs del Pine) ---
+WAVELET_LOOKBACK_ENERGY=40
+WAVELET_K_DOMINANCE=1.5
+WAVELET_COOLDOWN_BARS=4
+WAVELET_ATR_LENGTH=14
+WAVELET_ATR_MULT_SL=1.5
+WAVELET_ATR_MULT_TP=2.5
