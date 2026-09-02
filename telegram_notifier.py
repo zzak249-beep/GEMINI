@@ -1,21 +1,19 @@
 """
-telegram_notifier.py
-=====================
-Envío de notificaciones a Telegram vía la Bot API estándar
-(https://api.telegram.org/bot<token>/sendMessage).
-"""
+telegram_notifier.py — Envío de notificaciones a Telegram.
 
-from __future__ import annotations
+Se usa `requests` directo contra la Bot API (sin dependencias extra)
+porque el bot solo necesita ENVIAR mensajes, nunca recibir comandos.
+"""
 
 import logging
 
 import requests
 
-logger = logging.getLogger("telegram")
+logger = logging.getLogger("wavelet_bot.telegram")
 
 
 class TelegramNotifier:
-    def __init__(self, bot_token: str, chat_id: str, timeout: int = 10):
+    def __init__(self, bot_token: str, chat_id: str, timeout: float = 10.0):
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.chat_id = chat_id
         self.timeout = timeout
@@ -24,42 +22,37 @@ class TelegramNotifier:
         try:
             resp = requests.post(
                 f"{self.base_url}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML"},
+                json={"chat_id": self.chat_id, "text": text, "parse_mode": "HTML",
+                      "disable_web_page_preview": True},
                 timeout=self.timeout,
             )
-            if resp.status_code != 200:
+            if not resp.ok:
                 logger.warning("Telegram respondió %s: %s", resp.status_code, resp.text)
         except requests.RequestException as exc:
             logger.warning("No se pudo enviar mensaje a Telegram: %s", exc)
 
-    # ------------------------------------------------------------------
-    def startup(self, config_summary: str) -> None:
-        self.send(f"🤖 <b>Bot RSI+SuperTrend Doble Dip iniciado</b>\n\n{config_summary}")
-
-    def entry(self, symbol: str, qty: float, price: float, leverage: int, rsi: float) -> None:
+    # ── Formateadores ────────────────────────────────────────────────
+    def signal(self, symbol: str, side: str, price: float, sl: float, tp: float,
+               executed: bool, reason: str = "") -> None:
+        emoji = "🟢" if side == "LONG" else "🔴"
+        estado = "✅ ejecutada en BingX" if executed else ("⚠️ solo señal (no ejecutada" + (f": {reason}" if reason else "") + ")")
         self.send(
-            "🟢 <b>ENTRADA LONG</b>\n"
-            f"Símbolo: <b>{symbol}</b>\n"
-            f"Cantidad: <code>{qty}</code>\n"
-            f"Precio aprox.: <code>{price:.4f}</code>\n"
-            f"Apalancamiento: {leverage}x\n"
-            f"RSI en señal: {rsi:.2f}\n"
-            "Motivo: Doble Dip (2º cruce alcista de RSI bajo 50)"
+            f"{emoji} <b>{side}</b> {symbol}\n"
+            f"Estrategia: Wavelet MRA Haar 5m\n"
+            f"Precio: {price:.6g}\n"
+            f"SL: {sl:.6g}   TP: {tp:.6g}\n"
+            f"{estado}"
         )
 
-    def exit(self, symbol: str, qty: float, price: float, reason: str, pnl: float | None = None) -> None:
-        pnl_txt = f"\nPnL no realizado al cierre: <code>{pnl:.4f}</code> USDT" if pnl is not None else ""
+    def exit_notice(self, symbol: str, side: str, price: float, reason: str = "SL/TP") -> None:
         self.send(
-            "🔴 <b>SALIDA LONG</b>\n"
-            f"Símbolo: <b>{symbol}</b>\n"
-            f"Cantidad: <code>{qty}</code>\n"
-            f"Precio aprox.: <code>{price:.4f}</code>\n"
+            f"⚪ <b>Cierre {side}</b> {symbol}\n"
+            f"Precio aprox.: {price:.6g}\n"
             f"Motivo: {reason}"
-            f"{pnl_txt}"
         )
 
-    def error(self, message: str) -> None:
-        self.send(f"⚠️ <b>Error en el bot</b>\n<code>{message}</code>")
+    def error(self, context: str, detail: str) -> None:
+        self.send(f"❌ <b>Error</b> ({context})\n{detail}")
 
-    def info(self, message: str) -> None:
-        self.send(message)
+    def info(self, text: str) -> None:
+        self.send(f"ℹ️ {text}")

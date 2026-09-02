@@ -1,21 +1,8 @@
-# secrets — never commit real keys
 .env
-.env.*
-!.env.example
-
-# python
 __pycache__/
 *.pyc
 *.pyo
-.pytest_cache/
 .venv/
 venv/
-*.egg-info/
-
-# os / editor
-.DS_Store
-.vscode/
-.idea/
-
-# logs
 *.log
+.DS_Store

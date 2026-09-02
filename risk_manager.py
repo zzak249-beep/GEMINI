@@ -1,101 +1,61 @@
 """
-risk_manager.py — daily loss limit + trade counter.
+risk_manager.py — Tamaño de posición y cálculo de SL/TP.
 
-FIX: _day_pnl / _day_trades / _day_start_eq / _today ahora persisten
-vía state.py. Antes vivían solo en RAM — cada redeploy los reseteaba
-a cero, permitiendo saltarse MAX_DAILY_TRADES y DAILY_LOSS_PCT de
-facto si había varios redeploys en el mismo día. Mismo bug, mismo fix
-que en renewed-love — este archivo era idéntico al suyo.
+Replica la lógica de riesgo del script Pine:
+
+    entry_qty = strategy.equity * (qty_pct / 100) / close
+    sl/tp     = por ATR (atr_mult_sl/tp) o por porcentaje fijo
 """
-import logging
-from datetime import datetime, timezone, date
 
-import state
-
-log = logging.getLogger("risk_mgr")
+import math
+from dataclasses import dataclass
 
 
-class RiskManager:
-    def __init__(self, cfg):
-        self.cfg = cfg
-        saved_pnl, saved_trades, saved_eq, saved_day = state.get_day_state()
-        self._day_pnl      = saved_pnl if saved_pnl is not None else 0.0
-        self._day_trades   = saved_trades if saved_trades is not None else 0
-        self._day_start_eq = saved_eq
-        self._today        = date.fromisoformat(saved_day) if saved_day else None
-        if saved_day:
-            log.info(f"RiskManager: día restaurado desde state.py — "
-                     f"day_pnl={self._day_pnl:+.2f}  trades={self._day_trades}  "
-                     f"day_start_eq={self._day_start_eq}")
+@dataclass
+class SizingResult:
+    quantity: float
+    notional: float
+    ok: bool
+    reason: str = ""
 
-    def _reset(self, equity: float):
-        today = datetime.now(tz=timezone.utc).date()
-        if today != self._today:
-            self._today        = today
-            self._day_pnl      = 0.0
-            self._day_trades   = 0
-            self._day_start_eq = equity
-            state.save_day_state(self._day_pnl, self._day_trades,
-                                 self._day_start_eq, self._today.isoformat())
-            log.info(f"New day — equity: {equity:.2f} USDT")
 
-    def _today_str(self) -> str:
-        # FIX: fallback defensivo — si record_trade()/increment_daily_trades()
-        # se llama antes de que _reset() haya corrido ni una vez en este
-        # proceso, _today puede seguir en None.
-        if self._today:
-            return self._today.isoformat()
-        return datetime.now(tz=timezone.utc).date().isoformat()
+def round_step(value: float, precision: int) -> float:
+    """Redondea hacia abajo (floor) al número de decimales del contrato,
+    para nunca mandar una cantidad ligeramente por encima de lo que
+    BingX acepta."""
+    factor = 10 ** precision
+    return math.floor(value * factor) / factor
 
-    def can_trade(self, equity: float) -> tuple:
-        """Returns (allowed: bool, reason: str)."""
-        self._reset(equity)
-        if self._day_trades >= self.cfg.MAX_DAILY_TRADES:
-            return False, f"Daily trades limit: {self._day_trades}"
-        if self._day_start_eq and self._day_start_eq > 0:
-            loss_pct = (-self._day_pnl / self._day_start_eq) * 100.0
-            if loss_pct >= self.cfg.DAILY_LOSS_PCT:
-                return False, f"Daily loss {loss_pct:.1f}% >= {self.cfg.DAILY_LOSS_PCT}%"
-        return True, "ok"
 
-    def record_trade(self, pnl_usdt: float):
-        self._day_pnl    += pnl_usdt
-        self._day_trades += 1
-        state.save_day_state(self._day_pnl, self._day_trades,
-                             self._day_start_eq, self._today_str())
-        log.info(f"Trade recorded pnl={pnl_usdt:+.2f} day_pnl={self._day_pnl:+.2f} trades={self._day_trades}")
+def compute_position_size(equity: float, qty_pct: float, price: float,
+                           quantity_precision: int, trade_min_quantity: float,
+                           trade_min_usdt: float) -> SizingResult:
+    if price <= 0 or equity <= 0:
+        return SizingResult(0.0, 0.0, False, "precio o equity inválidos")
 
-    def increment_daily_trades(self):
-        self._day_trades += 1
-        state.save_day_state(self._day_pnl, self._day_trades,
-                             self._day_start_eq, self._today_str())
+    raw_qty = (equity * (qty_pct / 100.0)) / price
+    qty = round_step(raw_qty, quantity_precision)
+    notional = qty * price
 
-    # ── Missing methods called by position_monitor ────────────────────────────
-    def update_open_count(self, n: int):
-        """Track number of open positions (called by position_monitor)."""
-        self._open_count = n
+    if qty <= 0:
+        return SizingResult(0.0, 0.0, False, "cantidad redondeada a 0")
+    if trade_min_quantity and qty < trade_min_quantity:
+        return SizingResult(qty, notional, False, f"por debajo de tradeMinQuantity ({trade_min_quantity})")
+    if trade_min_usdt and notional < trade_min_usdt:
+        return SizingResult(qty, notional, False, f"nocional por debajo de tradeMinUSDT ({trade_min_usdt})")
 
-    def on_trade_opened(self, symbol: str = "", side: str = "", **kwargs):
-        """Hook called when a trade is opened."""
-        pass
+    return SizingResult(qty, notional, True)
 
-    def on_trade_closed(self, symbol: str = "", side: str = "", pnl: float = 0.0, **kwargs):
-        """Hook called when a trade is closed."""
-        if pnl != 0.0:
-            self.record_trade(pnl)
 
-    def new_day(self, equity: float):
-        """Force new day reset."""
-        self._reset(equity)
+def compute_sl_tp(entry_price: float, is_long: bool, atr_value: float | None, params) -> tuple[float, float]:
+    """Devuelve (stop_loss_price, take_profit_price)."""
+    if params.USE_ATR_SL and atr_value and atr_value > 0:
+        sl_dist = atr_value * params.ATR_MULT_SL
+        tp_dist = atr_value * params.ATR_MULT_TP
+        if is_long:
+            return entry_price - sl_dist, entry_price + tp_dist
+        return entry_price + sl_dist, entry_price - tp_dist
 
-    def can_open(self, equity: float) -> tuple:
-        """Alias for can_trade used by some position monitors."""
-        return self.can_trade(equity)
-
-    @property
-    def open_count(self) -> int:
-        return getattr(self, "_open_count", 0)
-
-    @property
-    def day_pnl(self) -> float:
-        return self._day_pnl
+    if is_long:
+        return entry_price * (1 - params.SL_PERCENT), entry_price * (1 + params.TP_PERCENT)
+    return entry_price * (1 + params.SL_PERCENT), entry_price * (1 - params.TP_PERCENT)
