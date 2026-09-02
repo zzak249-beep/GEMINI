@@ -1,165 +1,94 @@
 """
-config.py — Carga de configuración desde variables de entorno.
-
-Todos los parámetros replican 1:1 los `input.*()` del script Pine
-"Wavelet MRA Haar 5m — BingX". Los valores por defecto son los mismos
-que trae el script original.
-
-El parseo numérico es defensivo (strip + separación de comentarios en
-línea) porque en Railway es fácil que una variable quede con espacios,
-comillas o un `# comentario` pegado al valor y rompa `int()`/`float()`.
+Configuración centralizada. Todo se lee de variables de entorno
+(Railway → Variables). Ver .env.example para la lista completa.
 """
-
-import logging
 import os
 
-logger = logging.getLogger("wavelet_bot.config")
+
+def _bool(name, default="false"):
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _clean(raw: str) -> str:
-    # Corta cualquier comentario tipo "10  # diez por ciento" y quita
-    # espacios/comillas sueltas antes de intentar convertir el valor.
-    value = raw.split("#", 1)[0].strip()
-    return value.strip("'").strip('"')
+def _str(name, default=""):
+    """Lee una variable de entorno y le quita espacios/saltos de línea
+    accidentales (Railway/copiar-pegar suele dejar un '\\n' al final,
+    lo que rompe cabeceras HTTP como X-BX-APIKEY con un ValueError)."""
+    return os.getenv(name, default).strip()
 
 
-def _get_str(key: str, default: str) -> str:
-    raw = os.environ.get(key)
-    if raw is None or raw.strip() == "":
-        return default
-    return _clean(raw)
+# --- BingX ---
+BINGX_API_KEY = _str("BINGX_API_KEY")
+BINGX_API_SECRET = _str("BINGX_API_SECRET")
+BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
+BINGX_DEMO = _bool("BINGX_DEMO", "true")  # usa VST (demo trading) por defecto
 
+# --- Telegram ---
+TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
 
-def _get_bool(key: str, default: bool) -> bool:
-    raw = os.environ.get(key)
-    if raw is None or raw.strip() == "":
-        return default
-    return _clean(raw).lower() in ("1", "true", "yes", "on", "si", "sí")
+# --- Webhook ---
+WEBHOOK_SECRET = _str("WEBHOOK_SECRET")  # token que añades a la URL de la alerta
 
+# --- Modo de operación ---
+# AUTO_TRADE=false  -> solo reenvía la señal a Telegram, no ejecuta nada (modo manual)
+# AUTO_TRADE=true   -> ejecuta la orden en BingX y además avisa por Telegram
+AUTO_TRADE = _bool("AUTO_TRADE", "false")
 
-def _get_int(key: str, default: int) -> int:
-    raw = os.environ.get(key)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return int(float(_clean(raw)))
-    except ValueError:
-        logger.warning("No se pudo parsear %s=%r como int, uso default=%s", key, raw, default)
-        return default
+# --- Riesgo / cuenta ---
+RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))  # % del equity arriesgado (via SL)
+LEVERAGE = int(os.getenv("LEVERAGE", "10"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 
+# --- Circuit breaker ---
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
+MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
 
-def _get_float(key: str, default: float) -> float:
-    raw = os.environ.get(key)
-    if raw is None or raw.strip() == "":
-        return default
-    try:
-        return float(_clean(raw))
-    except ValueError:
-        logger.warning("No se pudo parsear %s=%r como float, uso default=%s", key, raw, default)
-        return default
+# --- Persistencia ---
+STATE_FILE = _str("STATE_FILE", "state.json")
 
+# --- Origen de la señal ---
+# "python": el propio bot calcula la señal wavelet leyendo velas de BingX
+#           cada 5 minutos (NO necesita plan de pago de TradingView).
+# "tradingview": usa el webhook de TradingView como hasta ahora (requiere
+#                plan Essential o superior para alertas por webhook).
+SIGNAL_SOURCE = _str("SIGNAL_SOURCE", "python")
+ENABLE_SCHEDULER = _bool("ENABLE_SCHEDULER", "true")  # los tests lo ponen a false
 
-class Config:
-    # ── Credenciales BingX ──────────────────────────────────────────
-    # Nombres fijos y sin alias para evitar el mismatch
-    # BINGX_SECRET_KEY / BINGX_API_SECRET que ya ha dado problemas antes.
-    BINGX_API_KEY = _get_str("BINGX_API_KEY", "")
-    BINGX_API_SECRET = _get_str("BINGX_API_SECRET", "")
-    BINGX_BASE_URL = _get_str("BINGX_BASE_URL", "https://open-api.bingx.com")
-    BINGX_RECV_WINDOW_MS = _get_int("BINGX_RECV_WINDOW_MS", 5000)
+# Símbolos a vigilar en formato BingX (BASE-QUOTE), separados por coma.
+# Escribe "ALL" para que el bot descubra y vigile TODOS los perpetuos
+# USDT-margin de BingX automáticamente (ver scanner.py / poller.py).
+_symbols_raw = _str("SYMBOLS", "BTC-USDT")
+SCAN_ALL_SYMBOLS = _symbols_raw.strip().upper() == "ALL"
+SYMBOLS = [] if SCAN_ALL_SYMBOLS else [s.strip().upper() for s in _symbols_raw.split(",") if s.strip()]
 
-    # Si es True, todos los símbolos se piden como BASE-VST en vez de
-    # BASE-USDT: BingX ofrece el mismo API con saldo de práctica (VST)
-    # sobre exactamente la misma infraestructura, ideal para probar el
-    # bot antes de arriesgar capital real. No cambia ninguna otra lógica.
-    DEMO_MODE = _get_bool("DEMO_MODE", False)
+# Cuántos símbolos como máximo procesa un ciclo del escaneo "ALL" (evita
+# ciclos de 5 min que tarden demasiado si BingX tiene cientos de perpetuos).
+SCAN_ALL_MAX_SYMBOLS = int(_str("SCAN_ALL_MAX_SYMBOLS", "150"))
+# Cada cuántas horas se refresca la lista de símbolos en modo "ALL"
+SCAN_ALL_REFRESH_HOURS = float(_str("SCAN_ALL_REFRESH_HOURS", "6"))
 
-    # ── Telegram ─────────────────────────────────────────────────────
-    TELEGRAM_BOT_TOKEN = _get_str("TELEGRAM_BOT_TOKEN", "")
-    TELEGRAM_CHAT_ID = _get_str("TELEGRAM_CHAT_ID", "")
+# Resumen periódico por Telegram del estado del filtro en todo el universo
+# vigilado (puramente informativo, no ejecuta nada)
+SCAN_REPORT_ENABLED = _bool("SCAN_REPORT_ENABLED", "false")
+SCAN_REPORT_INTERVAL_HOURS = float(_str("SCAN_REPORT_INTERVAL_HOURS", "4"))
 
-    # ── Interruptor maestro ─────────────────────────────────────────
-    # Si es False, el bot calcula señales, las manda por Telegram y las
-    # loguea, pero NUNCA manda órdenes reales a BingX. Útil para correr
-    # el bot en paralelo un tiempo antes de activarlo con dinero real.
-    LIVE_TRADING = _get_bool("LIVE_TRADING", True)
+# --- Parámetros del filtro Wavelet MRA Haar (equivalentes a los inputs del Pine) ---
+WAVELET_LOOKBACK_ENERGY = int(_str("WAVELET_LOOKBACK_ENERGY", "40"))
+WAVELET_K_DOMINANCE = float(_str("WAVELET_K_DOMINANCE", "1.5"))
+WAVELET_COOLDOWN_BARS = int(_str("WAVELET_COOLDOWN_BARS", "4"))
+WAVELET_ATR_LENGTH = int(_str("WAVELET_ATR_LENGTH", "14"))
+WAVELET_ATR_MULT_SL = float(_str("WAVELET_ATR_MULT_SL", "1.5"))
+WAVELET_ATR_MULT_TP = float(_str("WAVELET_ATR_MULT_TP", "2.5"))
 
-    # ── Universo de símbolos ────────────────────────────────────────
-    # "ALL" -> escanea todos los perpetuos USDT-M activos en BingX.
-    # o lista separada por comas, ej: "BTC-USDT,ETH-USDT,SOL-USDT"
-    SYMBOLS = _get_str("SYMBOLS", "ALL")
-    TIMEFRAME = _get_str("TIMEFRAME", "5m")  # debe existir como intervalo válido de BingX
-
-    POLL_INTERVAL_SECONDS = _get_int("POLL_INTERVAL_SECONDS", 30)
-    SYMBOL_BATCH_SIZE = _get_int("SYMBOL_BATCH_SIZE", 5)  # símbolos procesados en paralelo por tanda
-    SYMBOL_BATCH_DELAY_SECONDS = _get_float("SYMBOL_BATCH_DELAY_SECONDS", 1.0)
-
-    # ── Parámetros Wavelet (idénticos al script Pine) ───────────────
-    LOOKBACK_ENERGY = _get_int("LOOKBACK_ENERGY", 40)
-    K_DOMINANCE = _get_float("K_DOMINANCE", 1.5)
-    COOLDOWN_BARS = _get_int("COOLDOWN_BARS", 4)
-
-    USE_VOL_FILTER = _get_bool("USE_VOL_FILTER", False)
-    VOL_LEN = _get_int("VOL_LEN", 20)
-    VOL_MULT = _get_float("VOL_MULT", 1.2)
-
-    # ── Riesgo (idéntico al script Pine) ────────────────────────────
-    QTY_PCT = _get_float("QTY_PCT", 10.0)  # % del equity en NOCIONAL por operación
-    LEVERAGE = _get_int("LEVERAGE", 10)
-
-    USE_ATR_SL = _get_bool("USE_ATR_SL", True)
-    ATR_LENGTH = _get_int("ATR_LENGTH", 14)
-    ATR_MULT_SL = _get_float("ATR_MULT_SL", 1.5)
-    ATR_MULT_TP = _get_float("ATR_MULT_TP", 2.5)
-    SL_PERCENT = _get_float("SL_PERCENT", 1.0) / 100
-    TP_PERCENT = _get_float("TP_PERCENT", 2.0) / 100
-
-    # ── Salvaguardas propias del bot (no están en el Pine original) ─
-    # Límite de posiciones simultáneas abiertas POR ESTE BOT. Con 10%
-    # de nocional por operación y varios símbolos pudiendo señalar a la
-    # vez, esto evita sobreexponer la cuenta si escaneas "ALL".
-    MAX_CONCURRENT_POSITIONS = _get_int("MAX_CONCURRENT_POSITIONS", 5)
-
-    # Si ya existe una posición abierta en ese símbolo (de este bot o de
-    # cualquier otro proceso en la misma cuenta BingX), no se vuelve a
-    # entrar. Coordina de forma segura con tus otros bots en la misma cuenta.
-    SKIP_IF_SYMBOL_HAS_POSITION = _get_bool("SKIP_IF_SYMBOL_HAS_POSITION", True)
-
-    MIN_BALANCE_USDT = _get_float("MIN_BALANCE_USDT", 0.0)  # 0 = sin mínimo
-
-    # ── Servidor de salud (para Railway healthcheck / monitoreo) ────
-    HEALTH_PORT = _get_int("PORT", _get_int("HEALTH_PORT", 8080))
-
-    LOG_LEVEL = _get_str("LOG_LEVEL", "INFO")
-
-    @classmethod
-    def validate(cls):
-        """Falla rápido y con mensaje claro en vez de un 100001 críptico."""
-        missing = []
-        if not cls.BINGX_API_KEY:
-            missing.append("BINGX_API_KEY")
-        if not cls.BINGX_API_SECRET:
-            missing.append("BINGX_API_SECRET")
-        if not cls.TELEGRAM_BOT_TOKEN:
-            missing.append("TELEGRAM_BOT_TOKEN")
-        if not cls.TELEGRAM_CHAT_ID:
-            missing.append("TELEGRAM_CHAT_ID")
-        if missing:
-            raise RuntimeError(
-                "Faltan variables de entorno obligatorias: " + ", ".join(missing)
-            )
-
-    @classmethod
-    def summary(cls) -> str:
-        modo = "DEMO (VST)" if cls.DEMO_MODE else "REAL"
-        trading = "ACTIVO (envía órdenes reales)" if cls.LIVE_TRADING else "DESACTIVADO (solo señales)"
-        return (
-            f"Wavelet MRA Haar 5m — BingX\n"
-            f"Modo cuenta: {modo} | Trading: {trading}\n"
-            f"Símbolos: {cls.SYMBOLS} | Timeframe: {cls.TIMEFRAME}\n"
-            f"qty_pct={cls.QTY_PCT}% | leverage={cls.LEVERAGE}x | "
-            f"max_posiciones_simultaneas={cls.MAX_CONCURRENT_POSITIONS}\n"
-            f"k_dominance={cls.K_DOMINANCE} | lookback_energy={cls.LOOKBACK_ENERGY} | "
-            f"cooldown_bars={cls.COOLDOWN_BARS}\n"
-            f"SL/TP: {'ATR x' + str(cls.ATR_MULT_SL) + '/' + str(cls.ATR_MULT_TP) if cls.USE_ATR_SL else str(cls.SL_PERCENT*100) + '%/' + str(cls.TP_PERCENT*100) + '%'}"
-        )
+# --- Mapeo símbolo TradingView -> BingX ---
+# TradingView suele mandar "BTCUSDT" o "BTCUSDT.P". BingX quiere "BTC-USDT".
+def tv_symbol_to_bingx(tv_symbol: str) -> str:
+    s = tv_symbol.upper().replace(".P", "").replace("PERP", "")
+    if "-" in s:
+        return s
+    # separar el par asumiendo que termina en USDT/USDC/USD
+    for quote in ("USDT", "USDC", "USD"):
+        if s.endswith(quote):
+            base = s[: -len(quote)]
+            return f"{base}-{quote}"
+    return s

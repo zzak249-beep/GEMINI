@@ -1,295 +1,327 @@
 """
-main.py — Wavelet MRA Haar 5m Bot — BingX
+Wavelet MRA Haar 5m — Webhook receiver para TradingView -> BingX + Telegram.
 
-Bot standalone (no depende de webhooks de TradingView): recalcula la
-lógica del script Pine directamente desde velas de BingX y opera de
-forma autónoma, además de avisar por Telegram en cada señal para
-poder operar en paralelo a mano si se quiere.
+Flujo:
+  TradingView (alert() del Pine, formato JSON) --POST--> /webhook/<WEBHOOK_SECRET>
+  -> valida y parsea el JSON
+  -> si AUTO_TRADE=true: ejecuta en BingX (con circuit breaker + sizing)
+  -> en todos los casos: manda la señal a Telegram (para operar manualmente
+     si AUTO_TRADE=false, o como confirmación si AUTO_TRADE=true)
+  -> persiste el estado para reconciliación tras un restart de Railway
 
-Flujo de cada ciclo:
-  1. Reconcilia posiciones abiertas reales en BingX (detecta cierres
-     por SL/TP y avisa por Telegram).
-  2. Refresca el balance de la cuenta.
-  3. Recorre el universo de símbolos en tandas pequeñas:
-       - se salta si ya hay posición abierta en ese símbolo (de este
-         bot o de cualquier otro proceso en la misma cuenta),
-       - se salta si está en cooldown,
-       - se salta si se llegó al máximo de posiciones simultáneas,
-       - calcula la señal wavelet sobre velas cerradas,
-       - si hay señal: dimensiona, calcula SL/TP, avisa por Telegram
-         y (si LIVE_TRADING) manda la orden real + SL + TP a BingX.
-  4. Duerme POLL_INTERVAL_SECONDS y repite.
+Configura la alerta en TradingView con "Webhook URL":
+  https://<tu-app>.up.railway.app/webhook/<WEBHOOK_SECRET>
+y como mensaje: {{strategy.order.alert_message}}  (o deja que sea el propio
+JSON que genera `alert(json_..., alert.freq_once_per_bar_close)` del script;
+en ese caso usa "Any alert() function call" al crear la alerta).
 """
-
 import logging
 import sys
-import threading
-import time
-from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import pandas as pd
+from flask import Flask, jsonify, request
 
-from bingx_client import BingXClient, BingXAPIError, ERR_POSITION_NOT_EXIST
-from config import Config
-import risk_manager
-import wavelet_engine
-from state_manager import StateManager, timeframe_to_ms
-from telegram_notifier import TelegramNotifier
+import bingx_client
+import config
+import telegram_notifier
+from state_manager import StateManager
 
 logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL.upper(), logging.INFO),
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    stream=sys.stdout,
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("wavelet_bot.main")
+log = logging.getLogger("main")
 
-QUOTE_SUFFIX = "-VST" if Config.DEMO_MODE else "-USDT"
+app = Flask(__name__)
+bx = bingx_client.BingXClient()
+state = StateManager()
 
+# Reconciliación al arrancar (best-effort; si BingX no está configurado,
+# se registra el error y el bot sigue en modo señal/Telegram).
+if config.BINGX_API_KEY:
+    try:
+        state.reconcile(bx)
+    except Exception:
+        log.exception("Reconciliación inicial falló, continuando de todas formas")
 
-# ── Servidor de salud (para healthcheck de Railway / monitoreo manual) ──
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok")
-
-    def log_message(self, *args):
-        pass  # silencia el log de acceso por request, ya tenemos el logger propio
-
-
-def start_health_server(port: int) -> None:
-    def _serve():
+    # Valida que los símbolos de SYMBOLS existen en BingX -- si hay un typo
+    # (ej. "BTCUSDT" en vez de "BTC-USDT"), es mejor avisar ahora que
+    # descubrirlo por un error silencioso repetido cada 5 minutos.
+    _invalid_symbols = []
+    for _sym in config.SYMBOLS:
         try:
-            HTTPServer(("0.0.0.0", port), _HealthHandler).serve_forever()
-        except OSError as exc:
-            logger.warning("No se pudo levantar el servidor de salud en :%d (%s)", port, exc)
+            _filters = bx.get_symbol_filters(_sym)
+            if not _filters:
+                _invalid_symbols.append(_sym)
+        except Exception:
+            log.exception("No se pudo validar el símbolo %s al arrancar", _sym)
+            _invalid_symbols.append(_sym)
+    if _invalid_symbols:
+        _msg = f"⚠️ Símbolos en SYMBOLS que BingX no reconoce: {_invalid_symbols}. Revisa el formato (BASE-QUOTE, ej. BTC-USDT)."
+        log.warning(_msg)
+        telegram_notifier.send(_msg)
 
-    threading.Thread(target=_serve, daemon=True).start()
-    logger.info("Servidor de salud escuchando en :%d/health", port)
+# --------------------------------------------------------------------------- #
+# Generador de señales propio (no depende de TradingView). Se activa por
+# defecto (SIGNAL_SOURCE=python). Si prefieres seguir usando el webhook de
+# TradingView, pon SIGNAL_SOURCE=tradingview y ENABLE_SCHEDULER=false.
+# --------------------------------------------------------------------------- #
+_scheduler = None
+if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
+    import poller
+    import sys as _sys
+    _scheduler = poller.start(_sys.modules[__name__], bx, state)
 
 
-class Bot:
-    def __init__(self):
-        self.client = BingXClient(
-            Config.BINGX_API_KEY, Config.BINGX_API_SECRET, Config.BINGX_BASE_URL,
-            recv_window_ms=Config.BINGX_RECV_WINDOW_MS,
-        )
-        self.tg = TelegramNotifier(Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID)
-        self.state = StateManager()
-        self.timeframe_ms = timeframe_to_ms(Config.TIMEFRAME)
-        self._contracts: dict[str, dict] = {}
-        self._contracts_fetched_at = 0.0
+# --------------------------------------------------------------------------- #
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify(
+        status="ok",
+        auto_trade=config.AUTO_TRADE,
+        signal_source=config.SIGNAL_SOURCE,
+        symbols=("ALL (perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS),
+        open_positions=state.open_count(),
+        halted=state.state.get("trading_halted"),
+    )
 
-    # ── Universo de símbolos y metadatos de contrato ────────────────
-    def refresh_contracts(self, force: bool = False) -> None:
-        if not force and (time.time() - self._contracts_fetched_at) < 3600:
-            return
-        raw = self.client.get_contracts()
-        contracts = {}
-        for c in raw:
-            symbol = c.get("symbol", "")
-            if not symbol.endswith("-USDT"):
-                continue
-            if int(c.get("status", 0)) != 1:
-                continue
-            contracts[symbol] = {
-                "quantityPrecision": int(c.get("quantityPrecision", 4)),
-                "pricePrecision": int(c.get("pricePrecision", 4)),
-                "tradeMinQuantity": float(c.get("tradeMinQuantity", 0) or 0),
-                "tradeMinUSDT": float(c.get("tradeMinUSDT", 0) or 0),
-            }
-        self._contracts = contracts
-        self._contracts_fetched_at = time.time()
-        logger.info("Contratos USDT-M activos: %d", len(contracts))
 
-    def symbol_universe(self) -> list[str]:
-        if Config.SYMBOLS.strip().upper() == "ALL":
-            base_symbols = list(self._contracts.keys())
+@app.route("/status", methods=["GET"])
+def status():
+    """Diagnóstico más completo: próximas ejecuciones del scheduler,
+    posiciones abiertas conocidas y estado del circuit breaker."""
+    jobs = []
+    if _scheduler:
+        for job in _scheduler.get_jobs():
+            jobs.append({
+                "id": job.id,
+                "next_run": job.next_run_time.isoformat() if job.next_run_time else None,
+            })
+    return jsonify(
+        auto_trade=config.AUTO_TRADE,
+        signal_source=config.SIGNAL_SOURCE,
+        symbols=config.SYMBOLS,
+        scheduler_jobs=jobs,
+        open_positions=state.state.get("positions", {}),
+        consecutive_losses=state.state.get("consecutive_losses"),
+        trading_halted=state.state.get("trading_halted"),
+        halt_reason=state.state.get("halt_reason"),
+        daily_start_equity=state.state.get("daily_start_equity"),
+    )
+
+
+@app.route("/signal-check/<symbol>", methods=["GET"])
+def signal_check(symbol):
+    """Diagnóstico: calcula la señal actual para un símbolo sin ejecutar
+    nada, para verificar que el motor de señales lee bien BingX."""
+    import signal_engine
+    import poller as _poller
+    try:
+        rows = bx.get_klines(symbol.upper(), interval="5m", limit=config.WAVELET_LOOKBACK_ENERGY + 60)
+        df = signal_engine.klines_to_df(rows)
+        sig = signal_engine.compute_signal(df, _poller._params(), last_signal_ts=state.get_last_signal_ts(symbol.upper()))
+        return jsonify(symbol=symbol.upper(), bars=len(df), signal=sig)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+@app.route("/scan", methods=["GET"])
+def scan():
+    """Analiza TODAS las monedas de BingX (o las que estén en SYMBOLS) con
+    el filtro wavelet, sin ejecutar ni notificar nada -- solo para mirar.
+    Parámetros opcionales: ?quote=USDT (default) y ?limit=N (símbolos máx.).
+    Puede tardar varios segundos/minutos si escaneas todo el universo.
+    """
+    import poller as _poller
+    import scanner as _scanner
+
+    quote = request.args.get("quote", "USDT").upper()
+    limit = int(request.args.get("limit", config.SCAN_ALL_MAX_SYMBOLS))
+    notify = request.args.get("notify", "false").lower() == "true"
+
+    try:
+        if config.SYMBOLS and not config.SCAN_ALL_SYMBOLS:
+            symbols = config.SYMBOLS
         else:
-            base_symbols = [s.strip() for s in Config.SYMBOLS.split(",") if s.strip()]
-        if Config.DEMO_MODE:
-            return [s.replace("-USDT", "-VST") for s in base_symbols]
-        return base_symbols
+            symbols = bx.get_all_symbols(quote_filter=quote)[:limit]
+    except Exception as e:
+        return jsonify(error=f"no se pudo listar símbolos: {e}"), 500
 
-    def contract_meta(self, symbol: str) -> dict:
-        # en DEMO_MODE la precisión se toma del contrato USDT equivalente
-        key = symbol.replace("-VST", "-USDT")
-        return self._contracts.get(key, {
-            "quantityPrecision": 4, "pricePrecision": 4,
-            "tradeMinQuantity": 0.0, "tradeMinUSDT": 0.0,
-        })
+    results = _scanner.scan_symbols(bx, config, symbols)
+    ranked = _scanner.rank_results(results)
 
-    # ── Reconciliación de posiciones (fuente de verdad = BingX) ─────
-    def reconcile_positions(self) -> dict:
+    if notify:
+        telegram_notifier.send(_scanner.format_scan_summary(ranked))
+
+    return jsonify(symbols_requested=len(symbols), **ranked)
+
+
+@app.route("/webhook/<secret>", methods=["POST"])
+def webhook(secret):
+    if not config.WEBHOOK_SECRET or secret != config.WEBHOOK_SECRET:
+        log.warning("Intento de webhook con secret inválido")
+        return jsonify(error="unauthorized"), 401
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        # TradingView a veces manda el JSON como texto plano
         try:
-            positions = self.client.get_positions()
-        except Exception as exc:
-            logger.error("No se pudieron leer posiciones: %s", exc)
-            return self.state.known_positions
+            import json as _json
+            payload = _json.loads(request.data.decode("utf-8"))
+        except Exception:
+            log.error("Payload no parseable: %s", request.data)
+            return jsonify(error="invalid json"), 400
 
-        current = {}
-        for p in positions:
-            amt = float(p.get("positionAmt", p.get("positionSize", 0)) or 0)
-            if amt == 0:
-                continue
-            key = (p.get("symbol"), p.get("positionSide", "BOTH"))
-            current[key] = p
+    log.info("Alerta recibida: %s", payload)
 
-        for key, old in self.state.known_positions.items():
-            if key not in current:
-                symbol, side = key
-                exit_price = old.get("markPrice") or old.get("avgPrice") or 0
-                self.tg.exit_notice(symbol, side, float(exit_price or 0))
-                logger.info("Posición cerrada detectada: %s %s", symbol, side)
+    signal = payload.get("signal")
+    try:
+        if signal == "entry":
+            _handle_entry(payload)
+        elif signal == "exit":
+            _handle_exit(payload)
+        else:
+            log.warning("Tipo de señal desconocido: %s", signal)
+            return jsonify(error="unknown signal type"), 400
+    except Exception as e:
+        log.exception("Error procesando la alerta")
+        telegram_notifier.send(f"🚨 Error procesando alerta: `{e}`\nPayload: `{payload}`")
+        return jsonify(error=str(e)), 500
 
-        self.state.known_positions = current
-        return current
+    return jsonify(status="processed"), 200
 
-    def get_equity(self) -> float:
-        try:
-            bal = self.client.get_balance()
-            for key in ("equity", "balance", "availableMargin"):
-                if key in bal:
-                    return float(bal[key])
-            # algunas respuestas anidan en una lista de assets
-            if isinstance(bal, list) and bal:
-                return float(bal[0].get("equity", bal[0].get("balance", 0)))
-        except Exception as exc:
-            logger.error("No se pudo leer el balance: %s", exc)
-        return 0.0
 
-    # ── Procesamiento de un símbolo ──────────────────────────────────
-    def process_symbol(self, symbol: str, open_positions: dict, equity: float) -> None:
-        try:
-            if Config.SKIP_IF_SYMBOL_HAS_POSITION:
-                if any(sym == symbol for sym, _side in open_positions.keys()):
-                    return
+# --------------------------------------------------------------------------- #
+def _handle_entry(alert: dict):
+    tv_symbol = alert["symbol"]
+    symbol = config.tv_symbol_to_bingx(tv_symbol)
+    position_side = alert["positionSide"]          # LONG / SHORT
+    side = "BUY" if position_side == "LONG" else "SELL"
+    price = float(alert["price"])
+    sl = float(alert["sl"])
+    tp = float(alert["tp"])
 
-            candles = self.client.get_klines(symbol, Config.TIMEFRAME, limit=max(250, Config.LOOKBACK_ENERGY + 64))
-            if len(candles) < 20:
-                return
-
-            # descarta la vela en formación (todavía no cerrada)
-            now_ms = int(time.time() * 1000)
-            if candles[-1]["time"] + self.timeframe_ms > now_ms:
-                candles = candles[:-1]
-            if not candles:
-                return
-
-            df = pd.DataFrame(candles)
-            signal = wavelet_engine.compute_signal(df, Config)
-            if signal is None:
-                return
-
-            candle_time = signal["time"]
-            if not self.state.can_signal(symbol, candle_time, Config.COOLDOWN_BARS, self.timeframe_ms):
-                return
-
-            side = None
-            if signal["long_cond"]:
-                side = "LONG"
-            elif signal["short_cond"]:
-                side = "SHORT"
-            if side is None:
-                return
-
-            self.state.mark_signal(symbol, candle_time)
-            self._handle_entry(symbol, side, signal, df, equity, open_positions)
-
-        except BingXAPIError as exc:
-            if exc.code == ERR_POSITION_NOT_EXIST:
-                return
-            logger.warning("Error de API en %s: %s", symbol, exc)
-        except Exception as exc:
-            logger.exception("Error inesperado procesando %s: %s", symbol, exc)
-
-    def _handle_entry(self, symbol: str, side: str, signal: dict, df: pd.DataFrame,
-                       equity: float, open_positions: dict) -> None:
-        meta = self.contract_meta(symbol)
-        atr_series = wavelet_engine.compute_atr(df, Config.ATR_LENGTH)
-        atr_value = float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else None
-
-        entry_price = signal["close"]
-        is_long = side == "LONG"
-        sl_price, tp_price = risk_manager.compute_sl_tp(entry_price, is_long, atr_value, Config)
-
-        # límite de posiciones simultáneas en toda la cuenta (no solo las de este bot)
-        if len(open_positions) >= Config.MAX_CONCURRENT_POSITIONS:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="máximo de posiciones simultáneas alcanzado")
-            return
-
-        if Config.MIN_BALANCE_USDT and equity < Config.MIN_BALANCE_USDT:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="balance por debajo del mínimo configurado")
-            return
-
-        sizing = risk_manager.compute_position_size(
-            equity, Config.QTY_PCT, entry_price,
-            meta["quantityPrecision"], meta["tradeMinQuantity"], meta["tradeMinUSDT"],
+    if not config.AUTO_TRADE:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False)
         )
-        if not sizing.ok:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False, reason=sizing.reason)
-            return
+        return
 
-        if not Config.LIVE_TRADING:
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=False,
-                            reason="LIVE_TRADING desactivado")
-            return
+    if state.get_open(symbol):
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error=f"ya hay posición abierta en {symbol}"
+            )
+        )
+        return
 
-        try:
-            if not self.state.leverage_already_set(symbol):
-                self.client.set_leverage(symbol, side, Config.LEVERAGE)
-                self.state.mark_leverage_set(symbol)
+    if state.open_count() >= config.MAX_CONCURRENT_POSITIONS:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error="límite de posiciones concurrentes alcanzado"
+            )
+        )
+        return
 
-            entry_side = "BUY" if is_long else "SELL"
-            exit_side = "SELL" if is_long else "BUY"
+    try:
+        equity = bx.get_balance()
+    except Exception as e:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo leer balance: {e}")
+        )
+        return
 
-            self.client.place_market_order(symbol, entry_side, side, sizing.quantity)
-            self.client.place_stop_market(symbol, exit_side, side, sl_price, close_position=True)
-            self.client.place_take_profit_market(symbol, exit_side, side, tp_price, close_position=True)
+    allowed, reason = state.check_circuit_breaker(equity)
+    if not allowed:
+        telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
+        return
 
-            self.tg.signal(symbol, side, entry_price, sl_price, tp_price, executed=True)
-            logger.info("Entrada ejecutada: %s %s qty=%s @ %.6g (SL=%.6g TP=%.6g)",
-                        symbol, side, sizing.quantity, entry_price, sl_price, tp_price)
+    # Sizing: arriesgar RISK_PCT_PER_TRADE% del equity en la distancia al SL.
+    risk_amount = equity * (config.RISK_PCT_PER_TRADE / 100)
+    stop_distance = abs(price - sl)
+    if stop_distance <= 0:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error="distancia a SL inválida")
+        )
+        return
+    qty = round(risk_amount / stop_distance, 3)
+    if qty <= 0:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error="qty calculada es 0")
+        )
+        return
+    qty = bx.round_qty(symbol, qty)
+    if qty <= 0:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error="qty tras redondeo de precisión es 0")
+        )
+        return
 
-        except Exception as exc:
-            logger.exception("Fallo al ejecutar la entrada en %s: %s", symbol, exc)
-            self.tg.error(f"entrada {symbol} {side}", str(exc))
+    try:
+        bx.set_leverage(symbol, position_side, config.LEVERAGE)
+        bx.place_market_order(
+            symbol, side, position_side, qty, stop_loss=sl, take_profit=tp
+        )
+    except Exception as e:
+        log.exception("Fallo abriendo orden en BingX")
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=str(e))
+        )
+        return
 
-    # ── Bucle principal ──────────────────────────────────────────────
-    def run(self) -> None:
-        Config.validate()
-        start_health_server(Config.HEALTH_PORT)
-        logger.info("Iniciando bot.\n%s", Config.summary())
-        self.tg.info("Bot iniciado.\n" + Config.summary())
+    state.record_open(symbol, position_side, qty, price, sl, tp)
+    telegram_notifier.send(
+        telegram_notifier.format_entry_signal(alert, executed=True, qty=qty)
+    )
 
-        self.refresh_contracts(force=True)
 
-        while True:
-            cycle_start = time.time()
-            try:
-                self.refresh_contracts()
-                open_positions = self.reconcile_positions()
-                equity = self.get_equity()
-                symbols = self.symbol_universe()
+def _handle_exit(alert: dict):
+    tv_symbol = alert["symbol"]
+    symbol = config.tv_symbol_to_bingx(tv_symbol)
+    position_side = alert["positionSide"]
 
-                for i in range(0, len(symbols), Config.SYMBOL_BATCH_SIZE):
-                    batch = symbols[i:i + Config.SYMBOL_BATCH_SIZE]
-                    with ThreadPoolExecutor(max_workers=len(batch)) as pool:
-                        list(pool.map(lambda s: self.process_symbol(s, open_positions, equity), batch))
-                    time.sleep(Config.SYMBOL_BATCH_DELAY_SECONDS)
+    if not config.AUTO_TRADE:
+        telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=False))
+        return
 
-            except Exception as exc:
-                logger.exception("Error en el ciclo principal: %s", exc)
-                self.tg.error("ciclo principal", str(exc))
+    pos = state.get_open(symbol)
+    if not pos:
+        # puede que ya se haya cerrado por SL/TP directamente en BingX; solo avisamos
+        telegram_notifier.send(
+            telegram_notifier.format_exit_signal(
+                alert, executed=False, error="no había posición registrada localmente (¿cerrada ya por SL/TP?)"
+            )
+        )
+        return
 
-            elapsed = time.time() - cycle_start
-            sleep_for = max(1.0, Config.POLL_INTERVAL_SECONDS - elapsed)
-            time.sleep(sleep_for)
+    try:
+        exit_price = float(alert.get("price", 0))
+        bx.close_position(symbol, position_side, pos["qty"])
+        entry_price = pos["entry_price"]
+        pnl = (exit_price - entry_price) if position_side == "LONG" else (entry_price - exit_price)
+    except Exception as e:
+        log.exception("Fallo cerrando orden en BingX")
+        telegram_notifier.send(
+            telegram_notifier.format_exit_signal(alert, executed=False, error=str(e))
+        )
+        return
+
+    state.record_close(symbol, pnl=pnl)
+    telegram_notifier.send(telegram_notifier.format_exit_signal(alert, executed=True))
+
+
+# --------------------------------------------------------------------------- #
+@app.route("/reset-breaker/<secret>", methods=["POST"])
+def reset_breaker(secret):
+    """Endpoint manual para reactivar el trading tras un circuit breaker."""
+    if secret != config.WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 401
+    state.manual_reset_breaker()
+    telegram_notifier.send("✅ Circuit breaker reseteado manualmente.")
+    return jsonify(status="reset"), 200
 
 
 if __name__ == "__main__":
-    Bot().run()
+    import os
+
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
