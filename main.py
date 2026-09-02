@@ -41,6 +41,36 @@ log.info(
     "DEMO / VST (dinero simulado)" if config.BINGX_DEMO else "⚠️ PRODUCCIÓN — DINERO REAL ⚠️",
     config.AUTO_TRADE,
 )
+
+# --------------------------------------------------------------------------- #
+# GUARDIA DE ARRANQUE PARA DINERO REAL. Con AUTO_TRADE=true y BINGX_DEMO=false
+# el bot puede abrir/cerrar posiciones reales. Los endpoints /emergency-stop y
+# /reset-breaker son el ÚNICO freno manual que existe, y ambos dependen de
+# WEBHOOK_SECRET -- si está vacío, esas rutas son inalcanzables (Flask no
+# admite un segmento de URL vacío) y no hay forma de pararlo desde fuera sin
+# tocar variables de Railway y esperar un redeploy. Se rehúsa a arrancar en
+# real sin ese freno en vez de descubrirlo el día que algo va mal.
+if config.AUTO_TRADE and not config.BINGX_DEMO and not config.WEBHOOK_SECRET:
+    log.critical(
+        "AUTO_TRADE=true y BINGX_DEMO=false (dinero real) pero WEBHOOK_SECRET "
+        "está vacío -- /emergency-stop y /reset-breaker quedarían inutilizables. "
+        "Define WEBHOOK_SECRET en Railway (ej. `openssl rand -hex 24`) antes de arrancar en real."
+    )
+    sys.exit(1)
+
+# Aviso si el estado (posiciones, circuit breaker, cooldown) no está en una
+# ruta que sobreviva a un redeploy. Railway borra el disco del contenedor en
+# cada redeploy salvo que STATE_FILE apunte a un Volume montado (ver README
+# sección 0). Una ruta relativa como "state.json" NUNCA sobrevive.
+if config.AUTO_TRADE and not config.BINGX_DEMO and not config.STATE_FILE.startswith("/"):
+    _msg = (
+        f"⚠️ STATE_FILE='{config.STATE_FILE}' es una ruta relativa -- se perderá en el "
+        "próximo redeploy (circuit breaker y cooldown se resetearán a cero). Monta un "
+        "Volume en Railway y pon STATE_FILE=/data/state.json (o la ruta del Volume)."
+    )
+    log.warning(_msg)
+    telegram_notifier.send(_msg)
+
 if not config.BINGX_DEMO and config.AUTO_TRADE:
     telegram_notifier.send(
         "🔴 *Bot arrancado en PRODUCCIÓN con AUTO_TRADE=true* — las órdenes "
@@ -304,6 +334,20 @@ def _handle_entry(alert: dict):
             )
         )
         return
+
+    # Fuerza margen ISOLATED explícitamente: si la cuenta BingX tiene el modo
+    # por defecto en CROSS, una pérdida grande en esta posición podría comerse
+    # margen de OTRAS posiciones/todo el equity, no solo lo previsto por
+    # RISK_PCT_PER_TRADE. Falla en silencio (log, no aborta la entrada) porque
+    # BingX devuelve error si ya está en ISOLATED o si ya hay posición abierta
+    # en ese símbolo con otro modo -- no debe bloquear una entrada válida.
+    try:
+        bx.set_margin_mode(symbol, "ISOLATED")
+    except Exception:
+        log.warning(
+            "No se pudo confirmar margin mode ISOLATED para %s (revisa manualmente en BingX)",
+            symbol,
+        )
 
     try:
         bx.set_leverage(symbol, position_side, config.LEVERAGE)
