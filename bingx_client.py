@@ -55,12 +55,19 @@ class BingXClient:
     # ------------------------------------------------------------------ #
     def _signed_request(self, method: str, path: str, params: dict):
         params = {k: v for k, v in params.items() if v is not None}
-        params["timestamp"] = str(int(time.time() * 1000))
         params["recvWindow"] = params.get("recvWindow", "10000")
+        timestamp = str(int(time.time() * 1000))
 
-        # orden fijo (sorted) usado TANTO para firmar COMO para transmitir
+        # BingX firma así (parseParam de su SDK oficial): todos los
+        # parámetros ordenados alfabéticamente EXCEPTO "timestamp", que va
+        # SIEMPRE al final, fuera del sort. Meter timestamp dentro del
+        # sorted() (como estaba antes) lo descoloca -- por ejemplo cae entre
+        # "takeProfit" y "type" en vez de al final -- y BingX rechaza la
+        # firma con error 100001 "signature mismatch" en TODAS las órdenes.
+        # Mismo bug ya resuelto antes en renewed-love/joyful-art.
         ordered_items = sorted(params.items())
         query_string = urlencode(ordered_items)
+        query_string = f"{query_string}&timestamp={timestamp}" if query_string else f"timestamp={timestamp}"
 
         signature = hmac.new(
             self.api_secret.encode("utf-8"),
