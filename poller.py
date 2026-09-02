@@ -45,6 +45,23 @@ def _resolve_symbols(bx):
         log.exception("No se pudo listar todos los símbolos de BingX, se usa la caché anterior si hay")
         return _symbols_cache["symbols"]
 
+    # Filtra por liquidez y prioriza los más líquidos primero -- en vez de
+    # coger los primeros N alfabéticamente (que podían ser microcaps con
+    # spread altísimo), nos quedamos con los N de más volumen real.
+    volumes = bx.get_24h_quote_volumes()
+    if volumes:
+        liquid = [s for s in all_symbols if volumes.get(s, 0) >= config.MIN_24H_VOLUME_USDT]
+        if liquid:
+            liquid.sort(key=lambda s: volumes.get(s, 0), reverse=True)
+            all_symbols = liquid
+        else:
+            log.warning(
+                "Ningún símbolo supera MIN_24H_VOLUME_USDT=%s, se usa la lista sin filtrar por liquidez",
+                config.MIN_24H_VOLUME_USDT,
+            )
+    else:
+        log.warning("No se pudo leer volumen de 24h, se omite el filtro de liquidez este ciclo")
+
     limited = all_symbols[: config.SCAN_ALL_MAX_SYMBOLS]
     if len(all_symbols) > config.SCAN_ALL_MAX_SYMBOLS:
         log.warning(

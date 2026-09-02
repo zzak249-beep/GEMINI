@@ -36,6 +36,17 @@ app = Flask(__name__)
 bx = bingx_client.BingXClient()
 state = StateManager()
 
+log.info(
+    "=" * 70 + "\nENTORNO BINGX: %s | AUTO_TRADE=%s\n" + "=" * 70,
+    "DEMO / VST (dinero simulado)" if config.BINGX_DEMO else "⚠️ PRODUCCIÓN — DINERO REAL ⚠️",
+    config.AUTO_TRADE,
+)
+if not config.BINGX_DEMO and config.AUTO_TRADE:
+    telegram_notifier.send(
+        "🔴 *Bot arrancado en PRODUCCIÓN con AUTO_TRADE=true* — las órdenes "
+        "que ejecute serán con dinero real."
+    )
+
 # Reconciliación al arrancar (best-effort; si BingX no está configurado,
 # se registra el error y el bot sigue en modo señal/Telegram).
 if config.BINGX_API_KEY:
@@ -78,6 +89,8 @@ if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
 def health():
     return jsonify(
         status="ok",
+        bingx_env=("demo/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL"),
+        bingx_base_url=bx.base_url,
         auto_trade=config.AUTO_TRADE,
         signal_source=config.SIGNAL_SOURCE,
         symbols=("ALL (perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS),
@@ -223,6 +236,28 @@ def _handle_entry(alert: dict):
         )
         return
 
+    # Tope de seguridad ABSOLUTO contra las posiciones REALES en BingX (no
+    # el estado local, que puede haberse perdido si Railway reinició el
+    # contenedor sin un Volume persistente). Esto es lo único que evita un
+    # descontrol si el JSON local miente sobre cuántas posiciones hay.
+    try:
+        live_positions = [
+            p for p in bx.get_positions()
+            if float(p.get("positionAmt", p.get("positionSize", 0)) or 0) != 0
+        ]
+    except Exception as e:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(alert, executed=False, error=f"no se pudo verificar posiciones reales en BingX: {e}")
+        )
+        return
+    if len(live_positions) >= config.HARD_MAX_TOTAL_POSITIONS:
+        telegram_notifier.send(
+            f"⛔ Tope de seguridad alcanzado: {len(live_positions)} posiciones reales abiertas en "
+            f"BingX (límite HARD_MAX_TOTAL_POSITIONS={config.HARD_MAX_TOTAL_POSITIONS}). "
+            f"Entrada en {symbol} bloqueada."
+        )
+        return
+
     try:
         equity = bx.get_balance()
     except Exception as e:
@@ -257,6 +292,19 @@ def _handle_entry(alert: dict):
         )
         return
 
+    # Comprobación de margen: evita mandar una orden que BingX rechazaría
+    # por fondos insuficientes (o que consumiría casi todo el margen
+    # disponible sin que quede colchón para el resto de posiciones).
+    required_margin = (qty * price) / max(config.LEVERAGE, 1)
+    if required_margin > equity * 0.95:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT, equity {equity:.2f} USDT)",
+            )
+        )
+        return
+
     try:
         bx.set_leverage(symbol, position_side, config.LEVERAGE)
         bx.place_market_order(
@@ -267,6 +315,25 @@ def _handle_entry(alert: dict):
         telegram_notifier.send(
             telegram_notifier.format_entry_signal(alert, executed=False, error=str(e))
         )
+        return
+
+    # VERIFICACIÓN CRÍTICA: confirma que BingX aceptó de verdad el SL/TP.
+    # Si los rechazó en silencio (pasa con algunos símbolos/formatos de
+    # precio), la posición queda abierta y desprotegida -- nunca se cerraría
+    # sola. En vez de dejarla así, se cierra inmediatamente y se avisa.
+    if not bx.has_stop_and_take_profit(symbol):
+        log.error("%s se abrió SIN SL/TP confirmado -- cerrando inmediatamente por seguridad", symbol)
+        try:
+            bx.close_position(symbol, position_side, qty)
+            telegram_notifier.send(
+                f"🚨 *{symbol}*: la orden se abrió pero BingX NO confirmó el SL/TP. "
+                f"Se cerró la posición inmediatamente por seguridad, no quedó desprotegida."
+            )
+        except Exception as e:
+            telegram_notifier.send(
+                f"🚨🚨 *{symbol}*: se abrió SIN SL/TP y el cierre de emergencia también falló: {e}. "
+                f"REVISA BINGX A MANO AHORA."
+            )
         return
 
     state.record_open(symbol, position_side, qty, price, sl, tp)
@@ -319,6 +386,62 @@ def reset_breaker(secret):
     state.manual_reset_breaker()
     telegram_notifier.send("✅ Circuit breaker reseteado manualmente.")
     return jsonify(status="reset"), 200
+
+
+@app.route("/emergency-stop/<secret>", methods=["POST"])
+def emergency_stop(secret):
+    """Botón de pánico: pausa el trading YA y cierra TODAS las posiciones
+    reales abiertas en BingX (consultadas directamente al exchange, no al
+    estado local). Úsalo si algo se ve mal y no quieres esperar a diagnosticar."""
+    if secret != config.WEBHOOK_SECRET:
+        return jsonify(error="unauthorized"), 401
+
+    state.state["trading_halted"] = True
+    state.state["halt_reason"] = "PARADA DE EMERGENCIA manual"
+    state._save()
+
+    try:
+        live_positions = [
+            p for p in bx.get_positions()
+            if float(p.get("positionAmt", p.get("positionSize", 0)) or 0) != 0
+        ]
+    except Exception as e:
+        telegram_notifier.send(f"🚨 Parada de emergencia: no se pudo leer posiciones de BingX: {e}")
+        return jsonify(error=str(e)), 500
+
+    closed, failed = [], []
+    for p in live_positions:
+        sym = p.get("symbol")
+        side = p.get("positionSide", "LONG")
+        qty = abs(float(p.get("positionAmt", p.get("positionSize", 0)) or 0))
+        try:
+            bx.close_position(sym, side, qty)
+            state.record_close(sym)
+            closed.append(sym)
+        except Exception as e:
+            log.exception("Fallo cerrando %s en parada de emergencia", sym)
+            failed.append((sym, str(e)))
+
+    msg = f"🛑 *PARADA DE EMERGENCIA* — trading pausado.\nCerradas: {closed or 'ninguna'}"
+    if failed:
+        msg += f"\n⚠️ Fallaron: {failed} — CIÉRRALAS A MANO EN BINGX AHORA."
+    telegram_notifier.send(msg)
+
+    return jsonify(status="stopped", closed=closed, failed=failed), 200
+
+
+@app.route("/positions", methods=["GET"])
+def positions():
+    """Posiciones REALES en BingX ahora mismo (consulta directa al
+    exchange, no el JSON local) -- para verificar sin depender del estado."""
+    try:
+        live = [
+            p for p in bx.get_positions()
+            if float(p.get("positionAmt", p.get("positionSize", 0)) or 0) != 0
+        ]
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+    return jsonify(count=len(live), positions=live)
 
 
 if __name__ == "__main__":

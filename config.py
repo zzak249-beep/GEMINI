@@ -38,6 +38,17 @@ AUTO_TRADE = _bool("AUTO_TRADE", "false")
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))  # % del equity arriesgado (via SL)
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+# Tope de seguridad ABSOLUTO, independiente de MAX_CONCURRENT_POSITIONS y del
+# estado local (que puede resetearse si Railway no tiene un Volume montado
+# para STATE_FILE). Se comprueba contra las posiciones REALES en BingX, no
+# contra el JSON local, así que protege incluso si el estado se perdió.
+HARD_MAX_TOTAL_POSITIONS = int(os.getenv("HARD_MAX_TOTAL_POSITIONS", "5"))
+
+# Volumen mínimo en USDT de las últimas 24h para que un símbolo se vigile
+# en modo SYMBOLS=ALL. Filtra alts ilíquidos donde el spread/slippage real
+# se come cualquier ventaja del filtro antes de que se mueva el precio
+# (ver RESEARCH.md sección 5). No aplica si SYMBOLS es una lista explícita.
+MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "2000000"))
 
 # --- Circuit breaker ---
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))

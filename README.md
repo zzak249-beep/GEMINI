@@ -1,3 +1,36 @@
+## ⚠️ 0. IMPRESCINDIBLE antes de usar dinero real: Volume persistente en Railway
+
+Por defecto Railway **borra el disco del contenedor en cada redeploy**. Si
+`state.json` vive en el disco normal del contenedor (como está por defecto),
+cada vez que cambies una variable o subas un cambio, el bot **olvida** qué
+posiciones tenía abiertas y reinicia el circuit breaker a cero. Esto puede
+hacer que abra más posiciones de las que crees que tiene permitidas.
+
+**Antes de poner `AUTO_TRADE=true` con dinero real:**
+1. Railway → tu servicio → pestaña **Volumes** → *New Volume*.
+2. Móntalo en `/data` (o la ruta que prefieras).
+3. En Variables, pon `STATE_FILE=/data/state.json`.
+4. Redeploy una vez con esto ya puesto, y verifica con `/status` que el
+   estado sobrevive a un redeploy manual de prueba.
+
+Independientemente de esto, el bot ya trae un tope de seguridad absoluto
+(`HARD_MAX_TOTAL_POSITIONS`, por defecto 5) que se comprueba contra las
+posiciones **reales** en BingX, no contra el JSON local — así que aunque el
+estado se pierda, el bot no puede abrir un número descontrolado de
+posiciones. Pero el Volume sigue siendo necesario para que el circuit
+breaker y el cooldown de señales funcionen bien entre reinicios.
+
+## 0b. Verificación de SL/TP tras cada entrada
+
+Si BingX rechaza en silencio el `stopLoss`/`takeProfit` embebido en la orden
+(pasa con algunos símbolos, sobre todo alts ilíquidos), la posición quedaría
+abierta sin protección y no se cerraría nunca sola — es lo que parece haber
+pasado si viste posiciones acumulándose sin cerrarse. Ahora, justo después
+de abrir cada orden, el bot llama a `bx.has_stop_and_take_profit(symbol)`:
+si no encuentra las órdenes condicionales de SL y TP abiertas, **cierra la
+posición inmediatamente** con una orden de mercado y te avisa por Telegram,
+en vez de dejarla huérfana.
+
 # Wavelet MRA Haar 5m — Bot BingX + Telegram (sin TradingView de pago)
 
 Bot que calcula la señal wavelet **él solo**, leyendo velas de BingX cada 5
@@ -133,21 +166,46 @@ menos 1-2 semanas** y compara las señales contra lo que habría pasado.
 Usa `/signal-check/<symbol>` cuando quieras para ver el estado actual del
 filtro sin esperar a que dispare.
 
-## 5. Pasar a real
+## 5. Pasar a real — checklist completo
 
-Cuando confíes en las señales:
-1. Cambia `AUTO_TRADE=true` en Railway (redeploy automático).
-2. Empieza con `RISK_PCT_PER_TRADE` bajo (1% o menos) y `LEVERAGE` moderado.
-3. Vigila el circuit breaker: se activa solo tras `MAX_CONSECUTIVE_LOSSES`
+Antes de `AUTO_TRADE=true` con dinero real, en este orden:
+
+1. **Volume persistente en Railway montado** (sección 0). Sin esto, el
+   circuit breaker y el conteo de posiciones pueden perderse en un redeploy.
+2. **`BINGX_DEMO=false`** cuando estés listo — antes de eso, corre al menos
+   unos días con `BINGX_DEMO=true` para confirmar que las entradas,
+   SL/TP y cierres funcionan de principio a fin contra la cuenta VST. El
+   log de arranque te dice claramente contra qué entorno está pegando
+   (`bingx_env` en `/`).
+3. **`SYMBOLS` a pares líquidos**, no `ALL` al principio — `BTC-USDT,ETH-USDT,SOL-USDT`
+   o similares. `MIN_24H_VOLUME_USDT` ya filtra ilíquidos si usas `ALL`,
+   pero para tu primera vez en real, mejor una lista corta y conocida.
+4. **`RISK_PCT_PER_TRADE` bajo** (1% o menos) y **`LEVERAGE` moderado**
+   (5-10x) — no lo que uses en un experimento, lo que estés dispuesto a
+   perder mientras confirmas que todo funciona como esperas.
+5. **`HARD_MAX_TOTAL_POSITIONS` bajo** (3-5) las primeras semanas.
+6. Cambia `AUTO_TRADE=true` en Railway (redeploy automático).
+7. Verifica con `curl https://tu-app.up.railway.app/positions` que lo que
+   ves ahí coincide con lo que ves en la web de BingX.
+8. Vigila el circuit breaker: se activa solo tras `MAX_CONSECUTIVE_LOSSES`
    pérdidas seguidas o `MAX_DAILY_DRAWDOWN_PCT`% de drawdown diario, y te
    avisa por Telegram. Para reactivarlo manualmente:
    ```bash
    curl -X POST https://tu-app.up.railway.app/reset-breaker/<WEBHOOK_SECRET>
    ```
-4. El cierre (SL/TP) lo gestiona BingX solo (va embebido en la orden). El
-   bot detecta que la posición desapareció cada 2 minutos (`job_reconcile_closed_positions`),
-   calcula el PnL real vía el endpoint de income, actualiza el circuit
-   breaker y te avisa por Telegram.
+9. **Si algo se ve mal y quieres parar todo YA**, sin esperar a diagnosticar:
+   ```bash
+   curl -X POST https://tu-app.up.railway.app/emergency-stop/<WEBHOOK_SECRET>
+   ```
+   Esto pausa el trading y cierra TODAS las posiciones reales abiertas en
+   BingX (consultadas directamente al exchange), no solo las que el bot
+   creía tener localmente.
+10. El cierre normal (SL/TP) lo gestiona BingX solo. El bot verifica
+    justo tras cada entrada que el SL/TP se confirmó de verdad
+    (`has_stop_and_take_profit`) — si BingX lo rechazó en silencio, cierra
+    la posición al instante en vez de dejarla desprotegida. Y cada 2
+    minutos reconcilia por si una posición se cerró sola, calculando el
+    PnL real vía el endpoint de income.
 
 ## 6. (Opcional) Volver al webhook de TradingView
 
@@ -187,3 +245,19 @@ directamente:
   `SYMBOLS=ALL` como por el endpoint `/scan`) con pausa entre peticiones
   para respetar el límite compartido de datos de mercado de BingX (500
   peticiones/10s por IP).
+- **Filtro de liquidez** (`MIN_24H_VOLUME_USDT`): en modo `SYMBOLS=ALL`, el
+  bot descarta símbolos con menos volumen de 24h que el umbral y prioriza
+  los más líquidos primero, en vez de vigilar alfabéticamente los primeros
+  N — el spread/slippage en alts ilíquidos puede comerse cualquier ventaja
+  del filtro antes de que se mueva el precio (ver `RESEARCH.md` sección 5).
+- **Verificación de SL/TP post-orden**: tras cada entrada, `has_stop_and_take_profit()`
+  confirma que BingX aceptó de verdad las órdenes condicionales. Si no,
+  cierra la posición al instante en vez de dejarla desprotegida.
+- **Tope duro de posiciones** (`HARD_MAX_TOTAL_POSITIONS`): se comprueba
+  contra las posiciones reales en BingX, no el JSON local, así que protege
+  incluso si el estado se perdió en un redeploy sin Volume.
+- **`/emergency-stop/<secret>`**: pausa el trading y cierra TODAS las
+  posiciones reales de golpe, consultadas directamente a BingX.
+- **`/positions`**: muestra las posiciones reales en BingX ahora mismo, sin
+  pasar por el estado local — para verificar rápido sin depender de que el
+  bot tenga razón sobre lo que cree tener abierto.

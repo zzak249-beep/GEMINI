@@ -122,11 +122,55 @@ En orden de prioridad:
   baseline sin filtro) — es la prueba más barata y más informativa de si
   el "wavelet" aporta algo por encima de un cruce de medias con buena
   gestión de riesgo.
-- Si quieres una versión con wavelets reales (Daubechies db4, ortogonales,
-  con downsampling), eso requiere correrlas fuera de Pine (Python con
-  PyWavelets) porque Pine Script no tiene downsampling diádico nativo — se
-  podría hacer como un microservicio que TradingView consulta, o mover todo
-  el cálculo de señal al propio bot en Python (dejando TradingView solo como
-  fuente de velas via su API/exportación, o usando datos de BingX
-  directamente). Dilo si quieres que monte esa versión con PyWavelets real
-  corriendo dentro del propio bot de Railway en vez de en Pine.
+## 5. Lo que muestra tu cuenta real: ilíquidez, no falta de "más wavelet"
+
+Si tu cuenta tiene posiciones abiertas en símbolos como DRAM, FOGO,
+Zinc(XZN), ALLO, BLUAI, KGEN, OG, IN — eso es una señal en sí misma, y no
+buena. Son altcoins de capitalización pequeña/ilíquidos. En ese tipo de
+mercados:
+
+- **El spread bid/ask puede ser 0.2-1%+ por operación**, contra el 0.05%
+  de comisión que asume el backtest. Eso solo ya puede comerse todo el edge
+  teórico del filtro antes de que el precio se mueva nada.
+- **El slippage de una orden de mercado** en un libro fino puede ser
+  varias veces mayor que en BTC/ETH — la vela de 5m que ves en el gráfico
+  no representa bien a qué precio se ejecutó tu orden.
+- **El propio filtro "wavelet" puede disparar más en estos activos** porque
+  su volatilidad de baja liquidez genera saltos de precio que inflan la
+  energía de las escalas gruesas (coarse) tanto como la fina — recuerda el
+  punto 2.3 de este documento: eso es justo el tipo de ruido que el filtro
+  puede confundir con tendencia real.
+
+**Antes de buscar "cómo ganar más" ajustando el filtro**, lo más rentable
+casi seguro es restringir el universo a pares líquidos:
+
+```
+SYMBOLS=BTC-USDT,ETH-USDT,SOL-USDT,BNB-USDT,XRP-USDT
+```
+
+en vez de `SYMBOLS=ALL`. Menos señales, pero cada una con spread/slippage
+mucho más bajo — en la práctica esto suele importar más para la
+rentabilidad neta que cualquier ajuste de `k_dominance` o `lookback_energy`.
+
+## 6. Vías reales para mejorar la rentabilidad (en orden de impacto esperado)
+
+1. **Filtrar por liquidez antes que por señal.** Añade un filtro de volumen
+   mínimo en 24h (BingX lo da en `/openApi/swap/v2/quote/ticker`) y excluye
+   símbolos por debajo de un umbral, incluso en modo `SYMBOLS=ALL`. Esto es
+   más importante que cualquier parámetro del wavelet.
+2. **Funding rate.** Si mantienes una posición varias horas y el funding va
+   en tu contra, es un coste recurrente no modelado en el backtest de Pine.
+   Consulta `/openApi/swap/v2/quote/premiumIndex` antes de entrar y evita
+   entradas con funding muy desfavorable a tu dirección.
+3. **Comparar contra el baseline sin filtro** (punto 3.2 más arriba) — si
+   todavía no lo has hecho, es la prueba más barata para saber si el
+   "wavelet" aporta algo o si el edge (si lo hay) viene solo del cruce de
+   SMA con buen SL/TP en ATR.
+4. **Tamaño de muestra real.** Antes de sacar conclusiones sobre si "gana
+   más" o "gana menos", necesitas semanas de datos con capital real pequeño,
+   no unas pocas docenas de operaciones — con la varianza de un sistema
+   intradía en 5m, unas pocas operaciones no dicen casi nada.
+5. **No hay atajo matemático que sustituya a esto.** Ninguna variante del
+   filtro (más escalas, Daubechies real, etc.) arregla comisión+spread+
+   slippage en activos ilíquidos — eso hay que resolverlo con selección de
+   universo y sizing, no con más sofisticación en la señal.

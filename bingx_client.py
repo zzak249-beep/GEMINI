@@ -32,10 +32,25 @@ class BingXClient:
         # X-BX-APIKEY con un ValueError críptico en pleno reconcile/entrada.
         self.api_key = (api_key or config.BINGX_API_KEY or "").strip()
         self.api_secret = (api_secret or config.BINGX_API_SECRET or "").strip()
-        self.base_url = (base_url or config.BINGX_BASE_URL or "").strip()
+
+        # IMPORTANTE: BingX usa una URL DISTINTA para demo (VST) que para
+        # producción real. Si el caller no pasa base_url explícitamente,
+        # se resuelve según BINGX_DEMO -- así BINGX_DEMO=true de verdad
+        # apunta a dinero simulado, no solo a una etiqueta sin efecto.
+        if base_url:
+            self.base_url = base_url.strip()
+        elif config.BINGX_DEMO:
+            self.base_url = "https://open-api-vst.bingx.com"
+        else:
+            self.base_url = (config.BINGX_BASE_URL or "https://open-api.bingx.com").strip()
+
         self._filters_cache = {}  # symbol -> (fetched_at, filters_dict)
         if not self.api_key or not self.api_secret:
             log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas.")
+        log.info(
+            "BingXClient inicializado contra %s (%s)",
+            self.base_url, "DEMO/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL",
+        )
 
     # ------------------------------------------------------------------ #
     def _signed_request(self, method: str, path: str, params: dict):
@@ -147,6 +162,30 @@ class BingXClient:
             )
         return self._signed_request("POST", "/openApi/swap/v2/trade/order", params)
 
+    def get_open_orders(self, symbol: str):
+        """Órdenes abiertas (incluye las condicionales de SL/TP) para un
+        símbolo. Se usa justo después de abrir una posición para confirmar
+        que el SL/TP realmente se adjuntó -- si BingX lo rechaza en
+        silencio, la posición queda desprotegida y nunca se cierra sola."""
+        data = self._signed_request(
+            "GET", "/openApi/swap/v2/trade/openOrders", {"symbol": symbol}
+        )
+        orders = data if isinstance(data, list) else data.get("orders", [])
+        return orders
+
+    def has_stop_and_take_profit(self, symbol: str) -> bool:
+        """True si hay al menos una orden STOP_MARKET/STOP y una
+        TAKE_PROFIT_MARKET/TAKE_PROFIT abiertas para el símbolo."""
+        try:
+            orders = self.get_open_orders(symbol)
+        except Exception:
+            log.exception("No se pudo verificar SL/TP de %s tras abrir la orden", symbol)
+            return False
+        types = {o.get("type", "").upper() for o in orders}
+        has_sl = any("STOP" in t and "TAKE" not in t for t in types)
+        has_tp = any("TAKE" in t for t in types)
+        return has_sl and has_tp
+
     def close_position(self, symbol: str, position_side: str, quantity: float):
         """Cierra con una orden de mercado reduceOnly en sentido contrario."""
         side = "SELL" if position_side == "LONG" else "BUY"
@@ -255,3 +294,35 @@ class BingXClient:
     def get_realized_pnl_since(self, symbol: str, start_time_ms: int = None) -> float:
         rows = self.get_income(symbol, "REALIZED_PNL", start_time_ms)
         return sum(float(r.get("income", 0)) for r in rows)
+
+    # ------------------------------------------------------------------ #
+    # Liquidez — para filtrar símbolos ilíquidos ANTES de operarlos, no
+    # después de comerse el spread. BingX exige firma incluso en este
+    # endpoint de datos de mercado.
+    # ------------------------------------------------------------------ #
+    def get_all_tickers(self):
+        """Estadísticas de 24h de todos los símbolos (precio, volumen...).
+        Se usa para filtrar por liquidez antes de vigilar/operar un símbolo."""
+        data = self._signed_request("GET", "/openApi/swap/v2/quote/ticker", {})
+        return data if isinstance(data, list) else data.get("tickers", [])
+
+    def get_24h_quote_volumes(self) -> dict:
+        """symbol -> volumen en USDT de las últimas 24h (0 si no se puede
+        determinar). Prueba varios nombres de campo porque la documentación
+        pública de BingX no siempre es consistente entre versiones."""
+        volumes = {}
+        try:
+            tickers = self.get_all_tickers()
+        except Exception:
+            log.exception("No se pudieron leer los tickers de 24h para filtrar liquidez")
+            return volumes
+        for t in tickers:
+            sym = t.get("symbol")
+            if not sym:
+                continue
+            vol = t.get("quoteVolume") or t.get("quoteVol") or t.get("volume") or 0
+            try:
+                volumes[sym] = float(vol)
+            except (TypeError, ValueError):
+                volumes[sym] = 0.0
+        return volumes
