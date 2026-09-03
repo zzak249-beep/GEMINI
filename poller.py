@@ -100,7 +100,39 @@ def _build_alert(symbol: str, signal: dict):
     }
 
 
+# Recuerda el último motivo de pausa ya notificado, para avisar por Telegram
+# UNA vez por cada vez que el circuit breaker cambia de estado -- no una vez
+# por cada símbolo bloqueado en el ciclo (con SYMBOLS=ALL eso son ~150
+# mensajes idénticos seguidos en Telegram).
+_last_halt_notice = {"reason": None}
+
+
 def job_generate_signals(main_module, bx, state):
+    # Chequeo del circuit breaker UNA sola vez al principio del ciclo, antes
+    # de tocar ningún símbolo -- si está pausado, no tiene sentido gastar
+    # llamadas a BingX calculando señales que _handle_entry va a rechazar
+    # igualmente por cada uno de los símbolos vigilados.
+    try:
+        equity = bx.get_balance()
+        allowed, reason = state.check_circuit_breaker(equity)
+    except Exception:
+        log.exception("No se pudo comprobar el circuit breaker antes de generar señales; se continúa el ciclo")
+        allowed, reason = True, None
+
+    if not allowed:
+        if _last_halt_notice["reason"] != reason:
+            telegram_notifier.send(
+                f"⛔ Trading pausado (circuit breaker): {reason}. "
+                f"Generación de señales en pausa hasta que se reactive."
+            )
+            _last_halt_notice["reason"] = reason
+        else:
+            log.info("Circuit breaker sigue activo (%s) -- ciclo de señales saltado sin repetir aviso", reason)
+        return
+    elif _last_halt_notice["reason"] is not None:
+        telegram_notifier.send("✅ Circuit breaker reactivado -- generación de señales reanudada.")
+        _last_halt_notice["reason"] = None
+
     symbols = _resolve_symbols(bx)
     if not symbols:
         log.warning("Sin símbolos que vigilar este ciclo (lista vacía)")
