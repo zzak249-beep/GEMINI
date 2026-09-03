@@ -13,6 +13,7 @@ import os
 import threading
 
 import config
+import telegram_notifier
 
 log = logging.getLogger("state")
 
@@ -136,9 +137,43 @@ class StateManager:
         for sym in live_symbols - local_symbols:
             log.warning("Reconciliación: %s abierta en BingX pero no en estado local, se importa", sym)
             p = live_by_symbol[sym]
+            position_side = p.get("positionSide", "LONG")
+            qty = abs(float(p.get("positionAmt", 0)))
+
+            # Antes de darla por buena, confirma que de verdad tiene SL/TP
+            # activo en BingX -- mismo hueco que cubre _handle_entry justo
+            # tras abrir una orden. Si el proceso murió entre abrir la orden
+            # y esa verificación, y luego reinicia, reconcile() la importaría
+            # como "todo en orden" sin comprobar nada -- dejando una posición
+            # real desprotegida marcada como si estuviera bien.
+            try:
+                protected = bingx_client.has_stop_and_take_profit(sym)
+            except Exception:
+                protected = False
+                log.exception("No se pudo verificar SL/TP de %s al importarla en reconciliación", sym)
+
+            if not protected:
+                log.error(
+                    "%s encontrada al arrancar SIN SL/TP confirmado -- cerrando inmediatamente por seguridad",
+                    sym,
+                )
+                try:
+                    bingx_client.close_position(sym, position_side, qty)
+                    telegram_notifier.send(
+                        f"🚨 *{sym}*: encontrada abierta al arrancar el bot SIN SL/TP confirmado "
+                        f"(probable corte justo tras abrir la orden en el arranque anterior). "
+                        f"Se cerró de inmediato por seguridad."
+                    )
+                except Exception as e:
+                    telegram_notifier.send(
+                        f"🚨🚨 *{sym}*: encontrada sin SL/TP al arrancar y el cierre de emergencia "
+                        f"también falló: {e}. REVISA BINGX A MANO AHORA."
+                    )
+                continue  # no se añade al estado local, ya se cerró (o falló y se avisó)
+
             self.state["positions"][sym] = {
-                "positionSide": p.get("positionSide", "LONG"),
-                "qty": abs(float(p.get("positionAmt", 0))),
+                "positionSide": position_side,
+                "qty": qty,
                 "entry_price": float(p.get("avgPrice", 0)),
                 "sl": None,
                 "tp": None,
