@@ -6,6 +6,8 @@ Dos trabajos periódicos:
      filtro Wavelet MRA Haar sobre velas de BingX (signal_engine) para cada
      símbolo en config.SYMBOLS, y si hay señal la procesa exactamente igual
      que si hubiera llegado por webhook (reutiliza main._handle_entry).
+     Si el circuit breaker está activo NO se ejecuta la entrada, pero la
+     señal se sigue enviando a Telegram como informativa.
   2. job_reconcile_closed_positions: cada pocos minutos comprueba si alguna
      posición local ya no existe en BingX (se cerró sola por el SL/TP
      embebido en la orden), calcula el PnL realizado real vía el endpoint
@@ -100,43 +102,23 @@ def _build_alert(symbol: str, signal: dict):
     }
 
 
-# Recuerda el último motivo de pausa ya notificado, para avisar por Telegram
-# UNA vez por cada vez que el circuit breaker cambia de estado -- no una vez
-# por cada símbolo bloqueado en el ciclo (con SYMBOLS=ALL eso son ~150
-# mensajes idénticos seguidos en Telegram).
-_last_halt_notice = {"reason": None}
-
-
 def job_generate_signals(main_module, bx, state):
-    # Chequeo del circuit breaker UNA sola vez al principio del ciclo, antes
-    # de tocar ningún símbolo -- si está pausado, no tiene sentido gastar
-    # llamadas a BingX calculando señales que _handle_entry va a rechazar
-    # igualmente por cada uno de los símbolos vigilados.
-    try:
-        equity = bx.get_balance()
-        allowed, reason = state.check_circuit_breaker(equity)
-    except Exception:
-        log.exception("No se pudo comprobar el circuit breaker antes de generar señales; se continúa el ciclo")
-        allowed, reason = True, None
-
-    if not allowed:
-        if _last_halt_notice["reason"] != reason:
-            telegram_notifier.send(
-                f"⛔ Trading pausado (circuit breaker): {reason}. "
-                f"Generación de señales en pausa hasta que se reactive."
-            )
-            _last_halt_notice["reason"] = reason
-        else:
-            log.info("Circuit breaker sigue activo (%s) -- ciclo de señales saltado sin repetir aviso", reason)
-        return
-    elif _last_halt_notice["reason"] is not None:
-        telegram_notifier.send("✅ Circuit breaker reactivado -- generación de señales reanudada.")
-        _last_halt_notice["reason"] = None
-
     symbols = _resolve_symbols(bx)
     if not symbols:
         log.warning("Sin símbolos que vigilar este ciclo (lista vacía)")
         return
+
+    # El circuit breaker se consulta UNA vez por ciclo, no por símbolo: si
+    # está activo NO se abre ninguna posición, pero el escaneo continúa y
+    # cada señal se manda a Telegram como informativa. Así el breaker deja
+    # de silenciar el flujo de señales -- solo corta la ejecución, que es
+    # lo que debe proteger.
+    halted = bool(state.state.get("trading_halted"))
+    if halted:
+        log.info(
+            "Circuit breaker activo (%s) -- este ciclo genera señales SOLO informativas, no se ejecuta nada",
+            state.state.get("halt_reason"),
+        )
 
     for symbol in symbols:
         try:
@@ -167,7 +149,20 @@ def job_generate_signals(main_module, bx, state):
             alert = _build_alert(symbol, sig)
             log.info("Señal generada para %s: %s", symbol, alert)
             state.set_last_signal_ts(symbol, sig["timestamp"])
-            main_module._handle_entry(alert)
+
+            if halted:
+                telegram_notifier.send(
+                    telegram_notifier.format_entry_signal(
+                        alert,
+                        executed=False,
+                        error=(
+                            f"circuit breaker activo ({state.state.get('halt_reason')}) "
+                            f"— señal informativa, no se ha ejecutado"
+                        ),
+                    )
+                )
+            else:
+                main_module._handle_entry(alert)
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:
