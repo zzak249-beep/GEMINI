@@ -322,19 +322,6 @@ def _handle_entry(alert: dict):
         )
         return
 
-    # Comprobación de margen: evita mandar una orden que BingX rechazaría
-    # por fondos insuficientes (o que consumiría casi todo el margen
-    # disponible sin que quede colchón para el resto de posiciones).
-    required_margin = (qty * price) / max(config.LEVERAGE, 1)
-    if required_margin > equity * 0.95:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False,
-                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT, equity {equity:.2f} USDT)",
-            )
-        )
-        return
-
     # Fuerza margen ISOLATED explícitamente: si la cuenta BingX tiene el modo
     # por defecto en CROSS, una pérdida grande en esta posición podría comerse
     # margen de OTRAS posiciones/todo el equity, no solo lo previsto por
@@ -349,8 +336,45 @@ def _handle_entry(alert: dict):
             symbol,
         )
 
+    # Fija el leverage ANTES de calcular el margen requerido, y usa el valor
+    # que BingX confirma en la respuesta -- no config.LEVERAGE a ciegas.
+    # Algunos símbolos (sobre todo en SYMBOLS=ALL, altcoins poco comunes)
+    # tienen un tope de apalancamiento propio menor al pedido; si se asume
+    # que se aplicó el LEVERAGE de config y BingX en realidad usó menos, el
+    # cálculo local de margen sale bien pero BingX exige mucho más margen
+    # real al mandar la orden -- de ahí los rechazos "insufficient margin"
+    # aunque el chequeo local decía que sobraba equity.
+    actual_leverage = config.LEVERAGE
     try:
-        bx.set_leverage(symbol, position_side, config.LEVERAGE)
+        lev_resp = bx.set_leverage(symbol, position_side, config.LEVERAGE)
+        confirmed = None
+        if isinstance(lev_resp, dict):
+            confirmed = lev_resp.get("leverage") or lev_resp.get("longLeverage") or lev_resp.get("shortLeverage")
+        if confirmed:
+            actual_leverage = float(confirmed)
+            if actual_leverage != config.LEVERAGE:
+                log.warning(
+                    "%s: BingX confirmó leverage=%s (pedido %s) -- se recalcula el margen con el real",
+                    symbol, actual_leverage, config.LEVERAGE,
+                )
+    except Exception as e:
+        log.warning("No se pudo fijar/confirmar leverage para %s (%s) -- se asume config.LEVERAGE=%s",
+                    symbol, e, config.LEVERAGE)
+
+    # Comprobación de margen: evita mandar una orden que BingX rechazaría
+    # por fondos insuficientes (o que consumiría casi todo el margen
+    # disponible sin que quede colchón para el resto de posiciones).
+    required_margin = (qty * price) / max(actual_leverage, 1)
+    if required_margin > equity * 0.95:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT con leverage {actual_leverage}x, equity {equity:.2f} USDT)",
+            )
+        )
+        return
+
+    try:
         bx.place_market_order(
             symbol, side, position_side, qty, stop_loss=sl, take_profit=tp
         )
