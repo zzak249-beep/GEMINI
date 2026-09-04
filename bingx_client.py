@@ -19,6 +19,10 @@ TIMEOUT = 15
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 0.6
 
+# Este bot opera la cuenta en modo HEDGE (positionSide=LONG/SHORT explícito).
+# Se puede forzar One-Way con HEDGE_MODE=false en el entorno.
+HEDGE_MODE = bool(getattr(config, "HEDGE_MODE", True))
+
 
 class BingXError(Exception):
     pass
@@ -47,8 +51,10 @@ class BingXClient:
         if not self.api_key or not self.api_secret:
             log.warning("BINGX_API_KEY / BINGX_API_SECRET no configuradas.")
         log.info(
-            "BingXClient inicializado contra %s (%s)",
-            self.base_url, "DEMO/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL",
+            "BingXClient inicializado contra %s (%s) | modo posición: %s",
+            self.base_url,
+            "DEMO/VST" if config.BINGX_DEMO else "PRODUCCIÓN REAL",
+            "HEDGE" if HEDGE_MODE else "ONE-WAY",
         )
 
     # ------------------------------------------------------------------ #
@@ -128,6 +134,34 @@ class BingXClient:
         data = self._signed_request("GET", "/openApi/swap/v2/user/positions", params)
         return data if isinstance(data, list) else data.get("positions", [])
 
+    def get_position_amt(self, symbol: str, position_side: str) -> float:
+        """Tamaño REAL de la posición abierta en BingX para ese símbolo y
+        lado, en valor absoluto. 0.0 si no hay nada abierto.
+
+        Se usa para cerrar: nunca hay que cerrar con la cantidad calculada
+        al abrir. Puede diferir por fills parciales, cierres manuales
+        previos o un SL/TP que ya redujo parte de la posición — y una
+        cantidad mayor que la real hace que BingX rechace la orden o, peor,
+        abra posición en sentido contrario.
+        """
+        try:
+            positions = self.get_positions(symbol)
+        except Exception:
+            log.exception("No se pudo leer la posición real de %s", symbol)
+            return 0.0
+        wanted = (position_side or "").upper()
+        for p in positions:
+            if str(p.get("symbol")) != symbol:
+                continue
+            side = str(p.get("positionSide", "")).upper()
+            amt = float(p.get("positionAmt", 0) or 0)
+            if amt == 0:
+                continue
+            if HEDGE_MODE and side and side != wanted:
+                continue
+            return abs(amt)
+        return 0.0
+
     def set_leverage(self, symbol: str, side: str, leverage: int):
         """side: 'LONG' o 'SHORT' (modo hedge, que es el que usa este bot)."""
         return self._signed_request(
@@ -160,14 +194,17 @@ class BingXClient:
             "type": "MARKET",
             "quantity": quantity,
         }
-        # En modo Hedge (positionSide=LONG/SHORT, el que usa este bot),
-        # BingX rechaza la orden con error 109400 "In the Hedge mode, the
-        # 'ReduceOnly' field can not be filled" si el campo va presente al
-        # ABRIR -- da igual que sea "true" o "false", solo con que exista
-        # ya falla. Solo se manda cuando de verdad se está cerrando
-        # (close_position lo pasa como reduce_only=True); en una entrada
-        # nueva se omite del todo.
-        if reduce_only:
+        # En modo HEDGE, BingX rechaza con error 109400 ("In the Hedge mode,
+        # the 'ReduceOnly' field can not be filled") CUALQUIER orden que
+        # lleve el campo reduceOnly -- al abrir Y al cerrar, con valor
+        # "true" o "false", solo por estar presente.
+        #
+        # Y no hace ninguna falta: en hedge, la combinación side + positionSide
+        # ya determina unívocamente que se reduce. SELL+positionSide=LONG
+        # solo puede cerrar el largo; nunca abre un corto. El campo se manda
+        # únicamente en One-Way (HEDGE_MODE=false), donde sí es necesario
+        # para no darle la vuelta a la posición.
+        if reduce_only and not HEDGE_MODE:
             params["reduceOnly"] = "true"
         if stop_loss:
             params["stopLoss"] = (
@@ -205,20 +242,92 @@ class BingXClient:
         has_tp = any("TAKE" in t for t in types)
         return has_sl and has_tp
 
-    def close_position(self, symbol: str, position_side: str, quantity: float):
-        """Cierra con una orden de mercado reduceOnly en sentido contrario."""
+    def cancel_all_open_orders(self, symbol: str):
+        """Cancela las órdenes abiertas del símbolo (SL/TP condicionales
+        incluidos). Tras cerrar una posición hay que llamarla: si no, las
+        condicionales huérfanas se quedan vivas y pueden dispararse más
+        tarde ABRIENDO una posición nueva no deseada."""
+        return self._signed_request(
+            "POST", "/openApi/swap/v2/trade/allOpenOrders", {"symbol": symbol}
+        )
+
+    def close_position(self, symbol: str, position_side: str, quantity: float = None):
+        """Cierra a mercado con la orden contraria.
+
+        quantity=None (recomendado) lee el tamaño REAL de la posición en
+        BingX en vez de fiarse del tamaño calculado al abrir.
+        Devuelve None si no hay nada que cerrar -- así el caller no
+        interpreta "no había posición" como "el cierre falló".
+        """
+        position_side = (position_side or "").upper()
+        if quantity is None:
+            quantity = self.get_position_amt(symbol, position_side)
+        quantity = abs(float(quantity or 0))
+        if quantity <= 0:
+            log.info("%s (%s): no hay posición abierta que cerrar", symbol, position_side)
+            return None
+
+        quantity = self.round_qty(symbol, quantity)
         side = "SELL" if position_side == "LONG" else "BUY"
         return self.place_market_order(
             symbol, side, position_side, quantity, reduce_only=True
         )
 
+    def close_position_and_verify(self, symbol: str, position_side: str,
+                                   quantity: float = None, retries: int = 2):
+        """Cierra y COMPRUEBA contra BingX que la posición quedó en cero,
+        cancelando después las condicionales huérfanas.
+
+        Un 'ok' de la API no garantiza el cierre: la orden puede quedar
+        parcialmente ejecutada. Devuelve True solo si positionAmt llega a 0.
+        """
+        position_side = (position_side or "").upper()
+        for attempt in range(1, retries + 2):
+            try:
+                self.close_position(symbol, position_side, quantity)
+            except Exception:
+                log.exception(
+                    "%s (%s): fallo enviando el cierre (intento %d)",
+                    symbol, position_side, attempt,
+                )
+            time.sleep(1.0)
+            restante = self.get_position_amt(symbol, position_side)
+            if restante <= 0:
+                try:
+                    self.cancel_all_open_orders(symbol)
+                except Exception:
+                    log.warning("%s: posición cerrada pero no se pudieron cancelar "
+                                "las órdenes condicionales huérfanas", symbol)
+                log.info("%s (%s): posición cerrada y verificada", symbol, position_side)
+                return True
+            log.warning(
+                "%s (%s): tras el cierre siguen abiertos %s -- reintentando",
+                symbol, position_side, restante,
+            )
+            quantity = None  # releer el tamaño real en el siguiente intento
+        log.error("%s (%s): NO se pudo cerrar la posición tras %d intentos",
+                  symbol, position_side, retries + 1)
+        return False
+
     def get_symbol_filters(self, symbol: str):
-        """Precisión de cantidad/precio para el símbolo (evita rechazos por decimales)."""
+        """Precisión de cantidad/precio para el símbolo (evita rechazos por decimales).
+
+        Se filtra por símbolo sobre la respuesta: este endpoint puede
+        devolver la lista completa de contratos aunque se le pase symbol,
+        y coger items[0] a ciegas daría la precisión de OTRO símbolo --
+        con lo que la cantidad se redondea mal y BingX rechaza la orden.
+        """
         data = self._signed_request(
             "GET", "/openApi/swap/v2/quote/contracts", {"symbol": symbol}
         )
         items = data if isinstance(data, list) else [data]
-        return items[0] if items else {}
+        for item in items:
+            if isinstance(item, dict) and item.get("symbol") == symbol:
+                return item
+        if len(items) == 1 and isinstance(items[0], dict):
+            return items[0]
+        log.warning("No se encontró el contrato %s en la respuesta de BingX", symbol)
+        return {}
 
     def get_symbol_filters_cached(self, symbol: str, ttl_seconds: int = 3600):
         """Igual que get_symbol_filters pero cacheado en memoria (evita una
