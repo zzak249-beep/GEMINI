@@ -1,10 +1,17 @@
 """
-Persistencia JSON del estado del bot (posiciones abiertas conocidas,
-racha de pérdidas, equity de referencia diaria) + reconciliación contra
-BingX al arrancar + circuit breaker.
+state_manager.py — Persistencia JSON del estado del bot (posiciones
+abiertas conocidas, racha de pérdidas, equity de referencia diaria) +
+reconciliación contra BingX al arrancar + circuit breaker.
 
 Sigue el mismo patrón que el resto de la flota: todo lo que debe
 sobrevivir a un restart de Railway se guarda en disco en JSON.
+
+ÁMBITO (cambio importante): esta cuenta de BingX la comparten varios
+bots y operativa manual del usuario. Todo lo que este módulo GESTIONA
+—cerrar por falta de SL, contar para los límites, calcular la racha de
+pérdidas— se limita a las posiciones que ESTE bot abrió y registró en
+state["positions"]. Lo que aparezca en BingX y no esté aquí se reporta,
+pero NO se toca: cerrarlo sería destruir operativa ajena.
 """
 import datetime as dt
 import json
@@ -29,6 +36,16 @@ _DEFAULT_STATE = {
     "last_signal_ts": {},      # symbol -> open_time (ms) de la última señal disparada
     "last_income_check_ts": {},  # symbol -> desde cuándo mirar PnL realizado
 }
+
+
+def _utc_today() -> str:
+    """El día de referencia va en UTC, no en hora local del contenedor.
+
+    dt.date.today() depende de la zona horaria donde Railway levante el
+    contenedor, así que el 'día' del circuit breaker podía empezar a una
+    hora distinta que el del resto de la flota — y cambiar sin avisar si
+    el contenedor migraba de región."""
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
 
 
 def _load_raw():
@@ -92,6 +109,37 @@ class StateManager:
     def open_count(self):
         return len(self.state["positions"])
 
+    def is_ours(self, symbol) -> bool:
+        """True si este bot abrió y registró esa posición."""
+        return symbol in self.state.get("positions", {})
+
+    def count_own_live_positions(self, bingx_client) -> int:
+        """Cuántas posiciones REALES en BingX son de este bot.
+
+        Reemplaza al conteo de toda la cuenta que usaba
+        HARD_MAX_TOTAL_POSITIONS: con varios bots y operativa manual
+        compartiendo cuenta, contar todo bloqueaba este bot por
+        posiciones que no eran suyas. Sigue consultando el exchange (no
+        solo el JSON) para que el tope siga siendo real aunque el estado
+        local mienta, pero filtrando por lo que es nuestro.
+        """
+        nuestros = set(self.state.get("positions", {}).keys())
+        if not nuestros:
+            return 0
+        try:
+            live = bingx_client.get_positions()
+        except Exception:
+            log.exception("No se pudieron leer posiciones para contar las propias")
+            # Ante la duda, el JSON local es el límite: nunca devolver 0
+            # (eso permitiría saltarse el tope justo cuando falla la API).
+            return len(nuestros)
+        n = 0
+        for p in live:
+            amt = float(p.get("positionAmt", p.get("positionSize", 0)) or 0)
+            if amt != 0 and p.get("symbol") in nuestros:
+                n += 1
+        return n
+
     # -- cooldown de señales (equivalente a can_signal / last_signal_bar de Pine) --
     def get_last_signal_ts(self, symbol):
         return self.state.get("last_signal_ts", {}).get(symbol)
@@ -113,7 +161,18 @@ class StateManager:
     # -- reconciliación con el exchange al arrancar --------------------------
     def reconcile(self, bingx_client):
         """Compara el estado local con las posiciones reales en BingX.
-        Prioriza siempre lo que diga el exchange (fuente de verdad)."""
+
+        Reglas de ámbito:
+          - Registrada aquí y ya no está en BingX -> se elimina del estado.
+          - Registrada aquí y sigue viva SIN SL/TP -> se cierra (es nuestra,
+            y una posición nuestra desprotegida es exactamente lo que este
+            mecanismo existe para evitar).
+          - En BingX pero NO registrada aquí -> NO SE TOCA. Se reporta y ya.
+            Puede ser de otro bot de la flota o una operación manual del
+            usuario; la versión anterior las importaba y, si no tenían
+            SL/TP, las CERRABA. Eso llegó a intentar cerrar operativa manual
+            del usuario y solo falló por un error de la API.
+        """
         try:
             live_positions = bingx_client.get_positions()
         except Exception:
@@ -130,68 +189,87 @@ class StateManager:
         local_symbols = set(self.state["positions"].keys())
         live_symbols = set(live_by_symbol.keys())
 
+        # 1. Nuestras que ya no existen -> fuera del estado.
         for sym in local_symbols - live_symbols:
             log.warning("Reconciliación: %s ya no existe en BingX, se elimina del estado local", sym)
             self.state["positions"].pop(sym, None)
 
-        for sym in live_symbols - local_symbols:
-            log.warning("Reconciliación: %s abierta en BingX pero no en estado local, se importa", sym)
-            p = live_by_symbol[sym]
-            position_side = p.get("positionSide", "LONG")
-            qty = abs(float(p.get("positionAmt", 0)))
-
-            # Antes de darla por buena, confirma que de verdad tiene SL/TP
-            # activo en BingX -- mismo hueco que cubre _handle_entry justo
-            # tras abrir una orden. Si el proceso murió entre abrir la orden
-            # y esa verificación, y luego reinicia, reconcile() la importaría
-            # como "todo en orden" sin comprobar nada -- dejando una posición
-            # real desprotegida marcada como si estuviera bien.
+        # 2. Nuestras que siguen vivas -> verificar que están protegidas.
+        for sym in local_symbols & live_symbols:
             try:
                 protected = bingx_client.has_stop_and_take_profit(sym)
             except Exception:
                 protected = False
-                log.exception("No se pudo verificar SL/TP de %s al importarla en reconciliación", sym)
+                log.exception("No se pudo verificar SL/TP de %s al reconciliar", sym)
+            if protected:
+                continue
 
-            if not protected:
-                log.error(
-                    "%s encontrada al arrancar SIN SL/TP confirmado -- cerrando inmediatamente por seguridad",
-                    sym,
+            p = live_by_symbol[sym]
+            position_side = p.get("positionSide", self.state["positions"][sym].get("positionSide", "LONG"))
+            qty = abs(float(p.get("positionAmt", 0) or 0))
+            log.error("%s (nuestra) sigue abierta SIN SL/TP -- cerrando por seguridad", sym)
+            try:
+                bingx_client.close_position(sym, position_side, qty)
+                self.state["positions"].pop(sym, None)
+                telegram_notifier.send(
+                    f"🚨 *{sym}*: posición de ESTE bot encontrada sin SL/TP al arrancar "
+                    f"(probable corte justo tras abrir la orden). Cerrada por seguridad."
                 )
-                try:
-                    bingx_client.close_position(sym, position_side, qty)
-                    telegram_notifier.send(
-                        f"🚨 *{sym}*: encontrada abierta al arrancar el bot SIN SL/TP confirmado "
-                        f"(probable corte justo tras abrir la orden en el arranque anterior). "
-                        f"Se cerró de inmediato por seguridad."
-                    )
-                except Exception as e:
-                    telegram_notifier.send(
-                        f"🚨🚨 *{sym}*: encontrada sin SL/TP al arrancar y el cierre de emergencia "
-                        f"también falló: {e}. REVISA BINGX A MANO AHORA."
-                    )
-                continue  # no se añade al estado local, ya se cerró (o falló y se avisó)
+            except Exception as e:
+                telegram_notifier.send(
+                    f"🚨🚨 *{sym}*: posición de ESTE bot sin SL/TP y el cierre falló: {e}. "
+                    f"REVISA BINGX A MANO AHORA."
+                )
 
-            self.state["positions"][sym] = {
-                "positionSide": position_side,
-                "qty": qty,
-                "entry_price": float(p.get("avgPrice", 0)),
-                "sl": None,
-                "tp": None,
-                "opened_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                "imported_on_reconcile": True,
-            }
+        # 3. Ajenas -> solo informar. NUNCA cerrar ni importar.
+        ajenas = live_symbols - local_symbols
+        if ajenas:
+            sin_sl = []
+            for sym in sorted(ajenas):
+                try:
+                    if not bingx_client.has_stop_and_take_profit(sym):
+                        sin_sl.append(sym)
+                except Exception:
+                    log.exception("No se pudo comprobar SL/TP de la posición ajena %s", sym)
+            log.warning(
+                "Reconciliación: %d posiciones abiertas en BingX que NO son de este bot "
+                "(otro bot de la flota u operativa manual). No se tocan: %s",
+                len(ajenas), sorted(ajenas),
+            )
+            msg = (
+                f"ℹ️ {len(ajenas)} posiciones abiertas en la cuenta que NO son de este bot; "
+                f"no se van a tocar: {sorted(ajenas)}"
+            )
+            if sin_sl:
+                msg += (
+                    f"\n⚠️ De esas, sin SL/TP: {sin_sl}. Este bot NO las cierra — "
+                    f"revísalas tú en BingX si te interesan."
+                )
+            telegram_notifier.send(msg)
+
         self._save()
 
     # -- circuit breaker ------------------------------------------------------
     def refresh_daily_anchor(self, current_equity: float):
-        today = dt.date.today().isoformat()
+        """Fija el equity de referencia del día y levanta el halt al cambiar
+        de día. Idempotente: si ya es el día correcto no toca nada."""
+        today = _utc_today()
+        cambio = False
         with _lock:
             if self.state.get("daily_date") != today:
                 self.state["daily_date"] = today
                 self.state["daily_start_equity"] = current_equity
                 self.state["trading_halted"] = False
                 self.state["halt_reason"] = None
-        self._save()
+                cambio = True
+            elif self.state.get("daily_start_equity") in (None, 0):
+                # Ancla ausente o corrupta: sin esto el drawdown se calcula
+                # contra None y el breaker se queda pillado sin motivo real.
+                self.state["daily_start_equity"] = current_equity
+                cambio = True
+        if cambio:
+            self._save()
+            log.info("Ancla diaria fijada: %s equity=%.4f", today, current_equity)
 
     def check_circuit_breaker(self, current_equity: float) -> (bool, str):
         """Devuelve (permitido, motivo_si_no_permitido)."""
@@ -209,7 +287,10 @@ class StateManager:
         if start_equity > 0:
             drawdown_pct = (start_equity - current_equity) / start_equity * 100
             if drawdown_pct >= config.MAX_DAILY_DRAWDOWN_PCT:
-                reason = f"drawdown diario {drawdown_pct:.2f}% (límite {config.MAX_DAILY_DRAWDOWN_PCT}%)"
+                reason = (
+                    f"drawdown diario {drawdown_pct:.2f}% (límite {config.MAX_DAILY_DRAWDOWN_PCT}%). "
+                    f"OJO: el equity es de TODA la cuenta, así que incluye otros bots y operativa manual"
+                )
                 self._halt(reason)
                 return False, reason
 
@@ -222,9 +303,16 @@ class StateManager:
         self._save()
         log.error("CIRCUIT BREAKER ACTIVADO: %s", reason)
 
-    def manual_reset_breaker(self):
+    def manual_reset_breaker(self, reanclar_equity: float = None):
+        """Levanta el halt. Si se pasa reanclar_equity, además mueve el ancla
+        diaria al equity actual: sin eso, un reset con la cuenta ya caída
+        vuelve a disparar el breaker en la siguiente señal, porque el
+        drawdown se sigue midiendo contra el equity de antes de la caída."""
         with _lock:
             self.state["trading_halted"] = False
             self.state["halt_reason"] = None
             self.state["consecutive_losses"] = 0
+            if reanclar_equity is not None:
+                self.state["daily_date"] = _utc_today()
+                self.state["daily_start_equity"] = reanclar_equity
         self._save()
