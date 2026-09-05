@@ -2,7 +2,7 @@
 Generador de señales en background — sustituye a las alertas de TradingView.
 
 Dos trabajos periódicos:
-  1. job_generate_signals: cada vez que cierra una vela de 5m, calcula el
+  1. job_generate_signals: cada vez que cierra una vela, calcula el
      filtro Wavelet MRA Haar sobre velas de BingX (signal_engine) para cada
      símbolo en config.SYMBOLS, y si hay señal la procesa exactamente igual
      que si hubiera llegado por webhook (reutiliza main._handle_entry).
@@ -12,7 +12,20 @@ Dos trabajos periódicos:
      posición local ya no existe en BingX (se cerró sola por el SL/TP
      embebido en la orden), calcula el PnL realizado real vía el endpoint
      de income, y actualiza el circuit breaker + avisa por Telegram.
+
+DOS CORRECCIONES respecto a la versión anterior:
+  - El PnL realizado se pedía desde `None` en el primer cierre de cada
+    símbolo tras un despliegue, lo que sumaba el histórico ENTERO de ese
+    símbolo (incluidas operaciones manuales anteriores en esta cuenta
+    compartida) y se lo atribuía a la operación recién cerrada. Ese número
+    alimenta consecutive_losses, así que calibraba mal el circuit breaker.
+    Ahora la ventana arranca en el opened_at de la posición.
+  - La temporalidad estaba escrita a mano en tres sitios ("5m", el
+    5*60*1000 del descarte de vela en curso y el bar_ms de _params()),
+    mientras la variable TIMEFRAME de Railway no la leía nadie. Ahora sale
+    toda de config.
 """
+import datetime as dt
 import logging
 import time
 
@@ -27,6 +40,20 @@ import telegram_notifier
 log = logging.getLogger("poller")
 
 _symbols_cache = {"resolved_at": 0, "symbols": []}
+
+
+def timeframe_to_ms(timeframe: str) -> int:
+    """'5m' -> 300000. Una sola definición para todo el módulo."""
+    unit = timeframe[-1].lower()
+    value = int(timeframe[:-1])
+    mult = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}.get(unit)
+    if mult is None:
+        raise ValueError(f"Timeframe no soportado: {timeframe}")
+    return value * mult
+
+
+TIMEFRAME = getattr(config, "SIGNAL_TIMEFRAME", "5m")
+BAR_MS = timeframe_to_ms(TIMEFRAME)
 
 
 def _resolve_symbols(bx):
@@ -85,7 +112,7 @@ def _params():
         "atr_length": config.WAVELET_ATR_LENGTH,
         "atr_mult_sl": config.WAVELET_ATR_MULT_SL,
         "atr_mult_tp": config.WAVELET_ATR_MULT_TP,
-        "bar_ms": 5 * 60 * 1000,
+        "bar_ms": BAR_MS,
     }
 
 
@@ -95,7 +122,7 @@ def _build_alert(symbol: str, signal: dict):
     else:
         side, position_side = "sell", "SHORT"
     return {
-        "strategy": "wavelet_mra_5m_python", "exchange": "BingX", "symbol": symbol,
+        "strategy": f"wavelet_mra_{TIMEFRAME}_python", "exchange": "BingX", "symbol": symbol,
         "side": side, "positionSide": position_side, "signal": "entry",
         "price": signal["close"], "sl": signal["sl"], "tp": signal["tp"],
         "time": signal["timestamp"],
@@ -123,7 +150,7 @@ def job_generate_signals(main_module, bx, state):
     for symbol in symbols:
         try:
             rows = bx.get_klines(
-                symbol, interval="5m",
+                symbol, interval=TIMEFRAME,
                 limit=config.WAVELET_LOOKBACK_ENERGY + 60,
             )
             df = signal_engine.klines_to_df(rows)
@@ -133,7 +160,7 @@ def job_generate_signals(main_module, bx, state):
 
             # descarta la vela en curso si aún no ha cerrado
             now_ms = int(time.time() * 1000)
-            if df["open_time"].iloc[-1] + 5 * 60 * 1000 > now_ms:
+            if df["open_time"].iloc[-1] + BAR_MS > now_ms:
                 df = df.iloc[:-1]
             if len(df) < 20:
                 continue
@@ -170,6 +197,41 @@ def job_generate_signals(main_module, bx, state):
                 time.sleep(scanner.REQUEST_PACING_SECONDS)
 
 
+def _pnl_window_start(state, symbol: str):
+    """Desde cuándo mirar el PnL realizado de un símbolo, en ms.
+
+    Prioridad: el último chequeo -> el opened_at de la posición -> None.
+
+    El suelo por opened_at es lo importante. Sin él, en el primer cierre de
+    cada símbolo tras un despliegue la ventana empezaba en None y
+    get_income devolvía el histórico ENTERO: el PnL de operaciones
+    anteriores (incluidas las manuales del usuario en esta cuenta
+    compartida) se sumaba y se atribuía a la operación recién cerrada. Ese
+    número alimenta consecutive_losses, así que un histórico en verde podía
+    resetear la racha de pérdidas y desarmar el circuit breaker.
+    """
+    since = state.get_last_income_check_ts(symbol)
+    if since:
+        return since
+
+    pos = state.state.get("positions", {}).get(symbol) or {}
+    opened_at = pos.get("opened_at")
+    if opened_at:
+        try:
+            ts = dt.datetime.fromisoformat(str(opened_at))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt.timezone.utc)
+            # Un minuto de margen: el income de BingX puede registrarse con
+            # algo de desfase respecto al momento de apertura.
+            return int(ts.timestamp() * 1000) - 60_000
+        except (ValueError, TypeError):
+            log.warning("%s: opened_at ilegible (%s)", symbol, opened_at)
+
+    log.warning("%s: sin ventana de PnL fiable -- se registra el cierre SIN PnL "
+                "en vez de sumar histórico ajeno a la racha", symbol)
+    return None
+
+
 def job_reconcile_closed_positions(bx, state):
     try:
         live_raw = bx.get_positions()
@@ -186,12 +248,18 @@ def job_reconcile_closed_positions(bx, state):
     for symbol in list(state.state["positions"].keys()):
         if symbol in live_symbols:
             continue
+
+        since = _pnl_window_start(state, symbol)
         pnl = None
-        try:
-            since = state.get_last_income_check_ts(symbol)
-            pnl = bx.get_realized_pnl_since(symbol, since)
-        except Exception:
-            log.exception("No se pudo leer PnL realizado de %s, se registra sin PnL", symbol)
+        if since is not None:
+            try:
+                pnl = bx.get_realized_pnl_since(symbol, since)
+            except Exception:
+                log.exception("No se pudo leer PnL realizado de %s, se registra sin PnL", symbol)
+        # Sin ventana fiable NO se pasa PnL: es mejor no contabilizar esta
+        # operación en la racha que contabilizarla con un número que
+        # incluye histórico que no es suyo.
+
         state.set_last_income_check_ts(symbol, int(time.time() * 1000))
         state.record_close(symbol, pnl=pnl)
         icon = "✅" if (pnl or 0) >= 0 else "🔴"
@@ -224,10 +292,14 @@ def start(main_module, bx, state):
         log.warning("Sin símbolos configurados (SYMBOLS vacío y SCAN_ALL_SYMBOLS=false), el generador de señales no arranca")
         return None
 
+    # El cron sigue la temporalidad configurada en vez de un */5 fijo.
+    minutos = max(1, BAR_MS // 60_000)
+    minute_expr = f"*/{minutos}" if minutos <= 30 else "0"
+
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
         job_generate_signals,
-        CronTrigger(minute="*/5", second=15),
+        CronTrigger(minute=minute_expr, second=15),
         args=[main_module, bx, state],
         id="generate_signals",
         max_instances=1,
@@ -252,7 +324,8 @@ def start(main_module, bx, state):
         )
     scheduler.start()
     log.info(
-        "Scheduler de señales iniciado. Modo: %s",
+        "Scheduler de señales iniciado (%s, barrido cada %d min). Modo: %s",
+        TIMEFRAME, minutos,
         "ALL (todos los perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS,
     )
     return scheduler

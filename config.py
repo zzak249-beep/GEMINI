@@ -1,6 +1,10 @@
 """
 Configuración centralizada. Todo se lee de variables de entorno
 (Railway → Variables). Ver .env.example para la lista completa.
+
+OJO con los nombres: este bot NO lee DRY_RUN, MODE ni LIVE_CONFIRMED
+(esas son de otros bots de la flota). Los únicos interruptores reales
+son AUTO_TRADE y BINGX_DEMO.
 """
 import os
 
@@ -22,6 +26,11 @@ BINGX_API_SECRET = _str("BINGX_API_SECRET")
 BINGX_BASE_URL = _str("BINGX_BASE_URL", "https://open-api.bingx.com")
 BINGX_DEMO = _bool("BINGX_DEMO", "true")  # usa VST (demo trading) por defecto
 
+# Modo de posición de la cuenta. HEDGE (por defecto) manda positionSide
+# explícito y NUNCA el campo reduceOnly, que BingX rechaza con el error
+# 109400 en ese modo. Ponlo a false solo si la cuenta está en One-Way.
+HEDGE_MODE = _bool("HEDGE_MODE", "true")
+
 # --- Telegram ---
 TELEGRAM_BOT_TOKEN = _str("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = _str("TELEGRAM_CHAT_ID")
@@ -36,12 +45,29 @@ AUTO_TRADE = _bool("AUTO_TRADE", "false")
 
 # --- Riesgo / cuenta ---
 RISK_PCT_PER_TRADE = float(os.getenv("RISK_PCT_PER_TRADE", "2.0"))  # % del equity arriesgado (via SL)
+
+# Suelo de tamaño: valor MÍNIMO de la posición en USDT (nocional = qty ×
+# precio), NO margen. Con LEVERAGE=10, 9 USDT de nocional inmovilizan 0.9
+# USDT de margen.
+#
+# Por qué hace falta: el sizing por riesgo da nocional = riesgo / stop%.
+# En un símbolo con stop del 15% eso deja posiciones de céntimos, donde
+# las comisiones se comen cualquier resultado. Ponlo a 0 para desactivarlo.
+MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "9.0"))
+
+# Tope duro al subir hasta el suelo anterior: forzar el mínimo en un
+# símbolo de stop muy ancho puede arriesgar mucho más que
+# RISK_PCT_PER_TRADE. Si para llegar al mínimo hay que superar este % del
+# equity, la señal se DESCARTA en vez de operarse con un riesgo que no
+# habías autorizado.
+MAX_RISK_PCT_ABS = float(os.getenv("MAX_RISK_PCT_ABS", "4.0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 # Tope de seguridad ABSOLUTO, independiente de MAX_CONCURRENT_POSITIONS y del
 # estado local (que puede resetearse si Railway no tiene un Volume montado
-# para STATE_FILE). Se comprueba contra las posiciones REALES en BingX, no
-# contra el JSON local, así que protege incluso si el estado se perdió.
+# para STATE_FILE). Se comprueba contra las posiciones REALES en BingX que
+# sean DE ESTE BOT -- no contra toda la cuenta: la comparten otros bots y
+# operativa manual, y contarlo todo bloqueaba este bot por posiciones ajenas.
 HARD_MAX_TOTAL_POSITIONS = int(os.getenv("HARD_MAX_TOTAL_POSITIONS", "5"))
 
 # Volumen mínimo en USDT de las últimas 24h para que un símbolo se vigile
@@ -49,6 +75,14 @@ HARD_MAX_TOTAL_POSITIONS = int(os.getenv("HARD_MAX_TOTAL_POSITIONS", "5"))
 # se come cualquier ventaja del filtro antes de que se mueva el precio
 # (ver RESEARCH.md sección 5). No aplica si SYMBOLS es una lista explícita.
 MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", "2000000"))
+
+# Prefijos de símbolo a excluir del universo (BASE del par, separados por
+# coma). Ej. EXCLUDE_PREFIXES="NC" descarta NCCOGOLD2USD-USDT y compañía.
+# Esta variable existía en Railway pero NADIE la leía en este repo, así que
+# no filtraba nada: ahora la aplica bingx_client.get_all_symbols().
+EXCLUDE_PREFIXES = tuple(
+    p.strip().upper() for p in _str("EXCLUDE_PREFIXES", "").split(",") if p.strip()
+)
 
 # --- Circuit breaker ---
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
@@ -64,6 +98,12 @@ STATE_FILE = _str("STATE_FILE", "state.json")
 #                plan Essential o superior para alertas por webhook).
 SIGNAL_SOURCE = _str("SIGNAL_SOURCE", "python")
 ENABLE_SCHEDULER = _bool("ENABLE_SCHEDULER", "true")  # los tests lo ponen a false
+
+# Temporalidad de las velas y cada cuántos minutos barre el poller. Deben
+# coincidir: con velas de 5m y un barrido cada 15 se perderían señales, y
+# al revés se evaluaría varias veces la misma vela.
+SIGNAL_TIMEFRAME = _str("SIGNAL_TIMEFRAME", _str("TIMEFRAME", "5m"))
+SIGNAL_INTERVAL_MINUTES = int(_str("SIGNAL_INTERVAL_MINUTES", "5"))
 
 # Símbolos a vigilar en formato BingX (BASE-QUOTE), separados por coma.
 # Escribe "ALL" para que el bot descubra y vigile TODOS los perpetuos
@@ -90,6 +130,7 @@ WAVELET_COOLDOWN_BARS = int(_str("WAVELET_COOLDOWN_BARS", "4"))
 WAVELET_ATR_LENGTH = int(_str("WAVELET_ATR_LENGTH", "14"))
 WAVELET_ATR_MULT_SL = float(_str("WAVELET_ATR_MULT_SL", "1.5"))
 WAVELET_ATR_MULT_TP = float(_str("WAVELET_ATR_MULT_TP", "2.5"))
+
 
 # --- Mapeo símbolo TradingView -> BingX ---
 # TradingView suele mandar "BTCUSDT" o "BTCUSDT.P". BingX quiere "BTC-USDT".

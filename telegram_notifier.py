@@ -9,24 +9,62 @@ log = logging.getLogger("telegram")
 
 API_URL = "https://api.telegram.org/bot{token}/sendMessage"
 
+# Telegram corta en 4096 caracteres y rechaza el mensaje entero si se pasa.
+# Con listas largas de símbolos (escaneo de todo el universo) se alcanza.
+MAX_LEN = 3900
 
-def send(text: str, parse_mode: str = "Markdown"):
+
+def send(text: str, parse_mode: str = "Markdown") -> bool:
+    """Manda un mensaje. Devuelve True si Telegram lo aceptó.
+
+    Antes se ignoraba la respuesta HTTP: el except solo captura fallos de
+    red, no rechazos de la API. Un 400 por Markdown mal formado -- que es
+    lo que pasa en cuanto un '_' o un '*' aparece en un nombre de símbolo
+    o en el texto de una excepción -- hacía desaparecer el mensaje sin
+    dejar rastro. Y por ahí se van precisamente los avisos que importan
+    ("REVISA BINGX A MANO AHORA").
+
+    Ahora se comprueba, y si el rechazo viene del formato se reintenta en
+    texto plano: perder el formato es mejor que perder el aviso.
+    """
     if not config.TELEGRAM_BOT_TOKEN or not config.TELEGRAM_CHAT_ID:
         log.warning("Telegram no configurado; mensaje omitido: %s", text)
-        return
+        return False
+
+    text = str(text)
+    if len(text) > MAX_LEN:
+        text = text[:MAX_LEN] + "\n… (mensaje truncado)"
+
+    url = API_URL.format(token=config.TELEGRAM_BOT_TOKEN)
+    for modo in (parse_mode, None):
+        data = {
+            "chat_id": config.TELEGRAM_CHAT_ID,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if modo:
+            data["parse_mode"] = modo
+        try:
+            resp = requests.post(url, data=data, timeout=10)
+        except Exception:
+            log.exception("Fallo de red enviando mensaje a Telegram")
+            return False
+        if resp.ok:
+            return True
+        log.warning("Telegram rechazó el mensaje (parse_mode=%s, HTTP %s): %s",
+                    modo, resp.status_code, resp.text[:200])
+        if modo is None:
+            break
+    return False
+
+
+def _num(v) -> str:
+    """%.6g mantiene legibles tanto BTC (79380) como tokens de precio muy
+    bajo (0.000012). Con .4f estos últimos salían como 0.0000."""
     try:
-        requests.post(
-            API_URL.format(token=config.TELEGRAM_BOT_TOKEN),
-            data={
-                "chat_id": config.TELEGRAM_CHAT_ID,
-                "text": text,
-                "parse_mode": parse_mode,
-                "disable_web_page_preview": True,
-            },
-            timeout=10,
-        )
-    except Exception:
-        log.exception("Fallo enviando mensaje a Telegram")
+        return f"{float(v):.6g}"
+    except (TypeError, ValueError):
+        return str(v)
 
 
 def format_entry_signal(alert: dict, executed: bool, qty: float = None, error: str = None):
