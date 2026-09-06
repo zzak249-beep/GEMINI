@@ -61,8 +61,56 @@ MIN_NOTIONAL_USDT = float(os.getenv("MIN_NOTIONAL_USDT", "9.0"))
 # equity, la señal se DESCARTA en vez de operarse con un riesgo que no
 # habías autorizado.
 MAX_RISK_PCT_ABS = float(os.getenv("MAX_RISK_PCT_ABS", "4.0"))
+
+# MARGEN FIJO por operación, en USDT. 0 = desactivado (comportamiento
+# por defecto: dimensionar por riesgo).
+#
+# Este bot dimensiona por RIESGO: qty = (equity x RISK_PCT_PER_TRADE) /
+# distancia_al_SL. Eso mantiene constante lo que se pierde si salta el
+# stop, pero hace que el MARGEN varíe en cada operación -- en símbolos
+# de stop estrecho salen posiciones grandes y al revés.
+#
+# Con MARGIN_PER_TRADE_USDT > 0 se invierte el criterio: el margen es
+# fijo (nocional = margen x LEVERAGE) y lo que varía es el riesgo, que
+# pasa a depender de dónde caiga el stop. Sigue acotado por
+# MAX_RISK_PCT_ABS: si con ese tamaño la pérdida en el SL superaría ese
+# % del equity, la señal se descarta.
+MARGIN_PER_TRADE_USDT = float(os.getenv("MARGIN_PER_TRADE_USDT", "0"))
 LEVERAGE = int(os.getenv("LEVERAGE", "10"))
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+
+# --- Frenos aprendidos de RIVER (-21.04 USDT, 7x el riesgo previsto) ---
+#
+# 1) Apalancamiento REAL mayor del pedido. BingX puede dejar el simbolo al
+#    apalancamiento que ya tuviera si set_leverage no lo baja. Eso acerca
+#    la liquidacion (a 19x cae a ~4.8% en contra, a 10x a ~9.5%) Y ADEMAS
+#    relaja la comprobacion de margen de main.py, porque required_margin
+#    se divide por el apalancamiento real. RIVER se liquido con un
+#    movimiento del 4.40%: perdio el 101% de su margen.
+#    true = no se opera ese simbolo si BingX confirma mas del pedido.
+REJECT_HIGHER_LEVERAGE = _bool("REJECT_HIGHER_LEVERAGE", "true")
+
+# 2) Tope de NOCIONAL por posicion, en % del equity. El sizing por riesgo
+#    calcula qty = riesgo / distancia_al_stop, asi que con un stop muy
+#    estrecho el nocional se dispara: RIVER movio 396 USDT sobre un
+#    patrimonio de ~150, o sea 2.6 VECES la cuenta en un solo simbolo.
+#    0 = desactivado.
+#    MEDIDO antes de fijar el valor: las operaciones reales del bot corren
+#    entre 1.8x y 2.8x el equity, y RIVER estaba en 2.6x -- DENTRO de ese
+#    rango. Asi que este tope NO distingue RIVER de una operacion normal.
+#    Se deja en 400% como guarda de cola pura: solo ataja un nocional
+#    absurdo, sin tocar nada de lo que el bot opera hoy. Bajarlo a 150
+#    habria bloqueado ETHFI (2.8x) y FF (1.8x), que eran legitimas.
+MAX_NOTIONAL_PCT_EQUITY = float(os.getenv("MAX_NOTIONAL_PCT_EQUITY", "400"))
+
+# 3) Distancia MINIMA al stop, en % del precio. Es el otro lado del mismo
+#    problema: un stop al 0.76% (el de RIVER) produce nocionales enormes y
+#    ademas deja el coste pesando demasiado. 0 = desactivado.
+#    DESACTIVADO por defecto (0). Con 0.60% habria bloqueado operaciones
+#    normales del bot, y el stop estrecho NO fue la causa de RIVER: la
+#    causa fue el apalancamiento de 19x. Actívalo solo si mides que los
+#    stops estrechos pierden mas, no por precaucion generica.
+MIN_STOP_DISTANCE_PCT = float(os.getenv("MIN_STOP_DISTANCE_PCT", "0"))
 # Tope de seguridad ABSOLUTO, independiente de MAX_CONCURRENT_POSITIONS y del
 # estado local (que puede resetearse si Railway no tiene un Volume montado
 # para STATE_FILE). Se comprueba contra las posiciones REALES en BingX que

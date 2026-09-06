@@ -349,7 +349,12 @@ def _handle_entry(alert: dict):
         telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
         return
 
-    # Sizing: arriesgar RISK_PCT_PER_TRADE% del equity en la distancia al SL.
+    # Sizing. Dos modos:
+    #   - por RIESGO (default): qty = (equity x RISK_PCT) / distancia_al_SL.
+    #     La pérdida si salta el stop es constante; el margen varía.
+    #   - por MARGEN FIJO (MARGIN_PER_TRADE_USDT > 0): nocional =
+    #     margen x LEVERAGE. El margen es constante; el riesgo varía y
+    #     queda acotado por MAX_RISK_PCT_ABS.
     risk_amount = equity * (config.RISK_PCT_PER_TRADE / 100)
     stop_distance = abs(price - sl)
     if stop_distance <= 0:
@@ -357,7 +362,40 @@ def _handle_entry(alert: dict):
             telegram_notifier.format_entry_signal(alert, executed=False, error="distancia a SL inválida")
         )
         return
-    qty = bx.round_qty(symbol, risk_amount / stop_distance)
+
+    # FRENO 3: stop demasiado estrecho. Con qty = riesgo / distancia, un
+    # stop muy pegado dispara el nocional (RIVER: stop al 0.76% -> 396 USDT
+    # de nocional sobre 150 de equity) y ademas deja el coste pesando
+    # demasiado sobre el resultado.
+    stop_pct = stop_distance / price * 100.0
+    if config.MIN_STOP_DISTANCE_PCT and stop_pct < config.MIN_STOP_DISTANCE_PCT:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=(f"stop demasiado estrecho: {stop_pct:.2f}% del precio "
+                       f"(mínimo {config.MIN_STOP_DISTANCE_PCT}%). Con un stop así "
+                       f"el nocional se dispara y el coste se come el resultado"),
+            )
+        )
+        return
+    if config.MARGIN_PER_TRADE_USDT > 0:
+        qty = bx.round_qty(symbol, (config.MARGIN_PER_TRADE_USDT * config.LEVERAGE) / price)
+        riesgo_real = qty * stop_distance
+        riesgo_pct = (riesgo_real / equity * 100) if equity > 0 else 999.0
+        if riesgo_pct > config.MAX_RISK_PCT_ABS:
+            telegram_notifier.send(
+                telegram_notifier.format_entry_signal(
+                    alert, executed=False,
+                    error=(f"margen fijo {config.MARGIN_PER_TRADE_USDT} USDT x "
+                           f"{config.LEVERAGE}x arriesgaría {riesgo_pct:.2f}% del equity "
+                           f"en este stop (tope {config.MAX_RISK_PCT_ABS}%)"),
+                )
+            )
+            return
+        log.info("%s: margen fijo %.2f USDT x%s -> qty=%s (riesgo %.2f%% del equity)",
+                 symbol, config.MARGIN_PER_TRADE_USDT, config.LEVERAGE, qty, riesgo_pct)
+    else:
+        qty = bx.round_qty(symbol, risk_amount / stop_distance)
     if qty <= 0:
         telegram_notifier.send(
             telegram_notifier.format_entry_signal(alert, executed=False, error="qty tras redondeo de precisión es 0")
@@ -372,7 +410,7 @@ def _handle_entry(alert: dict):
     # MAX_RISK_PCT_ABS y, si lo supera, se descarta la señal en vez de
     # operarla con un riesgo no autorizado.
     notional = qty * price
-    if config.MIN_NOTIONAL_USDT and notional < config.MIN_NOTIONAL_USDT:
+    if (not config.MARGIN_PER_TRADE_USDT) and config.MIN_NOTIONAL_USDT and notional < config.MIN_NOTIONAL_USDT:
         qty_minima = bx.round_qty_up(symbol, config.MIN_NOTIONAL_USDT / price)
         riesgo_forzado = qty_minima * stop_distance
         riesgo_pct = (riesgo_forzado / equity * 100) if equity > 0 else 999.0
@@ -392,6 +430,24 @@ def _handle_entry(alert: dict):
                  symbol, notional, config.MIN_NOTIONAL_USDT, qty, qty_minima, riesgo_pct)
         qty = qty_minima
         notional = qty * price
+
+    # FRENO 2: tope de nocional por posicion. El sizing por riesgo no tiene
+    # techo por si mismo: si la distancia al stop tiende a cero, el nocional
+    # tiende a infinito. RIVER acabo con 2.6x el patrimonio en un simbolo.
+    if config.MAX_NOTIONAL_PCT_EQUITY:
+        tope_notional = equity * config.MAX_NOTIONAL_PCT_EQUITY / 100.0
+        if notional > tope_notional:
+            telegram_notifier.send(
+                telegram_notifier.format_entry_signal(
+                    alert, executed=False,
+                    error=(f"nocional {notional:.0f} USDT = "
+                           f"{notional/equity:.1f}x el equity ({equity:.0f}); "
+                           f"tope {config.MAX_NOTIONAL_PCT_EQUITY:.0f}% "
+                           f"({tope_notional:.0f} USDT). Stop demasiado estrecho "
+                           f"para el tamaño que exige"),
+                )
+            )
+            return
 
     # Fija el leverage ANTES de calcular el margen requerido, y usa el valor
     # que BingX confirma en la respuesta -- no config.LEVERAGE a ciegas.
@@ -414,6 +470,25 @@ def _handle_entry(alert: dict):
                     "%s: BingX confirmó leverage=%s (pedido %s) -- se recalcula el margen con el real",
                     symbol, actual_leverage, config.LEVERAGE,
                 )
+            # FRENO 1. MAS apalancamiento del pedido es el caso peligroso, y
+            # es justo el que no se contemplaba: acerca la liquidacion Y
+            # ADEMAS hace que required_margin (que divide por el real) salga
+            # MENOR, o sea que relaja la comprobacion de seguridad justo
+            # cuando el riesgo sube. RIVER se abrio a 19x con la liquidacion
+            # a ~4.8%, se movio 4.40% en contra y perdio el 101% del margen.
+            if config.REJECT_HIGHER_LEVERAGE and actual_leverage > config.LEVERAGE:
+                log.error("%s: BingX aplicó %sx (pedido %sx) -- NO se opera",
+                          symbol, actual_leverage, config.LEVERAGE)
+                telegram_notifier.send(
+                    telegram_notifier.format_entry_signal(
+                        alert, executed=False,
+                        error=(f"BingX aplicó {actual_leverage:.0f}x en vez de "
+                               f"{config.LEVERAGE}x. Liquidación quedaría a "
+                               f"~{100/actual_leverage:.1f}% en contra. "
+                               f"Baja el apalancamiento de {symbol} a mano en BingX"),
+                    )
+                )
+                return
     except Exception as e:
         log.warning("No se pudo fijar/confirmar leverage para %s (%s) -- se asume config.LEVERAGE=%s",
                     symbol, e, config.LEVERAGE)
@@ -607,6 +682,99 @@ def positions():
     propias = [p for p in live if state.is_ours(p.get("symbol"))]
     ajenas = [p for p in live if not state.is_ours(p.get("symbol"))]
     return jsonify(count=len(live), propias=propias, ajenas=ajenas)
+
+
+@app.route("/diagnose", methods=["GET"])
+def diagnose():
+    """Por qué NO se abren operaciones, puerta por puerta.
+
+    Recorre los mismos filtros que _handle_entry, en el mismo orden, y
+    dice cuál está cerrado. Evita tener que deducirlo por ausencia de
+    órdenes, que es lo que obliga a mirar cinco archivos distintos.
+    """
+    puertas = []
+
+    if not config.AUTO_TRADE:
+        puertas.append({"puerta": "AUTO_TRADE", "bloquea": True,
+                        "detalle": "AUTO_TRADE=false -> solo señales, no se ejecuta nada"})
+    if not (config.BINGX_API_KEY and config.BINGX_API_SECRET):
+        puertas.append({"puerta": "credenciales", "bloquea": True,
+                        "detalle": "faltan BINGX_API_KEY / BINGX_API_SECRET"})
+    if config.BINGX_DEMO:
+        puertas.append({"puerta": "BINGX_DEMO", "bloquea": False,
+                        "detalle": "operando contra saldo de práctica (VST)"})
+
+    halted = bool(state.state.get("trading_halted"))
+    if halted:
+        puertas.append({
+            "puerta": "circuit_breaker", "bloquea": True,
+            "detalle": state.state.get("halt_reason"),
+            "como_liberar": "POST /reset-breaker/<WEBHOOK_SECRET> "
+                            "(subir MAX_DAILY_DRAWDOWN_PCT NO lo libera: "
+                            "trading_halted está persistido en el estado)",
+        })
+
+    propias = state.open_count()
+    if propias >= config.MAX_CONCURRENT_POSITIONS:
+        puertas.append({"puerta": "MAX_CONCURRENT_POSITIONS", "bloquea": True,
+                        "detalle": f"{propias} >= {config.MAX_CONCURRENT_POSITIONS}"})
+
+    try:
+        vivas_propias = state.count_own_live_positions(bx)
+        if vivas_propias >= config.HARD_MAX_TOTAL_POSITIONS:
+            puertas.append({"puerta": "HARD_MAX_TOTAL_POSITIONS", "bloquea": True,
+                            "detalle": f"{vivas_propias} >= {config.HARD_MAX_TOTAL_POSITIONS}"})
+    except Exception as e:
+        vivas_propias = None
+        puertas.append({"puerta": "lectura_posiciones", "bloquea": True,
+                        "detalle": f"no se pudo consultar BingX: {e}"})
+
+    equity = None
+    try:
+        equity = bx.get_balance()
+        # El suelo de nocional puede rechazar TODAS las señales si el
+        # equity es pequeño: para llegar al mínimo habría que arriesgar
+        # más de MAX_RISK_PCT_ABS.
+        if config.MARGIN_PER_TRADE_USDT > 0:
+            puertas.append({
+                "puerta": "MARGIN_PER_TRADE_USDT", "bloquea": False,
+                "detalle": (f"margen fijo {config.MARGIN_PER_TRADE_USDT} USDT x "
+                            f"{config.LEVERAGE}x = "
+                            f"{config.MARGIN_PER_TRADE_USDT * config.LEVERAGE:.0f} USDT "
+                            f"de posición; MIN_NOTIONAL_USDT y el sizing por riesgo "
+                            f"quedan ignorados"),
+            })
+        elif config.MIN_NOTIONAL_USDT and equity:
+            puertas.append({
+                "puerta": "MIN_NOTIONAL_USDT", "bloquea": False,
+                "detalle": (f"mínimo {config.MIN_NOTIONAL_USDT} USDT por operación; "
+                            f"se descarta la señal si llegar ahí exige arriesgar "
+                            f">{config.MAX_RISK_PCT_ABS}% del equity ({equity:.2f} USDT)"),
+            })
+    except Exception as e:
+        puertas.append({"puerta": "balance", "bloquea": True,
+                        "detalle": f"no se pudo leer el balance: {e}"})
+
+    jobs = []
+    if _scheduler:
+        for job in _scheduler.get_jobs():
+            jobs.append({"id": job.id,
+                         "next_run": job.next_run_time.isoformat() if job.next_run_time else None})
+    else:
+        puertas.append({"puerta": "scheduler", "bloquea": True,
+                        "detalle": f"no arrancó (SIGNAL_SOURCE={config.SIGNAL_SOURCE}, "
+                                   f"ENABLE_SCHEDULER={config.ENABLE_SCHEDULER})"})
+
+    bloqueantes = [p for p in puertas if p["bloquea"]]
+    return jsonify(
+        puede_abrir=(len(bloqueantes) == 0),
+        bloqueado_por=[p["puerta"] for p in bloqueantes],
+        puertas=puertas,
+        equity=equity,
+        posiciones_propias=propias,
+        posiciones_propias_vivas=vivas_propias,
+        scheduler_jobs=jobs,
+    )
 
 
 @app.route("/unprotected", methods=["GET"])
