@@ -32,6 +32,9 @@ import time
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+import csv
+import os
+
 import config
 import scanner
 import signal_engine
@@ -116,6 +119,56 @@ def _params():
     }
 
 
+SIGNALS_LOG = os.path.join(
+    os.path.dirname(config.STATE_FILE) or ".", "senales_todas.csv")
+
+_LOG_COLS = ["ts_señal", "fecha_utc", "symbol", "side", "timeframe",
+             "price", "sl", "tp", "atr", "is_trending", "ejecutada",
+             "motivo_no_ejecutada"]
+
+
+def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = ""):
+    """
+    Guarda TODAS las señales, ejecutadas o no.
+
+    POR QUÉ. Con MAX_CONCURRENT_POSITIONS=1 y varias señales por ciclo,
+    el bot opera la PRIMERA que encuentra hueco -- y el orden lo fija el
+    volumen de 24h, no ningún criterio de calidad. Las demás solo iban a
+    Telegram y se perdían.
+
+    Sin este registro NO SE PUEDE responder la única pregunta que
+    importa aquí: ¿habrían ido mejor las que descarté? Con él, dentro de
+    un mes se comparan las ejecutadas contra las descartadas y el
+    ranking se elige CON DATOS en vez de inventándolo.
+
+    Es solo un CSV en el volumen. No cambia ni una decisión del bot.
+    """
+    try:
+        os.makedirs(os.path.dirname(SIGNALS_LOG) or ".", exist_ok=True)
+        nuevo_archivo = not os.path.exists(SIGNALS_LOG)
+        with open(SIGNALS_LOG, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=_LOG_COLS)
+            if nuevo_archivo:
+                w.writeheader()
+            w.writerow({
+                "ts_señal": alert.get("time"),
+                "fecha_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                "symbol": alert.get("symbol"),
+                "side": alert.get("positionSide"),
+                "timeframe": TIMEFRAME,
+                "price": alert.get("price"),
+                "sl": alert.get("sl"),
+                "tp": alert.get("tp"),
+                "atr": sig.get("atr"),
+                "is_trending": sig.get("is_trending"),
+                "ejecutada": int(bool(ejecutada)),
+                "motivo_no_ejecutada": motivo,
+            })
+    except Exception:
+        # El registro NUNCA puede tumbar el bot ni bloquear una entrada.
+        log.exception("No se pudo registrar la señal en %s", SIGNALS_LOG)
+
+
 def _build_alert(symbol: str, signal: dict):
     if signal["long_cond"]:
         side, position_side = "buy", "LONG"
@@ -178,6 +231,8 @@ def job_generate_signals(main_module, bx, state):
             state.set_last_signal_ts(symbol, sig["timestamp"])
 
             if halted:
+                registrar_senal(alert, sig, False,
+                                f"circuit breaker: {state.state.get('halt_reason')}")
                 telegram_notifier.send(
                     telegram_notifier.format_entry_signal(
                         alert,
@@ -189,7 +244,14 @@ def job_generate_signals(main_module, bx, state):
                     )
                 )
             else:
+                # Se registra ANTES de intentar la entrada: si _handle_entry
+                # falla o la rechaza, la señal queda igualmente anotada.
+                antes = state.open_count()
                 main_module._handle_entry(alert)
+                ejecutada = state.open_count() > antes
+                registrar_senal(
+                    alert, sig, ejecutada,
+                    "" if ejecutada else "sin hueco o rechazada en _handle_entry")
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:
