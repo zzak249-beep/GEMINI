@@ -151,7 +151,15 @@ ENABLE_SCHEDULER = _bool("ENABLE_SCHEDULER", "true")  # los tests lo ponen a fal
 # coincidir: con velas de 5m y un barrido cada 15 se perderían señales, y
 # al revés se evaluaría varias veces la misma vela.
 SIGNAL_TIMEFRAME = _str("SIGNAL_TIMEFRAME", _str("TIMEFRAME", "5m"))
+# OJO: SIGNAL_INTERVAL_MINUTES no lo lee NADIE. El barrido sale de BAR_MS
+# en poller.py, o sea de SIGNAL_TIMEFRAME. Cambiarla no hace nada.
 SIGNAL_INTERVAL_MINUTES = int(_str("SIGNAL_INTERVAL_MINUTES", "5"))
+
+# Segundo dentro del minuto en que se evalua (antes fijo a 15 en poller.py).
+# Hay picos recurrentes de volatilidad y volumen en los minutos 0, 15, 30 y
+# 45 por actividad algoritmica, y los creadores de mercado ensanchan el
+# spread justo antes. Esperar unos segundos deja pasar la rafaga inicial.
+SIGNAL_SECOND_OFFSET = int(_str("SIGNAL_SECOND_OFFSET", "40"))
 
 # Símbolos a vigilar en formato BingX (BASE-QUOTE), separados por coma.
 # Escribe "ALL" para que el bot descubra y vigile TODOS los perpetuos

@@ -299,7 +299,7 @@ def start(main_module, bx, state):
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(
         job_generate_signals,
-        CronTrigger(minute=minute_expr, second=15),
+        CronTrigger(minute=minute_expr, second=config.SIGNAL_SECOND_OFFSET),
         args=[main_module, bx, state],
         id="generate_signals",
         max_instances=1,
@@ -324,8 +324,8 @@ def start(main_module, bx, state):
         )
     scheduler.start()
     log.info(
-        "Scheduler de señales iniciado (%s, barrido cada %d min). Modo: %s",
-        TIMEFRAME, minutos,
+        "Scheduler de señales iniciado (%s, barrido cada %d min, segundo %d). Modo: %s",
+        TIMEFRAME, minutos, config.SIGNAL_SECOND_OFFSET,
         "ALL (todos los perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS,
     )
     return scheduler
