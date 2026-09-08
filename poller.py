@@ -24,6 +24,23 @@ DOS CORRECCIONES respecto a la versión anterior:
     5*60*1000 del descarte de vela en curso y el bar_ms de _params()),
     mientras la variable TIMEFRAME de Railway no la leía nadie. Ahora sale
     toda de config.
+
+TERCERA CORRECCIÓN (08/09/2026) — GUARDA DE ORIENTACIÓN DE SL/TP.
+    En los logs de ese día, LYN-USDT SHORT salió con sl=0.035412 POR DEBAJO
+    de la entrada 0.03559 y tp=0.035698 POR ENCIMA. En un corto eso es al
+    revés: el stop donde está tu beneficio y el objetivo donde está tu
+    pérdida.
+
+    Los PRECIOS estaban bien calculados; lo que estaba mal eran las
+    ETIQUETAS. El nivel de abajo está a 2.5 ATR (es el take profit) y se
+    llamaba 'sl'; el de arriba está a 1.5 ATR (es el stop) y se llamaba
+    'tp'. Emparejándolos al revés el ATR implícito cuadra al 1.4%, el mismo
+    margen de redondeo que tiene el LONG de SOLV consigo mismo (0.4%).
+
+    ESTE ARCHIVO NO ES EL ORIGEN DEL FALLO. _build_alert pasa signal["sl"]
+    y signal["tp"] tal cual vienen de signal_engine.compute_signal: el
+    intercambio ocurre allí. Aquí solo se corta antes de ejecutar, se anota
+    en el CSV y se avisa. Arregla compute_signal o el bug sigue vivo.
 """
 import datetime as dt
 import logging
@@ -36,6 +53,7 @@ import csv
 import os
 
 import config
+import guardas as gd
 import scanner
 import signal_engine
 import telegram_notifier
@@ -124,10 +142,32 @@ SIGNALS_LOG = os.path.join(
 
 _LOG_COLS = ["ts_señal", "fecha_utc", "symbol", "side", "timeframe",
              "price", "sl", "tp", "atr", "is_trending", "ejecutada",
-             "motivo_no_ejecutada"]
+             "motivo_no_ejecutada", "orientacion_ok"]
 
 
-def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = ""):
+def _cabecera_existente(ruta: str):
+    """
+    Columnas del CSV que ya está en disco, si lo hay.
+
+    Añadir una columna nueva al CSV rompía el registro en silencio: DictWriter
+    lanza ValueError si le pasas una clave que no está en fieldnames, y el
+    except de registrar_senal se lo tragaba. Resultado: dejaba de anotarse
+    TODO, no solo la columna nueva. Se lee la cabecera real y se escribe
+    contra ella.
+    """
+    try:
+        if not os.path.exists(ruta) or os.path.getsize(ruta) == 0:
+            return None
+        with open(ruta, newline="", encoding="utf-8") as f:
+            fila = next(csv.reader(f), None)
+        return fila or None
+    except Exception:
+        log.exception("No se pudo leer la cabecera de %s", ruta)
+        return None
+
+
+def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = "",
+                    orientacion_ok: bool = True):
     """
     Guarda TODAS las señales, ejecutadas o no.
 
@@ -145,25 +185,30 @@ def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = ""):
     """
     try:
         os.makedirs(os.path.dirname(SIGNALS_LOG) or ".", exist_ok=True)
-        nuevo_archivo = not os.path.exists(SIGNALS_LOG)
+        columnas = _cabecera_existente(SIGNALS_LOG)
+        nuevo_archivo = columnas is None
+        if nuevo_archivo:
+            columnas = _LOG_COLS
+        fila = {
+            "ts_señal": alert.get("time"),
+            "fecha_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+            "symbol": alert.get("symbol"),
+            "side": alert.get("positionSide"),
+            "timeframe": TIMEFRAME,
+            "price": alert.get("price"),
+            "sl": alert.get("sl"),
+            "tp": alert.get("tp"),
+            "atr": sig.get("atr"),
+            "is_trending": sig.get("is_trending"),
+            "ejecutada": int(bool(ejecutada)),
+            "motivo_no_ejecutada": motivo,
+            "orientacion_ok": int(bool(orientacion_ok)),
+        }
         with open(SIGNALS_LOG, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=_LOG_COLS)
+            w = csv.DictWriter(f, fieldnames=columnas, extrasaction="ignore")
             if nuevo_archivo:
                 w.writeheader()
-            w.writerow({
-                "ts_señal": alert.get("time"),
-                "fecha_utc": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-                "symbol": alert.get("symbol"),
-                "side": alert.get("positionSide"),
-                "timeframe": TIMEFRAME,
-                "price": alert.get("price"),
-                "sl": alert.get("sl"),
-                "tp": alert.get("tp"),
-                "atr": sig.get("atr"),
-                "is_trending": sig.get("is_trending"),
-                "ejecutada": int(bool(ejecutada)),
-                "motivo_no_ejecutada": motivo,
-            })
+            w.writerow(fila)
     except Exception:
         # El registro NUNCA puede tumbar el bot ni bloquear una entrada.
         log.exception("No se pudo registrar la señal en %s", SIGNALS_LOG)
@@ -180,6 +225,24 @@ def _build_alert(symbol: str, signal: dict):
         "price": signal["close"], "sl": signal["sl"], "tp": signal["tp"],
         "time": signal["timestamp"],
     }
+
+
+def _orientacion_valida(alert: dict):
+    """
+    Última puerta antes de ejecutar: ¿el stop está del lado que le toca?
+
+    LONG  -> sl POR DEBAJO de la entrada, tp POR ENCIMA.
+    SHORT -> sl POR ENCIMA, tp POR DEBAJO.
+
+    Devuelve (ok, motivo, sl_bueno, tp_bueno). NO se autocorrige: si el bot
+    arreglara los campos en silencio, el fallo seguiría en compute_signal y
+    nadie volvería a mirarlo. Se bloquea y se avisa con los valores buenos
+    para que el arreglo se haga donde toca.
+    """
+    return gd.revisar_sl_tp(
+        alert.get("side", ""), alert.get("positionSide", ""),
+        alert.get("price", 0), alert.get("sl", 0), alert.get("tp", 0),
+    )
 
 
 def job_generate_signals(main_module, bx, state):
@@ -199,6 +262,8 @@ def job_generate_signals(main_module, bx, state):
             "Circuit breaker activo (%s) -- este ciclo genera señales SOLO informativas, no se ejecuta nada",
             state.state.get("halt_reason"),
         )
+
+    invertidas = 0
 
     for symbol in symbols:
         try:
@@ -230,6 +295,25 @@ def job_generate_signals(main_module, bx, state):
             log.info("Señal generada para %s: %s", symbol, alert)
             state.set_last_signal_ts(symbol, sig["timestamp"])
 
+            # ── GUARDA DE ORIENTACIÓN ─────────────────────────────────
+            ok, motivo_or, sl_bueno, tp_bueno = _orientacion_valida(alert)
+            if not ok:
+                invertidas += 1
+                log.error("%s NO ejecutada — %s | correcto sería sl=%.10g tp=%.10g",
+                          symbol, motivo_or, sl_bueno, tp_bueno)
+                registrar_senal(alert, sig, False, motivo_or, orientacion_ok=False)
+                if gd.debe_avisar(f"orient:{symbol}",
+                                  getattr(config, "GUARD_AVISO_MIN", 30)):
+                    telegram_notifier.send(
+                        f"🚫 *{symbol}* — señal NO ejecutada\n"
+                        f"{motivo_or}\n"
+                        f"Correcto sería `sl={sl_bueno:.10g}` `tp={tp_bueno:.10g}`\n"
+                        f"_El fallo está en signal_engine.compute_signal, no aquí. "
+                        f"No se autocorrige a propósito._"
+                    )
+                continue
+            # ──────────────────────────────────────────────────────────
+
             if halted:
                 registrar_senal(alert, sig, False,
                                 f"circuit breaker: {state.state.get('halt_reason')}")
@@ -257,6 +341,12 @@ def job_generate_signals(main_module, bx, state):
         finally:
             if config.SCAN_ALL_SYMBOLS:
                 time.sleep(scanner.REQUEST_PACING_SECONDS)
+
+    # Si TODAS las de un lado salen invertidas, esto no es un caso raro: es
+    # que compute_signal está mal para ese lado y hay que arreglarlo ya.
+    if invertidas:
+        log.error("Ciclo terminado con %d señal(es) bloqueadas por orientación de SL/TP",
+                  invertidas)
 
 
 def _pnl_window_start(state, symbol: str):
@@ -390,4 +480,6 @@ def start(main_module, bx, state):
         TIMEFRAME, minutos, config.SIGNAL_SECOND_OFFSET,
         "ALL (todos los perpetuos USDT)" if config.SCAN_ALL_SYMBOLS else config.SYMBOLS,
     )
+    log.info("Guarda de orientación SL/TP ACTIVA: una señal con el stop del lado "
+             "equivocado se bloquea y se anota en %s", SIGNALS_LOG)
     return scheduler
