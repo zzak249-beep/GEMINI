@@ -22,6 +22,7 @@ JSON que genera `alert(json_..., alert.freq_once_per_bar_close)` del script;
 en ese caso usa "Any alert() function call" al crear la alerta).
 """
 import logging
+import os
 import sys
 
 from flask import Flask, jsonify, request
@@ -122,6 +123,22 @@ if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
 
 
 # --------------------------------------------------------------------------- #
+# Ajustes nuevos, con valor por defecto para no depender de config.py.
+if not hasattr(config, "CERRAR_SIN_TP"):
+    config.CERRAR_SIN_TP = os.getenv("CERRAR_SIN_TP", "true").strip().lower() in (
+        "1", "true", "yes", "si", "sí", "on")
+if not hasattr(config, "MAX_MISMA_DIRECCION"):
+    try:
+        config.MAX_MISMA_DIRECCION = int(float(os.getenv("MAX_MISMA_DIRECCION", "2")))
+    except ValueError:
+        config.MAX_MISMA_DIRECCION = 2
+if not hasattr(config, "EQUITY_MINIMO"):
+    try:
+        config.EQUITY_MINIMO = float(os.getenv("EQUITY_MINIMO", "5"))
+    except ValueError:
+        config.EQUITY_MINIMO = 5.0
+
+
 def _margen_disponible(equity: float = None):
     """
     Margen LIBRE, no patrimonio. Devuelve (disponible, fuente).
@@ -337,6 +354,24 @@ def _handle_entry(alert: dict):
         )
         return
 
+    # TOPE DIRECCIONAL. Las señales llegan en rachas del mismo lado —el
+    # 09/09 salieron nueve LONG seguidos— y en un desplome las alts se
+    # mueven juntas. Nueve largos no son nueve apuestas: son una repetida
+    # nueve veces.
+    if config.MAX_MISMA_DIRECCION > 0:
+        mismo = sum(1 for p in state.state.get("positions", {}).values()
+                    if str(p.get("positionSide", "")).upper() == position_side)
+        if mismo >= config.MAX_MISMA_DIRECCION:
+            telegram_notifier.send(
+                telegram_notifier.format_entry_signal(
+                    alert, executed=False,
+                    error=(f"ya hay {mismo} posiciones {position_side} abiertas "
+                           f"(tope {config.MAX_MISMA_DIRECCION}). En una caída las "
+                           f"alts se mueven juntas: son la misma apuesta repetida"),
+                )
+            )
+            return
+
     if state.open_count() >= config.MAX_CONCURRENT_POSITIONS:
         telegram_notifier.send(
             telegram_notifier.format_entry_signal(
@@ -394,9 +429,40 @@ def _handle_entry(alert: dict):
         )
         return
 
+    # EQUITY 0 NO ES "RIESGO CERO": es que no se pudo leer la cuenta. Con
+    # equity 0 el sizing por riesgo da qty 0 y la señal muere con un "qty
+    # tras redondeo es 0" que parece un problema de precisión y no lo es.
+    # Peor: check_circuit_breaker(0) no puede medir drawdown y el límite
+    # diario queda desactivado sin avisar.
+    if equity < config.EQUITY_MINIMO:
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False,
+                error=f"sin fondos: patrimonio {equity:.2f} USDT "
+                      f"(mínimo {config.EQUITY_MINIMO})",
+            )
+        )
+        if gd.debe_avisar("cuenta:equity", getattr(config, "GUARD_AVISO_MIN", 30)):
+            telegram_notifier.send(
+                f"🛑 *Patrimonio {equity:.2f} USDT* — no se ejecuta nada, pero las "
+                f"señales siguen llegando.\n_Si el saldo real no es ese, revisa "
+                f"BINGX_DEMO y las claves._"
+            )
+        log.error("%s sin abrir: equity %.4f por debajo del mínimo %.2f",
+                  symbol, equity, config.EQUITY_MINIMO)
+        return
+
     allowed, reason = state.check_circuit_breaker(equity)
     if not allowed:
-        telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
+        # La señal SIEMPRE llega: el breaker es motivo para no ejecutar,
+        # no para dejar de informar. El enfriamiento tapa solo el aviso
+        # del breaker, que sí se repite en cada señal del ciclo.
+        telegram_notifier.send(
+            telegram_notifier.format_entry_signal(
+                alert, executed=False, error=f"circuit breaker: {reason}")
+        )
+        if gd.debe_avisar("cuenta:breaker", getattr(config, "GUARD_AVISO_MIN", 30)):
+            telegram_notifier.send(f"⛔ Trading pausado (circuit breaker): {reason}")
         return
 
     # Sizing. Dos modos:
@@ -595,6 +661,28 @@ def _handle_entry(alert: dict):
         )
         log.error("Entrada NO completada en %s %s: %s", symbol, position_side, motivo)
         return
+
+    # SIN TP NO SE OPERA. Una posición con stop y sin objetivo tiene pago
+    # asimétrico: la pérdida se corta en -1R y la ganancia no se cobra
+    # nunca, así que corre hasta que se gira y acaba en el stop. Es la
+    # firma del ratio realizado 0,54 frente al 1,67 de diseño (SL 1.5 ATR
+    # / TP 2.5 ATR): con 46% de aciertos, 1,67 da +0,23 R por operación y
+    # 0,54 da -0,29. La diferencia entre ganar y perder no está en la
+    # señal, está aquí. Antes esto solo mandaba un aviso.
+    if not res.get("has_tp") and config.CERRAR_SIN_TP:
+        cerrada = False
+        try:
+            cerrada = bx.close_position_and_verify(symbol, position_side)
+        except Exception:
+            log.exception("No se pudo cerrar %s sin TP", symbol)
+        telegram_notifier.send(
+            f"🔻 *{symbol}*: abierta con SL pero SIN TP confirmado — "
+            + ("CERRADA." if cerrada else "⚠️ NO se pudo cerrar, CIÉRRALA A MANO.")
+            + "\n_Con stop y sin objetivo el pago es asimétrico: la pérdida se "
+              "corta y la ganancia no se cobra. Es lo que hunde el ratio._"
+        )
+        if cerrada:
+            return
 
     state.record_open(symbol, position_side, res["quantity"], price, sl, tp)
     telegram_notifier.send(
