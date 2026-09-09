@@ -122,43 +122,29 @@ if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
 
 
 # --------------------------------------------------------------------------- #
-def _margen_disponible(equity: float):
+def _margen_disponible(equity: float = None):
     """
     Margen LIBRE, no patrimonio. Devuelve (disponible, fuente).
 
-    POR QUÉ EXISTE. La comprobación de margen usaba `equity * 0.95`, y equity
-    es el patrimonio TOTAL: incluye el margen bloqueado en las posiciones de
-    los otros bots de esta cuenta compartida. Con 135 USDT de patrimonio y
-    125 bloqueados, el chequeo local decía que sobraba de largo y BingX
-    rechazaba con 101204 'Insufficient margin'. El comentario del código
-    afirmaba que evitaba justo eso.
+    Antes esto adivinaba el nombre de un getter que no existía en
+    bingx_client (get_available_margin, get_free_margin...) y siempre
+    caía a equity -- que en una cuenta compartida por varios bots
+    INCLUYE el margen que ya tienen inmovilizado los demás. Con 135 USDT
+    de patrimonio y 125 bloqueados, el chequeo decía que sobraba de largo
+    y BingX rechazaba con 101204 'Insufficient margin'.
 
-    No sé cómo se llama el getter en bingx_client, así que se prueban los
-    nombres habituales. Si ninguno existe se cae a equity, PERO se avisa: es
-    mejor saber que la comprobación es aproximada que creerla exacta.
+    Ahora usa bx.get_balance_detail()['available_margin'], que es el
+    campo que BingX ya devuelve en la misma respuesta de la que antes
+    solo se leía 'equity'. equity sigue de parámetro solo como fallback
+    si la llamada a BingX falla.
     """
-    for nombre in ("get_available_margin", "get_available_balance",
-                   "get_free_margin", "get_balance_detail", "get_account"):
-        fn = getattr(bx, nombre, None)
-        if fn is None:
-            continue
-        try:
-            r = fn()
-        except Exception:
-            log.debug("_margen_disponible: %s() falló", nombre, exc_info=True)
-            continue
-        if isinstance(r, (int, float)) and r >= 0:
-            return float(r), nombre
-        if isinstance(r, dict):
-            datos = r.get("data") if isinstance(r.get("data"), dict) else r
-            for clave in ("availableMargin", "available", "availableBalance",
-                          "freeMargin", "free"):
-                if clave in datos:
-                    try:
-                        return float(datos[clave]), f"{nombre}.{clave}"
-                    except (TypeError, ValueError):
-                        pass
-    return float(equity or 0.0), "equity (APROXIMADO)"
+    try:
+        detalle = bx.get_balance_detail()
+        if detalle.get("available_margin") is not None:
+            return float(detalle["available_margin"]), "get_balance_detail"
+    except Exception:
+        log.debug("_margen_disponible: get_balance_detail() falló", exc_info=True)
+    return float(equity or 0.0), "equity (APROXIMADO -- no se pudo leer availableMargin)"
 
 
 def _live_positions():
@@ -557,31 +543,32 @@ def _handle_entry(alert: dict):
         log.warning("No se pudo fijar/confirmar leverage para %s (%s) -- se asume config.LEVERAGE=%s",
                     symbol, e, config.LEVERAGE)
 
-    # Comprobación de margen: evita mandar una orden que BingX rechazaría
-    # por fondos insuficientes (o que consumiría casi todo el margen
-    # disponible sin que quede colchón para el resto de posiciones).
-    required_margin = (qty * price) / max(actual_leverage, 1)
+    # Filtro final unificado (guardas.revisar): margen real + riesgo real +
+    # ratio tp/sl, con la qty YA decidida arriba. Sustituye al chequeo de
+    # margen que había aquí a mano: ahora ese chequeo vive en un solo sitio
+    # (guardas.py) en vez de duplicado, y de paso se aprovecha el chequeo
+    # de ratio tp/sl (GUARD_MIN_RATIO) que guardas.py ya tenía pero que
+    # nadie llamaba desde este archivo.
     disponible, fuente_margen = _margen_disponible(equity)
     if fuente_margen.startswith("equity"):
         log.warning(
-            "%s: no hay getter de margen disponible en bingx_client -- se compara "
-            "contra el patrimonio, que INCLUYE el margen bloqueado por otros bots. "
+            "%s: no se pudo leer availableMargin de BingX -- se compara contra "
+            "el patrimonio, que INCLUYE el margen bloqueado por otros bots. "
             "El rechazo 101204 puede volver a aparecer.", symbol)
-    if required_margin > disponible * 0.95:
-        telegram_notifier.send(
-            telegram_notifier.format_entry_signal(
-                alert, executed=False,
-                error=(f"margen insuficiente: necesita ~{required_margin:.2f} USDT "
-                       f"con leverage {actual_leverage}x y hay {disponible:.2f} "
-                       f"libres (patrimonio {equity:.2f}, fuente: {fuente_margen}). "
-                       f"La diferencia está bloqueada en posiciones abiertas, de "
-                       f"este bot o de otro de la cuenta"),
-            )
-        )
-        log.warning("%s: margen insuficiente ANTES de mandar la orden "
-                    "(%.2f necesarios, %.2f libres) -- así no llega el 101204",
-                    symbol, required_margin, disponible)
+
+    v = gd.revisar(
+        config, symbol,
+        alert.get("side", ""), position_side,
+        qty, price, sl, tp,
+        actual_leverage, disponible, equity,
+    )
+    if not v.ok:
+        if gd.debe_avisar(f"guarda:{symbol}", getattr(config, "GUARD_AVISO_MIN", 30)):
+            telegram_notifier.send(gd.formato_telegram(symbol, position_side, v))
+        log.warning("%s: bloqueada por guardas.revisar -- %s", symbol, v.motivo)
         return
+    for aviso in v.avisos:
+        log.info("%s: aviso de guardas.revisar -- %s", symbol, aviso)
 
     # Apertura protegida: abre, lee el tamaño REAL rellenado, verifica el
     # SL/TP contra openOrders y, si no consigue dejar un stop puesto, CIERRA

@@ -133,17 +133,57 @@ class BingXClient:
         return data.get("data", data)
 
     # ------------------------------------------------------------------ #
-    def get_balance(self) -> float:
-        """Devuelve el equity disponible en USDT de la cuenta de swap."""
+    def get_balance_detail(self) -> dict:
+        """Balance COMPLETO de la cuenta de swap, no solo el equity.
+
+        POR QUÉ EXISTE. /openApi/swap/v2/user/balance ya devuelve
+        'availableMargin' y 'usedMargin' en el MISMO objeto del que
+        get_balance() solo leía 'equity'. No hacía falta adivinar el
+        nombre de un getter de margen: estaba en la respuesta que ya se
+        pedía y se tiraba.
+
+        Ese adivinado (_margen_disponible en main.py, leer_cuenta en
+        guardas.py, probando get_available_margin/get_free_margin/... uno
+        a uno) es justo lo que producía el rechazo 101204 'Insufficient
+        margin': con ningún nombre coincidiendo, ambos caían a equity, que
+        en una cuenta compartida por varios bots INCLUYE el margen que ya
+        tienen inmovilizado los demás.
+
+        Devuelve dict con equity/availableMargin/usedMargin/asset. Claves
+        a 0.0 si no vienen en la respuesta (no lanza)."""
         data = self._signed_request("GET", "/openApi/swap/v2/user/balance", {})
         balances = data.get("balance", data)
-        if isinstance(balances, dict):
-            return float(balances.get("equity", balances.get("balance", 0)))
         if isinstance(balances, list):
-            for b in balances:
-                if b.get("asset") == "USDT":
-                    return float(b.get("equity", b.get("balance", 0)))
-        return 0.0
+            balances = next((b for b in balances if b.get("asset") == "USDT"),
+                            balances[0] if balances else {})
+        if not isinstance(balances, dict):
+            balances = {}
+
+        def _f(*claves):
+            for k in claves:
+                if k in balances:
+                    try:
+                        return float(balances[k])
+                    except (TypeError, ValueError):
+                        pass
+            return 0.0
+
+        return {
+            "asset": balances.get("asset", "USDT"),
+            "equity": _f("equity", "balance"),
+            "available_margin": _f("availableMargin", "available"),
+            "used_margin": _f("usedMargin", "freezedMargin"),
+            "unrealized_profit": _f("unrealizedProfit"),
+        }
+
+    def get_balance(self) -> float:
+        """Devuelve el equity (patrimonio TOTAL) de la cuenta de swap.
+
+        OJO: esto NO es margen libre. Para comprobar si hay fondos para
+        una entrada nueva usa get_balance_detail()['available_margin'],
+        no esto -- equity incluye el margen ya bloqueado por otras
+        posiciones, propias o de otro bot de la flota."""
+        return self.get_balance_detail()["equity"]
 
     def get_positions(self, symbol: str = None):
         params = {"symbol": symbol} if symbol else {}

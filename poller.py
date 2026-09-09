@@ -52,6 +52,7 @@ from apscheduler.triggers.cron import CronTrigger
 import csv
 import os
 
+import atrous
 import config
 import guardas as gd
 import scanner
@@ -142,7 +143,13 @@ SIGNALS_LOG = os.path.join(
 
 _LOG_COLS = ["ts_señal", "fecha_utc", "symbol", "side", "timeframe",
              "price", "sl", "tp", "atr", "is_trending", "ejecutada",
-             "motivo_no_ejecutada", "orientacion_ok"]
+             "motivo_no_ejecutada", "orientacion_ok",
+             # Contexto de la à trous de Haar causal (atrous.py). SOLO MIDE:
+             # no entra en ninguna decisión de este archivo. Se anota para
+             # comparar dentro de unas semanas si separa ganadoras de
+             # perdedoras (ver atrous.py y NOTAS_MOTOR.md) antes de activar
+             # nada como filtro de verdad.
+             "at_pendiente", "at_macro", "at_acuerdo", "at_ruido"]
 
 
 def _cabecera_existente(ruta: str):
@@ -167,7 +174,7 @@ def _cabecera_existente(ruta: str):
 
 
 def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = "",
-                    orientacion_ok: bool = True):
+                    orientacion_ok: bool = True, at_ctx: dict = None):
     """
     Guarda TODAS las señales, ejecutadas o no.
 
@@ -204,6 +211,11 @@ def registrar_senal(alert: dict, sig: dict, ejecutada: bool, motivo: str = "",
             "motivo_no_ejecutada": motivo,
             "orientacion_ok": int(bool(orientacion_ok)),
         }
+        at_ctx = at_ctx or {}
+        fila["at_pendiente"] = at_ctx.get("at_pendiente")
+        fila["at_macro"] = at_ctx.get("at_macro")
+        fila["at_acuerdo"] = at_ctx.get("at_acuerdo")
+        fila["at_ruido"] = at_ctx.get("at_ruido")
         with open(SIGNALS_LOG, "a", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=columnas, extrasaction="ignore")
             if nuevo_archivo:
@@ -295,13 +307,22 @@ def job_generate_signals(main_module, bx, state):
             log.info("Señal generada para %s: %s", symbol, alert)
             state.set_last_signal_ts(symbol, sig["timestamp"])
 
+            # Contexto de la à trous de Haar causal -- solo mide y se anota
+            # en el CSV (ver atrous.py). No cambia ninguna decisión de este
+            # ciclo: un fallo aquí no debe tumbar la señal.
+            try:
+                at_ctx = atrous.contexto(df["close"].tolist(), alert["positionSide"])
+            except Exception:
+                log.exception("%s: fallo calculando contexto atrous (no afecta a la señal)", symbol)
+                at_ctx = {}
+
             # ── GUARDA DE ORIENTACIÓN ─────────────────────────────────
             ok, motivo_or, sl_bueno, tp_bueno = _orientacion_valida(alert)
             if not ok:
                 invertidas += 1
                 log.error("%s NO ejecutada — %s | correcto sería sl=%.10g tp=%.10g",
                           symbol, motivo_or, sl_bueno, tp_bueno)
-                registrar_senal(alert, sig, False, motivo_or, orientacion_ok=False)
+                registrar_senal(alert, sig, False, motivo_or, orientacion_ok=False, at_ctx=at_ctx)
                 if gd.debe_avisar(f"orient:{symbol}",
                                   getattr(config, "GUARD_AVISO_MIN", 30)):
                     telegram_notifier.send(
@@ -316,7 +337,8 @@ def job_generate_signals(main_module, bx, state):
 
             if halted:
                 registrar_senal(alert, sig, False,
-                                f"circuit breaker: {state.state.get('halt_reason')}")
+                                f"circuit breaker: {state.state.get('halt_reason')}",
+                                at_ctx=at_ctx)
                 telegram_notifier.send(
                     telegram_notifier.format_entry_signal(
                         alert,
@@ -335,7 +357,8 @@ def job_generate_signals(main_module, bx, state):
                 ejecutada = state.open_count() > antes
                 registrar_senal(
                     alert, sig, ejecutada,
-                    "" if ejecutada else "sin hueco o rechazada en _handle_entry")
+                    "" if ejecutada else "sin hueco o rechazada en _handle_entry",
+                    at_ctx=at_ctx)
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:

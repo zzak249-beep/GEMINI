@@ -136,6 +136,21 @@ EXCLUDE_PREFIXES = tuple(
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "4"))
 MAX_DAILY_DRAWDOWN_PCT = float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "6.0"))
 
+# --- Guardas (guardas.py) ---
+# guardas.revisar() es el último filtro antes de mandar la orden: vuelve a
+# comprobar orientación de SL/TP + margen real + riesgo, con los MISMOS
+# valores que ya usa el resto de este archivo -- si aquí se leyeran los
+# defaults propios de guardas.py (GUARD_MAX_RIESGO_PCT=3.0 por ejemplo)
+# en vez de estos, el "último filtro" comprobaría un límite distinto del
+# que main.py ya validó al calcular el tamaño, y podría bloquear (o dejar
+# pasar) por una razón que no es la configurada en Railway.
+GUARD_ENABLED = _bool("GUARD_ENABLED", "true")
+GUARD_BLOQUEAR_SLTP = _bool("GUARD_BLOQUEAR_SLTP", "true")
+GUARD_COLCHON = float(_str("GUARD_COLCHON", "0.95"))
+GUARD_MAX_RIESGO_PCT = MAX_RISK_PCT_ABS
+GUARD_MIN_RATIO = float(_str("GUARD_MIN_RATIO", "1.0"))
+GUARD_AVISO_MIN = int(_str("GUARD_AVISO_MIN", "30"))
+
 # --- Persistencia ---
 STATE_FILE = _str("STATE_FILE", "state.json")
 

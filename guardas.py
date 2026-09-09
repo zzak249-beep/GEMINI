@@ -134,10 +134,27 @@ def margen_necesario(qty: float, price: float, leverage: float) -> float:
 
 async def leer_cuenta(api: Any) -> dict:
     """
-    Lector defensivo: no sé cómo se llama el método en este repo, así que
-    prueba los nombres habituales y las claves habituales. Si no encuentra
-    nada devuelve ceros, y con ceros la guarda bloquea.
+    Primero intenta get_balance_detail() (el método real de
+    bingx_client.py, que expone availableMargin tal cual lo da BingX). Si
+    no existe -- por ejemplo si `api` es un cliente de otro bot de la
+    flota que no lo tiene -- cae al adivinado por nombre de antes. Con
+    ceros la guarda bloquea, así que un fallo aquí nunca deja pasar una
+    orden a ciegas.
     """
+    detalle = getattr(api, "get_balance_detail", None)
+    if detalle is not None:
+        try:
+            r = detalle()
+            r = await r if hasattr(r, "__await__") else r
+            if isinstance(r, dict) and (r.get("equity") or r.get("available_margin")):
+                return {
+                    "disponible": float(r.get("available_margin", 0.0)),
+                    "equity": float(r.get("equity", 0.0)),
+                    "leido": True,
+                }
+        except Exception as exc:  # noqa: BLE001
+            log.debug("guardas: get_balance_detail() falló: %s", exc)
+
     datos = None
     for nombre in ("cuenta", "balance", "get_balance", "account",
                    "get_account", "fetch_balance"):
