@@ -67,13 +67,41 @@ def _num(v) -> str:
         return str(v)
 
 
+def _coste_en_r(alert: dict) -> float:
+    """Cuánto se lleva la comisión de cada R. Es el único término CIERTO
+    de la operación: la ventaja es una estimación, el coste no.
+
+    Va en el mensaje porque con AUTO_TRADE=false decides tú a mano, y sin
+    este número no hay forma de ver de un vistazo que una señal con el
+    stop pegado se lleva el 30% del resultado antes de empezar."""
+    try:
+        px = float(alert.get("price"))
+        dist = abs(px - float(alert.get("sl")))
+        coste = float(getattr(config, "COST_ROUNDTRIP_PCT", 0.25))
+        return (coste / 100.0 * px) / dist if dist > 0 else 99.0
+    except (TypeError, ValueError):
+        return 99.0
+
+
 def format_entry_signal(alert: dict, executed: bool, qty: float = None, error: str = None):
     side = alert.get("positionSide", "?")
     icon = "🟢" if side == "LONG" else "🔴"
+    # La temporalidad sale de config, no escrita a mano. Con el bot en 15m
+    # el mensaje seguía diciendo "5m", y en modo manual eso es el dato con
+    # el que decides en qué gráfico mirar.
+    tf = getattr(config, "SIGNAL_TIMEFRAME", "5m")
+    cr = _coste_en_r(alert)
+    marca = "" if cr <= 0.20 else "  ⚠️"
+    try:
+        px = float(alert.get("price"))
+        stop_pct = abs(px - float(alert.get("sl"))) / px * 100.0
+    except (TypeError, ValueError):
+        stop_pct = 0.0
     lines = [
-        f"{icon} *{side} {alert.get('symbol')}* — Wavelet MRA 5m",
-        f"Precio señal: `{alert.get('price')}`",
-        f"SL: `{alert.get('sl')}`   TP: `{alert.get('tp')}`",
+        f"{icon} *{side} {alert.get('symbol')}* — Wavelet MRA {tf}",
+        f"Precio señal: `{_num(alert.get('price'))}`",
+        f"SL: `{_num(alert.get('sl'))}`   TP: `{_num(alert.get('tp'))}`",
+        f"Stop a {stop_pct:.2f}% · coste {cr:.2f} R{marca}",
     ]
     if executed:
         lines.append(f"✅ Ejecutado en BingX (qty: {qty})")

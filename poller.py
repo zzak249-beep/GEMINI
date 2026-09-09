@@ -355,10 +355,16 @@ def job_generate_signals(main_module, bx, state):
                 antes = state.open_count()
                 main_module._handle_entry(alert)
                 ejecutada = state.open_count() > antes
-                registrar_senal(
-                    alert, sig, ejecutada,
-                    "" if ejecutada else "sin hueco o rechazada en _handle_entry",
-                    at_ctx=at_ctx)
+                # El motivo tiene que decir la verdad: con AUTO_TRADE=false
+                # NO es que la señal se rechazara, es que el bot no opera.
+                # Anotarlas todas como "sin hueco o rechazada" ensucia la
+                # columna con la que después se comparan ejecutadas contra
+                # descartadas — y en modo manual TODAS caerían del lado malo.
+                motivo_no = ("" if ejecutada
+                             else "modo manual (AUTO_TRADE=false)"
+                             if not config.AUTO_TRADE
+                             else "sin hueco o rechazada en _handle_entry")
+                registrar_senal(alert, sig, ejecutada, motivo_no, at_ctx=at_ctx)
         except Exception:
             log.exception("Error generando señal para %s", symbol)
         finally:

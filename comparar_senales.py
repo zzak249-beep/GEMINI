@@ -43,6 +43,20 @@ import time
 import requests
 
 BINGX_BASE_URL = "https://open-api.bingx.com"
+
+# Coste de ida y vuelta, en % del nocional. Se descuenta de cada R.
+# SIN ESTO el script devolvía R BRUTO, y la decisión que se toma con él
+# es justo 5m contra 15m — donde el coste es LO ÚNICO que los separa:
+# con un bruto de +0.10 R, 5m queda en -0.12 y 15m en -0.02. Los dos
+# pierden, pero el bruto decía que los dos ganaban.
+COSTE_IDA_VUELTA_PCT = 0.25
+
+# Horas de seguimiento, no barras. max_barras=288 fijo significaba 24h en
+# 5m pero TRES DÍAS en 15m y SEIS en 30m: las que no tocaban SL ni TP se
+# resolvían a un precio de tres días después, que no se parece en nada a
+# lo que habría pasado. Ahora la ventana es tiempo de reloj y las barras
+# se calculan desde la temporalidad de cada fila.
+HORAS_SEGUIMIENTO = 24.0
 MS = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
      "1h": 3_600_000, "4h": 14_400_000}
 
@@ -92,7 +106,7 @@ def velas(symbol: str, desde_ms: int, barras: int, interval: str):
     return [v for v in salida if v["t"] >= desde_ms]
 
 
-def resolver(s: dict, max_barras: int = 288):
+def resolver(s: dict, horas: float = HORAS_SEGUIMIENTO, coste_pct: float = COSTE_IDA_VUELTA_PCT):
     """
     Simula la operación: ¿tocó antes el SL o el TP?
 
@@ -105,25 +119,44 @@ def resolver(s: dict, max_barras: int = 288):
     entre despliegues, cada fila se resuelve con la suya.
     """
     interval = s.get("timeframe") or "5m"
-    v = velas(s["symbol"], s["ts"] + MS.get(interval, 300_000), max_barras, interval)
+    barra_ms = MS.get(interval, 300_000)
+    # Las mismas HORAS para toda temporalidad: 24h son 288 barras en 5m,
+    # 96 en 15m y 48 en 30m. Comparar 5m contra 15m con el mismo número
+    # de BARRAS es comparar ventanas de duración distinta.
+    max_barras = max(int(horas * 3_600_000 / barra_ms), 2)
+    v = velas(s["symbol"], s["ts"] + barra_ms, max_barras, interval)
     if not v:
         return None, None
     largo = s["side"] == "LONG"
     riesgo = abs(s["price"] - s["sl"])
     if riesgo <= 0:
         return None, None
+    # El coste en R depende de lo ancho que sea el stop: mismo % de
+    # comisión pesa el doble con un stop la mitad de ancho.
+    coste_r = (coste_pct / 100.0 * s["price"]) / riesgo
     for i, k in enumerate(v):
         toca_sl = k["l"] <= s["sl"] if largo else k["h"] >= s["sl"]
         toca_tp = k["h"] >= s["tp"] if largo else k["l"] <= s["tp"]
         if toca_sl:
-            return -1.0, i + 1
+            return -1.0 - coste_r, i + 1
         if toca_tp:
             bruto = (s["tp"] - s["price"]) if largo else (s["price"] - s["tp"])
-            return bruto / riesgo, i + 1
+            return bruto / riesgo - coste_r, i + 1
     # no resolvió en la ventana: se cierra a mercado al final
     ult = v[-1]["c"]
     bruto = (ult - s["price"]) if largo else (s["price"] - ult)
-    return bruto / riesgo, len(v)
+    return bruto / riesgo - coste_r, len(v)
+
+
+def resumen_tf(nombre: str, rs: list):
+    if len(rs) < 5:
+        print(f"  {nombre:>6}: solo {len(rs)}, muestra insuficiente")
+        return
+    m = st.mean(rs)
+    sd = st.pstdev(rs) if len(rs) > 1 else 1.0
+    t = m * (len(rs) ** 0.5) / sd if sd > 1e-9 else 0.0
+    print(f"  {nombre:>6}: n={len(rs):>4} · media {m:+.3f}R · t={t:+5.2f}"
+          + ("  ⚠ muestra corta" if len(rs) < 87 else ""))
 
 
 def main():
@@ -133,8 +166,12 @@ def main():
                     help="temporalidad de RESPALDO solo para filas antiguas "
                          "sin columna 'timeframe'. Si el CSV ya la tiene "
                          "(poller.py la escribe desde siempre), se ignora.")
-    ap.add_argument("--max-barras", type=int, default=288,
-                    help="cuántas barras seguir cada señal (288 = 24h en 5m)")
+    ap.add_argument("--horas", type=float, default=HORAS_SEGUIMIENTO,
+                    help="horas de reloj que se sigue cada señal (por defecto 24). "
+                         "Las barras se calculan desde la temporalidad de cada fila.")
+    ap.add_argument("--coste", type=float, default=COSTE_IDA_VUELTA_PCT,
+                    help="coste de ida y vuelta en %% del nocional (por defecto 0.25). "
+                         "Ponlo a 0 para ver el bruto.")
     a = ap.parse_args()
 
     filas = []
@@ -162,11 +199,14 @@ def main():
         return 1
 
     ej = sum(1 for x in filas if x["ejecutada"])
+    tfs = sorted({x["timeframe"] for x in filas})
     print(f"{len(filas)} señales · {ej} ejecutadas · {len(filas)-ej} descartadas")
+    print(f"Temporalidades en el CSV: {', '.join(tfs)}")
+    print(f"Seguimiento: {a.horas:.0f} h de reloj · coste {a.coste}% ida y vuelta")
     print("Simulando cada una con su propio SL/TP (velas de BingX)...\n")
 
     for i, s in enumerate(filas, 1):
-        s["r"], s["barras"] = resolver(s, a.max_barras)
+        s["r"], s["barras"] = resolver(s, a.horas, a.coste)
         marca = "EJEC" if s["ejecutada"] else "    "
         r = f"{s['r']:+.2f}R" if s["r"] is not None else "sin datos"
         print(f"  [{i}/{len(filas)}] {marca} {s['symbol']:16} {r}")
@@ -184,9 +224,27 @@ def main():
             print(f"{nombre}: solo {len(g)}, muestra insuficiente")
             continue
         rs = [x["r"] for x in g]
+        m = st.mean(rs)
+        sd = st.pstdev(rs) if len(rs) > 1 else 1.0
+        t = m * (len(rs) ** 0.5) / sd if sd > 1e-9 else 0.0
+        aviso = ""
+        if len(rs) < 31:
+            aviso = "  ⚠ ni para detectar 0.50 R/op"
+        elif len(rs) < 87:
+            aviso = "  ⚠ sólo detecta ≥0.50 R/op"
+        elif len(rs) < 196:
+            aviso = "  ⚠ sólo detecta ≥0.30 R/op"
         print(f"{nombre:12} n={len(rs):>4} · acierto "
               f"{sum(1 for x in rs if x>0)/len(rs):>4.0%} · "
-              f"media {st.mean(rs):+.3f}R")
+              f"media {m:+.3f}R · t={t:+5.2f}{aviso}")
+
+    por_tf = {}
+    for x in con:
+        por_tf.setdefault(x["timeframe"], []).append(x["r"])
+    if len(por_tf) > 1:
+        print("\nPOR TEMPORALIDAD (con el coste dentro):")
+        for tf in sorted(por_tf):
+            resumen_tf(tf, por_tf[tf])
 
     if len(ej) >= 10 and len(de) >= 10:
         dif = st.mean([x["r"] for x in de]) - st.mean([x["r"] for x in ej])
