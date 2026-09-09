@@ -28,6 +28,7 @@ from flask import Flask, jsonify, request
 
 import bingx_client
 import config
+import guardas as gd
 import telegram_notifier
 from state_manager import StateManager
 
@@ -121,6 +122,45 @@ if config.SIGNAL_SOURCE == "python" and config.ENABLE_SCHEDULER:
 
 
 # --------------------------------------------------------------------------- #
+def _margen_disponible(equity: float):
+    """
+    Margen LIBRE, no patrimonio. Devuelve (disponible, fuente).
+
+    POR QUÉ EXISTE. La comprobación de margen usaba `equity * 0.95`, y equity
+    es el patrimonio TOTAL: incluye el margen bloqueado en las posiciones de
+    los otros bots de esta cuenta compartida. Con 135 USDT de patrimonio y
+    125 bloqueados, el chequeo local decía que sobraba de largo y BingX
+    rechazaba con 101204 'Insufficient margin'. El comentario del código
+    afirmaba que evitaba justo eso.
+
+    No sé cómo se llama el getter en bingx_client, así que se prueban los
+    nombres habituales. Si ninguno existe se cae a equity, PERO se avisa: es
+    mejor saber que la comprobación es aproximada que creerla exacta.
+    """
+    for nombre in ("get_available_margin", "get_available_balance",
+                   "get_free_margin", "get_balance_detail", "get_account"):
+        fn = getattr(bx, nombre, None)
+        if fn is None:
+            continue
+        try:
+            r = fn()
+        except Exception:
+            log.debug("_margen_disponible: %s() falló", nombre, exc_info=True)
+            continue
+        if isinstance(r, (int, float)) and r >= 0:
+            return float(r), nombre
+        if isinstance(r, dict):
+            datos = r.get("data") if isinstance(r.get("data"), dict) else r
+            for clave in ("availableMargin", "available", "availableBalance",
+                          "freeMargin", "free"):
+                if clave in datos:
+                    try:
+                        return float(datos[clave]), f"{nombre}.{clave}"
+                    except (TypeError, ValueError):
+                        pass
+    return float(equity or 0.0), "equity (APROXIMADO)"
+
+
 def _live_positions():
     """Todas las posiciones abiertas en la cuenta (incluye las ajenas)."""
     return [
@@ -190,7 +230,11 @@ def signal_check(symbol):
     import signal_engine
     import poller as _poller
     try:
-        rows = bx.get_klines(symbol.upper(), interval="5m", limit=config.WAVELET_LOOKBACK_ENERGY + 60)
+        # El timeframe sale de config, no escrito a mano: con "5m" fijo este
+        # endpoint mentía en el bot de 15m y daba una señal que no era la que
+        # el poller estaba evaluando.
+        rows = bx.get_klines(symbol.upper(), interval=_poller.TIMEFRAME,
+                             limit=config.WAVELET_LOOKBACK_ENERGY + 60)
         df = signal_engine.klines_to_df(rows)
         sig = signal_engine.compute_signal(df, _poller._params(), last_signal_ts=state.get_last_signal_ts(symbol.upper()))
         return jsonify(symbol=symbol.upper(), bars=len(df), signal=sig)
@@ -272,6 +316,26 @@ def _handle_entry(alert: dict):
     price = float(alert["price"])
     sl = float(alert["sl"])
     tp = float(alert["tp"])
+
+    # GUARDA DE ORIENTACIÓN. Va aquí y no solo en poller.py porque las
+    # señales del /webhook de TradingView NO pasan por el poller: entran
+    # directas a esta función. En un SHORT el stop tiene que quedar POR
+    # ENCIMA de la entrada; el 08/09/2026 LYN-USDT salió al revés.
+    # stop_distance usa abs(), así que un stop del lado equivocado no se
+    # detecta más abajo: pasa todos los frenos y llega al exchange.
+    _ok, _motivo, _sl_bueno, _tp_bueno = gd.revisar_sl_tp(
+        alert.get("side", ""), position_side, price, sl, tp)
+    if not _ok:
+        log.error("%s NO ejecutada — %s | correcto sería sl=%.10g tp=%.10g",
+                  symbol, _motivo, _sl_bueno, _tp_bueno)
+        if gd.debe_avisar(f"orient:{symbol}", getattr(config, "GUARD_AVISO_MIN", 30)):
+            telegram_notifier.send(
+                f"🚫 *{symbol}* — entrada NO ejecutada\n{_motivo}\n"
+                f"Correcto sería `sl={_sl_bueno:.10g}` `tp={_tp_bueno:.10g}`\n"
+                f"_El origen está en signal_engine.compute_signal. "
+                f"No se autocorrige a propósito._"
+            )
+        return
 
     if not config.AUTO_TRADE:
         telegram_notifier.send(
@@ -497,13 +561,26 @@ def _handle_entry(alert: dict):
     # por fondos insuficientes (o que consumiría casi todo el margen
     # disponible sin que quede colchón para el resto de posiciones).
     required_margin = (qty * price) / max(actual_leverage, 1)
-    if required_margin > equity * 0.95:
+    disponible, fuente_margen = _margen_disponible(equity)
+    if fuente_margen.startswith("equity"):
+        log.warning(
+            "%s: no hay getter de margen disponible en bingx_client -- se compara "
+            "contra el patrimonio, que INCLUYE el margen bloqueado por otros bots. "
+            "El rechazo 101204 puede volver a aparecer.", symbol)
+    if required_margin > disponible * 0.95:
         telegram_notifier.send(
             telegram_notifier.format_entry_signal(
                 alert, executed=False,
-                error=f"margen insuficiente (necesita ~{required_margin:.2f} USDT con leverage {actual_leverage}x, equity {equity:.2f} USDT)",
+                error=(f"margen insuficiente: necesita ~{required_margin:.2f} USDT "
+                       f"con leverage {actual_leverage}x y hay {disponible:.2f} "
+                       f"libres (patrimonio {equity:.2f}, fuente: {fuente_margen}). "
+                       f"La diferencia está bloqueada en posiciones abiertas, de "
+                       f"este bot o de otro de la cuenta"),
             )
         )
+        log.warning("%s: margen insuficiente ANTES de mandar la orden "
+                    "(%.2f necesarios, %.2f libres) -- así no llega el 101204",
+                    symbol, required_margin, disponible)
         return
 
     # Apertura protegida: abre, lee el tamaño REAL rellenado, verifica el
@@ -572,7 +649,16 @@ def _handle_exit(alert: dict):
             )
             return
         entry_price = pos["entry_price"]
-        pnl = (exit_price - entry_price) if position_side == "LONG" else (entry_price - exit_price)
+        # POR UNIDAD x CANTIDAD. Antes se pasaba solo el delta de PRECIO,
+        # así que en una alt de 0.03 USDT el "PnL" valía 0.0002 en vez de
+        # los USDT reales. Ese número alimenta el circuit breaker: el signo
+        # salía bien pero la magnitud no, y cualquier umbral sobre ella
+        # quedaba desactivado de hecho.
+        delta = (exit_price - entry_price) if position_side == "LONG" else (entry_price - exit_price)
+        pnl = delta * float(pos.get("quantity", 0) or 0)
+        if not pos.get("quantity"):
+            log.warning("%s: cierre sin cantidad registrada -- el PnL va como "
+                        "delta de precio y NO en USDT", symbol)
     except Exception as e:
         log.exception("Fallo cerrando orden en BingX")
         telegram_notifier.send(
@@ -732,6 +818,14 @@ def diagnose():
     equity = None
     try:
         equity = bx.get_balance()
+        _disp, _fuente = _margen_disponible(equity)
+        puertas.append({
+            "puerta": "margen_disponible",
+            "bloquea": bool(config.MARGIN_PER_TRADE_USDT and _disp < config.MARGIN_PER_TRADE_USDT),
+            "detalle": (f"{_disp:.2f} USDT libres de {equity:.2f} de patrimonio "
+                        f"(fuente: {_fuente}). Cada entrada pide "
+                        f"{config.MARGIN_PER_TRADE_USDT or 0:.2f} USDT de margen"),
+        })
         # El suelo de nocional puede rechazar TODAS las señales si el
         # equity es pequeño: para llegar al mínimo habría que arriesgar
         # más de MAX_RISK_PCT_ABS.
