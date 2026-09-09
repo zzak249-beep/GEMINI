@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import csv
 import math
+import os
 import re
 import statistics as st
 import sys
@@ -176,6 +177,10 @@ def main():
     ap.add_argument("--horas", type=float, default=HORAS)
     ap.add_argument("--coste", type=float, default=COSTE_PCT)
     a = ap.parse_args()
+
+    if not os.path.isfile(a.csv):
+        print(f"Archivo no encontrado: {a.csv}. Aun no se generaron senales, saliendo sin error.")
+        return 0
 
     filas = []
     for enc in ("utf-8-sig", "utf-8"):
