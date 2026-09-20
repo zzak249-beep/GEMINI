@@ -1,7 +1,5 @@
-.env
-state.json
-state.json.tmp
 __pycache__/
-*.pyc
-.venv/
-logs/
+*.py[cod]
+.env
+*.log
+data/
