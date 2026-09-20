@@ -1,5 +1,4 @@
 __pycache__/
-*.py[cod]
-.env
-*.log
-data/
+*.pyc
+decay_*.csv
+/data/

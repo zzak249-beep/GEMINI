@@ -1,126 +1,133 @@
-# Crowding bot — solo señales
+# decay — ¿cuánto dura la señal de basis, y llega a pagar el peaje?
 
-Bot de señales del posicionamiento amontonado en perpetuos de BingX.
+Servicio de **medición**. No opera, no pide claves de API, no puede abrir una
+posición aunque quisiera. Solo lee endpoints públicos de BingX y escribe CSV.
 
-**NO OPERA. NO PIDE CLAVES DE API.** Solo endpoints públicos, así que no
-puede tocar la cuenta ni por error.
+## Qué mide y por qué existe
 
-## Qué hace
+El panel de 15 minutos del bot de crowding dejó esto:
 
-Detecta apalancamiento amontonado (basis extremo + open interest subiendo
-+ precio en un extremo) y espera la primera vela EN CONTRA de la multitud.
-Cada señal abre una operación **virtual** con stop y objetivo, la sigue
-hasta el desenlace y anota el resultado en R con el coste descontado.
+```
+IC(basis_z -> retorno futuro, transversal)   +0.079 a 15 min
+el mismo IC esperando una sola vela          +0.005
+```
 
-El informe diario dice la muestra acumulada **y qué se puede concluir con
-ella**:
+Toda la ventaja vive **dentro del primer intervalo de captura**, y con capturas
+cada 15 minutos no se puede ver dónde muere. Puede ser a los 30 segundos
+(precio rancio, no hay nada que hacer) o a los 8 minutos (hay un bot posible,
+con ejecución maker). La diferencia entre esas dos respuestas es la diferencia
+entre cerrar la línea y abrir otra.
 
-| ventaja real | operaciones necesarias |
-|---|---|
-| 0.50 R/op | 31 |
-| 0.30 R/op | 87 |
-| 0.20 R/op | 196 |
-| 0.10 R/op | 784 |
+Este servicio captura cada **60 s** en vez de cada 900 y mide el IC a 1, 2, 3,
+5, 10, 15, 30 y 60 minutos.
+
+## Por qué cuesta casi nada
+
+`/quote/premiumIndex` devuelve **todos** los símbolos en una sola llamada. No
+hacen falta klines ni openInterest por símbolo. Una captura completa del
+universo son 1-2 peticiones: ~2.900 al día.
+
+Se guarda el basis **crudo**, no el z-score. La ventana del z es justamente uno
+de los parámetros a probar, y guardando el crudo se recalcula con cualquier
+ventana sin volver a capturar.
+
+## El coste no se estima, se mide
+
+Se apunta el bid y el ask reales de cada símbolo en cada captura, así que el
+umbral que la señal tiene que superar sale del libro de órdenes. Se informan
+las dos ejecuciones por separado:
+
+- **taker**: spread completo + 2 × comisión taker
+- **maker**: 0 × spread + 2 × comisión maker
+
+El maker asume que te llenan. No siempre te llenan, y justo cuando la señal es
+buena es cuando menos te llenan. **Ese sesgo no está medido aquí.**
+
+## El control
+
+Cada IC va acompañado de su nulo empírico: se baraja `basis_z` dentro de cada
+instantánea (lo que destruye la relación señal-retorno pero conserva la
+estructura transversal de los retornos) y se recalcula `DECAY_BARAJAS` veces.
+El p empírico es la fracción de barajas que iguala o supera lo observado.
+
+Probado contra ruido puro generado a propósito, un horizonte sacó p=0,020
+—"significativo" al 5%— y la cartera decil a 30 min dio beneficio neto sobre
+paseos aleatorios. La corrección de Bonferroni sobre los 8 horizontes lo tumba.
+Sin ese control, ese resultado se habría leído como una ventaja.
+
+El t-Student se calcula **solo sobre ventanas que no comparten velas**. Con
+capturas de 60 s y horizonte de 60 min hay 60 ventanas solapadas y el t saldría
+inflado unas 8 veces.
 
 ## Despliegue en Railway
 
-1. Proyecto nuevo desde este repo.
-2. **Monta un Volume en `/data`.** Sin él, cada redespliegue borra la
-   historia acumulada y el bot vuelve a calentar 31 horas desde cero.
-3. Variables de entorno (ver abajo).
+Repo propio y proyecto propio. No comparte código ni volumen con ningún bot.
 
-## Calentamiento
-
-BingX no sirve histórico de open interest, así que el bot acumula el suyo.
-Dirá `calentando (X/30h, N/200)` y no emitirá nada hasta cumplir **las dos
-condiciones**: 30 horas de historia Y 200 muestras.
-
-Con 300 símbolos el ciclo tarda ~9,4 min (4,4 de trabajo + `SCAN_SEC`), así
-que son unas **31 horas**, no tres días.
-
-## Los parámetros van en HORAS, no en muestras
-
-El bot toma una muestra por ciclo, y la duración del ciclo depende de
-cuántos símbolos escanee: con 300 son ~9,4 min; con 100 serían ~3. Si
-`OI_LOOK` fuera un contador de muestras, cada cambio de `MAX_SYMBOLS` lo
-reinterpretaría en silencio — una ventana de "24 muestras" pasaría de 3,7 h
-a 1,2 h sin que nada avisara.
-
-Por eso `OI_LOOK_H`, `HIST_HORAS` y `MIN_HORAS` están en horas y el bot
-hace la conversión con su cadencia real, que además registra en cada línea
-de log (`cadencia 9.4 min`).
-
-`MIN_MUESTRAS` sigue siendo una cuenta: hacen falta las dos cosas, tiempo
-suficiente y muestras suficientes para que el z-score sea estable.
-
-## Variables
+1. Repo nuevo en GitHub con estos archivos en la raíz.
+2. Railway → New Project → Deploy from GitHub repo.
+3. **Volumen**: Add Volume, punto de montaje `/data`. Sin esto el servicio no
+   arranca (lo comprueba al inicio y avisa por Telegram).
+4. Variables: pegar el bloque de abajo en el raw editor.
+5. El comando de arranque ya viene fijado en `railway.json` y en el `Procfile`.
+   **No lo cambies a mano**: si Railway lo autodetecta acaba eligiendo
+   `gunicorn`, que es para aplicaciones web, y el servicio entra en bucle de
+   reinicio con `sh: 1: gunicorn: not found`.
 
 ```
-TIMEFRAME=15m
-SCAN_SEC=300
-MIN_VOL_24H=2000000
-MAX_SYMBOLS=300
-HIST_HORAS=168
-MIN_HORAS=30
-MIN_MUESTRAS=200
-OI_LOOK_H=6
-Z_BASIS=2.0
-Z_OI=1.0
-EXT_PCT=80
-ATR_LEN=14
-SL_ATR=1.5
-TP_R=2.0
-MAX_BARS=16
-MIN_ATR_PCT=1.0
-COST_PCT=0.25
-MAX_COST_R=0.20
-STATE=/data/crowding_state.json
-CSV=/data/crowding_ops.csv
+DECAY_DIR=/data/decay
+DECAY_CADA_SEG=60
+DECAY_DIAS=7
+DECAY_MIN_SIMBOLOS=40
+DECAY_MIN_VOL_USDT=2000000
+DECAY_Z_VENTANA=240
+DECAY_Z_MIN=60
+DECAY_INFORME_H=6
+DECAY_ANALISIS_H=48
+DECAY_MAX_PARES=1200
+DECAY_BARAJAS=200
+DECAY_COM_TAKER=0.045
+DECAY_COM_MAKER=0.020
 TG_TOKEN=
 TG_CHAT=
-TG_SIGNALS=false
-TG_CLOSES=false
-REPORT_HOUR=7
 ```
 
-## Telegram
+`TG_TOKEN` y `TG_CHAT` son los mismos del resto de la flota. Si los dejas
+vacíos el informe sale por los logs en vez de por Telegram.
 
-`TG_SIGNALS` y `TG_CLOSES` vienen **apagados**. Con ~300 símbolos salen
-unos 67 mensajes al día, y un chat con 67 mensajes diarios se deja de leer
-en una semana. Por defecto llega **un mensaje al día**: el informe.
+## Uso
 
-Todo queda igualmente en el CSV, que es de donde sale la respuesta a los
-15 días.
+El servicio captura solo y manda informe cada `DECAY_INFORME_H` horas. El
+informe se lanza en subproceso a propósito: tarda hasta 90 s y en el mismo
+proceso se comería las capturas de esos segundos, que es justo la resolución
+que el servicio existe para medir.
 
-Pon `TG_SIGNALS=true` los primeros días si quieres ver que emite bien, y
-apágalo después.
+Informe a demanda, desde la consola de Railway:
 
-## Sobre las claves de BingX
+```
+python decay.py informe
+```
 
-**No las pongas.** Todo lo que este bot necesita (klines, open interest,
-premium index, tickers) es público. Unas claves no le darían ni un dato
-más: solo añadirían un secreto con permiso de trading a un servicio que no
-ejecuta nada.
+El primer informe útil necesita **48 horas** de captura. Antes de eso el
+z-score no tiene ventana suficiente y el informe lo dice en vez de inventarse
+un número.
 
-## Régimen (confirm.py)
+## Cómo leer el resultado
 
-El módulo `confirm.py` calcula el ratio de varianzas robusto y etiqueta el
-símbolo como tendencial, reversivo o indeterminado. **Aquí solo se apunta,
-nunca decide.**
+Tres desenlaces posibles:
 
-Motivo: el crowding opera CONTRA la multitud, o sea que es una estrategia
-de reversión. El veto de `confirm.py` está pensado para ruptura y le
-quitaría justo sus mejores entradas. Se registra en la columna
-`conf_regimen` para que a los 15 días el informe conteste si el crowding
-rinde mejor en régimen reversivo — en vez de darlo por hecho.
+- **El IC muere antes del minuto** → precio rancio. Se cierra la línea y
+  `basis_z` queda solo como veto direccional sobre BOT14.
+- **Vive 3-10 min pero no cubre ni el coste maker** → hay señal, no hay
+  negocio. Mismo destino, pero sabiendo por qué.
+- **Vive y cubre maker** → el siguiente paso **no es operar**, es medir el
+  llenado maker.
 
-Variables: `CONFIRM_ENABLED`, `CONFIRM_Q`, `CONFIRM_WIN`,
-`CONFIRM_LAMBDA`, `CONFIRM_Z`, `CONFIRM_MIN_VELAS`. `CONFIRM_BLOQUEAR`
-está fijado a False en el código y no es configurable a propósito.
+La prueba que separa señal de microestructura es la tabla "misma señal,
+entrando tarde". Con señal real el IC apenas baja al esperar 5 minutos; con los
+datos del panel de 15 min se desplomaba de +0,0399 a +0,0046.
 
-## Salida
+## Tamaño en disco
 
-- `/data/crowding_ops.csv` — una fila por operación virtual cerrada,
-  con `conf_z` y `conf_regimen` para cruzar resultados por régimen
-- `/data/crowding_state.json` — historia de basis y OI, virtuales abiertas
-- Telegram — cada señal, cada cierre, e informe diario
+~180 símbolos × 1.440 capturas/día ≈ 260.000 filas/día, unos 15 MB. Con
+`DECAY_DIAS=7` se estabiliza en ~100 MB. El servicio poda los CSV viejos cada
+hora; sin eso el volumen se llena y el contenedor muere sin avisar.

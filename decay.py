@@ -607,7 +607,23 @@ def main():
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     signal.signal(signal.SIGTERM, _senal)
     signal.signal(signal.SIGINT, _senal)
-    os.makedirs(CFG["DIR"], exist_ok=True)
+
+    # El volumen, antes de nada. Sin él el contenedor escribe en su disco
+    # efímero, todo parece ir bien durante horas y el primer redespliegue se
+    # lleva la captura entera. Es el fallo más caro posible aquí: no da error,
+    # solo borra el trabajo de dos días.
+    try:
+        os.makedirs(CFG["DIR"], exist_ok=True)
+        prueba = os.path.join(CFG["DIR"], ".escritura")
+        with open(prueba, "w") as fh:
+            fh.write("ok")
+        os.remove(prueba)
+    except OSError as e:
+        msg = ("decay NO arranca: no puedo escribir en %s (%s).\n"
+               "Monta el volumen en /data o cambia DECAY_DIR." % (CFG["DIR"], e))
+        avisar(msg)
+        log.error(msg)
+        return
 
     if len(sys.argv) > 1 and sys.argv[1] == "informe":
         avisar(informe())
