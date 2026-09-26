@@ -1,1 +1,1 @@
-worker: python decay.py
+worker: python zlab_scanner.py

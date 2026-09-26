@@ -2,10 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "sh -c 'gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --timeout 30'"
+startCommand = "python zlab_scanner.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
-# Envuelto en `sh -c '...'` a propósito: Railway pasa startCommand tal cual
-# al proceso, sin pasar por una shell que expanda variables. Sin el `sh -c`,
-# gunicorn recibe el texto literal "$PORT" en vez del número de puerto real
-# y falla con "Error: '$PORT' is not a valid port number." en bucle.
