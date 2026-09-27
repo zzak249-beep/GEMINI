@@ -15,7 +15,7 @@ from dataclasses import dataclass, field, asdict
 
 import requests
 
-CODE_VERSION = "zlab-scanner 1.0.0"
+CODE_VERSION = "zlab-scanner 1.1.0"
 
 
 # ───────────────────────── configuracion ─────────────────────────
@@ -36,8 +36,8 @@ TG_TOKEN        = env("TELEGRAM_TOKEN", "")
 TG_CHAT         = env("TELEGRAM_CHAT_ID", "")
 SCAN_EVERY_MIN  = env("SCAN_EVERY_MIN", 240, int)
 ONE_SHOT        = env("ONE_SHOT", False, bool)
-MIN_VOL_USDT    = env("MIN_VOL_USDT", 5_000_000, float)
-MAX_SYMBOLS     = env("MAX_SYMBOLS", 60, int)
+MIN_VOL_USDT    = env("MIN_VOL_USDT", 2_000_000, float)
+MAX_SYMBOLS     = env("MAX_SYMBOLS", 0, int)          # 0 = todas las que pasen el volumen
 PAGES           = env("KLINE_PAGES", 2, int)          # 1 pagina = 1440 velas de 5m = 5 dias
 TOP_N           = env("TOP_N", 10, int)
 MIN_TRADES      = env("MIN_TRADES", 4, int)
@@ -118,7 +118,21 @@ def parse_kline(k):
     return Bar(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), tb)
 
 
+KCACHE = {}   # symbol -> {t: Bar}; tras el primer escaneo solo se descarga la pagina mas reciente
+
+
 def get_klines(symbol, pages):
+    cached = KCACHE.get(symbol)
+    now_ms = int(time.time() * 1000)
+    if cached and max(cached) > now_ms - 4 * 86_400_000:
+        data = api_get("/openApi/swap/v3/quote/klines", {"symbol": symbol, "interval": "5m", "limit": 1440})
+        time.sleep(REQ_PAUSE_S)
+        for k in data or []:
+            b = parse_kline(k)
+            cached[b.t] = b
+        keep = sorted(cached)[-pages * 1440:]
+        KCACHE[symbol] = {t: cached[t] for t in keep}
+        return [KCACHE[symbol][t] for t in keep if t + 300_000 <= now_ms]
     bars = {}
     end = None
     for _ in range(pages):
@@ -137,8 +151,9 @@ def get_klines(symbol, pages):
         if len(chunk) < 1440:
             break
     out = sorted(bars.values(), key=lambda b: b.t)
+    if out:
+        KCACHE[symbol] = {b.t: b for b in out}
     # descartar la vela en curso (no cerrada)
-    now_ms = int(time.time() * 1000)
     return [b for b in out if b.t + 300_000 <= now_ms]
 
 
@@ -491,9 +506,17 @@ def scan_once():
     t0 = time.time()
     tickers = get_tickers()
     time.sleep(REQ_PAUSE_S)
-    cands = [t for t in tickers if t[1] >= MIN_VOL_USDT and t[0].split("-")[0] not in EXCLUDE and t[0] not in EXCLUDE]
+    def is_crypto(sym):
+        base = sym.split("-")[0]
+        # BingX lista acciones/materias primas tokenizadas como NCxxxx2USD-USDT: fuera
+        return not (base.startswith("NC") and base.endswith("USD"))
+    cands = [t for t in tickers if t[1] >= MIN_VOL_USDT and is_crypto(t[0])
+             and t[0].split("-")[0] not in EXCLUDE and t[0] not in EXCLUDE]
     cands.sort(key=lambda t: t[1], reverse=True)
-    cands = cands[:MAX_SYMBOLS]
+    if MAX_SYMBOLS > 0:
+        cands = cands[:MAX_SYMBOLS]
+    for gone in set(KCACHE) - {c[0] for c in cands}:
+        KCACHE.pop(gone, None)
     log.info("%d candidatos (vol >= %.0f USDT)", len(cands), MIN_VOL_USDT)
 
     results = []
